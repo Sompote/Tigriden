@@ -45,6 +45,9 @@ fn main() {
     ui.on_row_toggled(|id| with_app(|app| app.row_toggled(id)));
     ui.on_close_session(|idx| with_app(|app| app.close_session(idx as usize)));
     ui.on_preset_clicked(|idx| with_app(|app| app.preset_clicked(idx as usize)));
+    ui.on_term_tab_clicked(|tab| with_app(|app| app.term_tab_clicked(tab as usize)));
+    ui.on_new_terminal(|| with_app(|app| app.new_terminal_active()));
+    ui.on_close_terminal(|tab| with_app(|app| app.close_terminal(tab as usize)));
     ui.on_split_changed(|| with_app(|app| app.split_changed()));
     ui.on_banner_primary(|| with_app(|app| app.banner_primary()));
     ui.on_banner_secondary(|| with_app(|app| app.banner_secondary()));

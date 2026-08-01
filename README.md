@@ -14,7 +14,7 @@ Written in pure Rust. **~10 MB binary, ~40 MB RAM.**
 │   src/   │      ...                    │
 │   lib.rs │  }                          │
 │          ├─────────────────────────────┤
-│          │ [claude] [codex] [gemini]   │
+│          │ [1][2][+] [claude] [codex]  │
 │          │  ❯ claude                   │
 │ [+ Add]  │  ⏺ Working on task...      │
 └──────────┴─────────────────────────────┘
@@ -27,6 +27,7 @@ Agentic coding means running several agents in several folders and checking in o
 ## Features
 
 - **One-click agents** — preset buttons type the agent command into the terminal for you (fully configurable).
+- **Multiple terminals per folder** — the `+` tab spawns extra shells in the same workspace, so one agent can run while you use a second terminal for git, tests, or another agent.
 - **Real terminal** — VTE-compliant emulation ([alacritty_terminal](https://crates.io/crates/alacritty_terminal) + a real PTY). TUIs like `vim`, `top`, and the Claude Code interface just work, including bracketed paste and truecolor.
 - **Live file tree** — gitignore-aware, refreshes automatically as agents create and delete files.
 - **Built-in editor** — syntax highlighting for 40+ languages ([cosmic-text](https://crates.io/crates/cosmic-text) + syntect), edit and Cmd+S save. When an agent edits the open file on disk, it reloads automatically (or asks, if you have unsaved changes).
@@ -50,7 +51,8 @@ Requires stable Rust. macOS is the primary target (Linux/Windows untested but th
 1. Click **+ Add folder** and pick a project directory — a login shell opens there.
 2. Click a preset button (e.g. **claude**) to launch the agent, or type any command.
 3. Watch the file tree update as the agent works; click any file to inspect or tweak it.
-4. Add more folders to run more agents in parallel; switch by clicking a session in the sidebar.
+4. Click **+** in the terminal tab strip to open more terminals in the same folder (each tab is its own shell; ✕ on hover closes one).
+5. Add more folders to run more agents in parallel; switch by clicking a session in the sidebar.
 
 ### Keys
 

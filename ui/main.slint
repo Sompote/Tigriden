@@ -82,6 +82,8 @@ export component MainWindow inherits Window {
     in property <bool> has-session: false;
     in property <string> term-overlay: "";
     in property <string> banner-text: "";
+    in property <[string]> term-tabs;
+    in property <int> active-term: 0;
     in property <string> banner-primary-label: "";
     in property <string> banner-secondary-label: "";
 
@@ -90,6 +92,9 @@ export component MainWindow inherits Window {
     callback close-session(int);
     callback add-folder();
     callback preset-clicked(int);
+    callback term-tab-clicked(int);
+    callback new-terminal();
+    callback close-terminal(int);
     callback split-changed();
     callback banner-primary();
     callback banner-secondary();
@@ -254,6 +259,66 @@ export component MainWindow inherits Window {
                                 padding-left: 8px;
                                 spacing: 4px;
                                 alignment: start;
+
+                                for label[i] in root.term-tabs: tab-touch := TouchArea {
+                                    width: root.term-tabs.length > 1 && self.has-hover ? 46px : 30px;
+                                    Rectangle {
+                                        y: 4px;
+                                        height: 22px;
+                                        border-radius: 4px;
+                                        background: i == root.active-term ? Theme.selection
+                                            : (tab-touch.has-hover ? Theme.panel-hover : transparent);
+                                        HorizontalLayout {
+                                            padding-left: 8px;
+                                            padding-right: 4px;
+                                            spacing: 2px;
+                                            Text {
+                                                text: label;
+                                                color: i == root.active-term ? Theme.text : Theme.text-dim;
+                                                font-size: 11px;
+                                                vertical-alignment: center;
+                                            }
+                                            if root.term-tabs.length > 1 && tab-touch.has-hover: TouchArea {
+                                                width: 14px;
+                                                Text {
+                                                    text: "✕";
+                                                    color: Theme.text-dim;
+                                                    font-size: 9px;
+                                                    vertical-alignment: center;
+                                                    horizontal-alignment: center;
+                                                }
+                                                clicked => { root.close-terminal(i); }
+                                            }
+                                        }
+                                    }
+                                    clicked => { root.term-tab-clicked(i); }
+                                }
+
+                                new-term-touch := TouchArea {
+                                    width: 24px;
+                                    Rectangle {
+                                        y: 4px;
+                                        height: 22px;
+                                        border-radius: 4px;
+                                        background: new-term-touch.has-hover ? Theme.panel-hover : transparent;
+                                        Text {
+                                            text: "+";
+                                            color: Theme.accent;
+                                            font-size: 13px;
+                                            vertical-alignment: center;
+                                            horizontal-alignment: center;
+                                        }
+                                    }
+                                    clicked => { root.new-terminal(); }
+                                }
+
+                                Rectangle {
+                                    width: 1px;
+                                    y: 6px;
+                                    height: 18px;
+                                    background: Theme.border;
+                                }
+
                                 for preset[i] in root.presets: preset-touch := TouchArea {
                                     width: preset-text.preferred-width + 20px;
                                     Rectangle {

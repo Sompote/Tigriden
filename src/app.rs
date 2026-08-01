@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use alacritty_terminal::grid::Scroll;
@@ -10,13 +10,14 @@ use slint::{ComponentHandle, Image, ModelRc, SharedString, VecModel};
 
 use crate::config::{self, Config, PersistedState};
 use crate::editor::{EditorState, KeyOutcome};
-use crate::session::Session;
+use crate::session::{Session, TermHandle};
 use crate::term::keys::{self, Mods};
 use crate::term::render::TermRenderer;
 use crate::term::{TermHooks, TermSession};
 use crate::{MainWindow, PresetItem, TreeRow};
 
 static SYNTAX_SYSTEM: OnceLock<SyntaxSystem> = OnceLock::new();
+static NEXT_TERM_ID: AtomicU64 = AtomicU64::new(1);
 
 fn syntax_system() -> &'static SyntaxSystem {
     SYNTAX_SYSTEM.get_or_init(SyntaxSystem::new)
@@ -159,13 +160,8 @@ impl App {
 
     // ----- sessions -----
 
-    pub fn add_session(&mut self, root: PathBuf, persist: bool) {
-        let root = root.canonicalize().unwrap_or(root);
-        if let Some(idx) = self.sessions.iter().position(|s| s.root == root) {
-            self.set_active(idx);
-            return;
-        }
-
+    /// Spawns one terminal (shell) in `root` with its own event routing id.
+    fn spawn_term(&mut self, root: &Path) -> Option<TermHandle> {
         let (cell_w, cell_h) = self.ensure_renderer();
         let (cols, rows) = if self.term_view.0 > 0.0 {
             let scale = self.scale();
@@ -177,11 +173,12 @@ impl App {
             (80, 24)
         };
 
+        let id = NEXT_TERM_ID.fetch_add(1, Ordering::Relaxed);
         let frame_pending = Arc::new(AtomicBool::new(false));
-        let hooks = Self::make_hooks(&root, frame_pending.clone());
+        let hooks = Self::make_hooks(id, frame_pending.clone());
 
-        let term = match TermSession::spawn(
-            &root,
+        match TermSession::spawn(
+            root,
             cols,
             rows,
             (cell_w as u16, cell_h as u16),
@@ -189,15 +186,25 @@ impl App {
             self.dark,
             hooks,
         ) {
-            Ok(term) => term,
+            Ok(term) => Some(TermHandle { id, term, frame_pending }),
             Err(err) => {
                 eprintln!("tigriden: {err}");
-                return;
+                None
             }
-        };
+        }
+    }
+
+    pub fn add_session(&mut self, root: PathBuf, persist: bool) {
+        let root = root.canonicalize().unwrap_or(root);
+        if let Some(idx) = self.sessions.iter().position(|s| s.root == root) {
+            self.set_active(idx);
+            return;
+        }
+
+        let Some(first_term) = self.spawn_term(&root) else { return };
 
         let fs_root = root.clone();
-        let session = Session::new(root, term, frame_pending, move |paths| {
+        let session = Session::new(root, first_term, move |paths| {
             let fs_root = fs_root.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 with_app(|app| app.fs_changed(&fs_root, paths));
@@ -221,10 +228,22 @@ impl App {
                     let delay = std::time::Duration::from_millis(1500 + i as u64 * 3000);
                     slint::Timer::single_shot(delay, move || {
                         with_app(|app| {
-                            if let Some(session) = app.sessions.first() {
-                                session.term.write(bytes.clone());
+                            if let Some(handle) =
+                                app.sessions.first().and_then(|s| s.terms.first())
+                            {
+                                handle.term.write(bytes.clone());
                             }
                         });
+                    });
+                }
+            }
+            if let Ok(mode) = std::env::var("TIGRIDEN_TEST_NEWTERM") {
+                slint::Timer::single_shot(std::time::Duration::from_millis(2500), || {
+                    with_app(|app| app.new_terminal_active());
+                });
+                if mode == "back" {
+                    slint::Timer::single_shot(std::time::Duration::from_millis(5000), || {
+                        with_app(|app| app.term_tab_clicked(0));
                     });
                 }
             }
@@ -236,24 +255,78 @@ impl App {
         }
     }
 
-    fn make_hooks(root: &Path, pending: Arc<AtomicBool>) -> TermHooks {
-        let repaint_root = root.to_path_buf();
+    fn make_hooks(term_id: u64, pending: Arc<AtomicBool>) -> TermHooks {
         let repaint = Arc::new(move || {
             if !pending.swap(true, Ordering::AcqRel) {
-                let root = repaint_root.clone();
                 let _ = slint::invoke_from_event_loop(move || {
-                    with_app(|app| app.term_repaint(&root));
+                    with_app(|app| app.term_repaint(term_id));
                 });
             }
         });
-        let exit_root = root.to_path_buf();
         let exited = Arc::new(move || {
-            let root = exit_root.clone();
             let _ = slint::invoke_from_event_loop(move || {
-                with_app(|app| app.term_exited(&root));
+                with_app(|app| app.term_exited(term_id));
             });
         });
         TermHooks { repaint, exited }
+    }
+
+    // ----- terminal tabs -----
+
+    fn find_term(&self, id: u64) -> Option<(usize, usize)> {
+        self.sessions.iter().enumerate().find_map(|(si, session)| {
+            session.terms.iter().position(|t| t.id == id).map(|ti| (si, ti))
+        })
+    }
+
+    pub fn new_terminal_active(&mut self) {
+        self.new_terminal(self.active);
+    }
+
+    pub fn new_terminal(&mut self, session_idx: usize) {
+        if session_idx >= self.sessions.len() {
+            return;
+        }
+        let root = self.sessions[session_idx].root.clone();
+        let Some(handle) = self.spawn_term(&root) else { return };
+        let session = &mut self.sessions[session_idx];
+        session.terms.push(handle);
+        session.active_term = session.terms.len() - 1;
+        self.active = session_idx;
+        self.apply_term_size();
+        self.refresh_all();
+        if let Some(ui) = self.ui() {
+            ui.invoke_focus_terminal();
+        }
+    }
+
+    pub fn term_tab_clicked(&mut self, tab: usize) {
+        let Some(session) = self.sessions.get_mut(self.active) else { return };
+        if tab >= session.terms.len() || tab == session.active_term {
+            return;
+        }
+        session.active_term = tab;
+        self.apply_term_size();
+        self.render_term();
+        self.update_chrome();
+        if let Some(ui) = self.ui() {
+            ui.invoke_focus_terminal();
+        }
+    }
+
+    pub fn close_terminal(&mut self, tab: usize) {
+        let Some(session) = self.sessions.get_mut(self.active) else { return };
+        // The last terminal of a session can only go by closing the session.
+        if session.terms.len() <= 1 || tab >= session.terms.len() {
+            return;
+        }
+        let mut handle = session.terms.remove(tab);
+        handle.term.shutdown();
+        if session.active_term >= session.terms.len() {
+            session.active_term = session.terms.len() - 1;
+        }
+        self.apply_term_size();
+        self.refresh_all();
     }
 
     pub fn close_session(&mut self, idx: usize) {
@@ -269,7 +342,9 @@ impl App {
 
     fn really_close_session(&mut self, idx: usize) {
         let mut session = self.sessions.remove(idx);
-        session.term.shutdown();
+        for handle in &mut session.terms {
+            handle.term.shutdown();
+        }
         if self.active >= self.sessions.len() {
             self.active = self.sessions.len().saturating_sub(1);
         }
@@ -286,10 +361,6 @@ impl App {
         self.apply_editor_size();
         self.persist();
         self.refresh_all();
-    }
-
-    fn active_session(&mut self) -> Option<&mut Session> {
-        self.sessions.get_mut(self.active)
     }
 
     // ----- tree -----
@@ -563,18 +634,19 @@ impl App {
 
     // ----- terminal -----
 
-    pub fn term_repaint(&mut self, root: &Path) {
-        let Some(idx) = self.sessions.iter().position(|s| s.root == root) else { return };
-        self.sessions[idx].frame_pending.store(false, Ordering::Release);
-        if idx == self.active {
+    pub fn term_repaint(&mut self, id: u64) {
+        let Some((si, ti)) = self.find_term(id) else { return };
+        self.sessions[si].terms[ti].frame_pending.store(false, Ordering::Release);
+        if si == self.active && ti == self.sessions[si].active_term {
             self.render_term();
         }
     }
 
-    pub fn term_exited(&mut self, root: &Path) {
-        let is_active =
-            self.sessions.iter().position(|s| s.root == root).is_some_and(|i| i == self.active);
-        if is_active {
+    pub fn term_exited(&mut self, id: u64) {
+        let is_visible = self
+            .find_term(id)
+            .is_some_and(|(si, ti)| si == self.active && ti == self.sessions[si].active_term);
+        if is_visible {
             self.update_chrome();
         }
     }
@@ -583,17 +655,20 @@ impl App {
         if mods.meta {
             return self.term_shortcut(text);
         }
-        let Some(session) = self.sessions.get_mut(self.active) else { return false };
+        let Some(handle) = self.sessions.get_mut(self.active).and_then(Session::active_term_mut)
+        else {
+            return false;
+        };
         let (mode, scrolled) = {
-            let term = session.term.term.lock();
+            let term = handle.term.term.lock();
             (*term.mode(), term.grid().display_offset() != 0)
         };
         match keys::encode(text, &mods, mode) {
             Some(bytes) => {
                 if scrolled {
-                    session.term.term.lock().scroll_display(Scroll::Bottom);
+                    handle.term.term.lock().scroll_display(Scroll::Bottom);
                 }
-                session.term.write(bytes);
+                handle.term.write(bytes);
                 true
             }
             None => false,
@@ -604,9 +679,10 @@ impl App {
         match text.chars().next().map(|c| c.to_ascii_lowercase()) {
             Some('v') => {
                 let pasted = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok());
-                if let (Some(text), Some(session)) = (pasted, self.sessions.get_mut(self.active)) {
-                    let mode = *session.term.term.lock().mode();
-                    session.term.write(keys::encode_paste(&text, mode));
+                let handle = self.sessions.get_mut(self.active).and_then(Session::active_term_mut);
+                if let (Some(text), Some(handle)) = (pasted, handle) {
+                    let mode = *handle.term.term.lock().mode();
+                    handle.term.write(keys::encode_paste(&text, mode));
                 }
                 true
             }
@@ -621,8 +697,9 @@ impl App {
         let lines = self.wheel_accum as i32;
         if lines != 0 {
             self.wheel_accum -= lines as f32;
-            if let Some(session) = self.sessions.get_mut(self.active) {
-                session.term.term.lock().scroll_display(Scroll::Delta(lines));
+            if let Some(handle) = self.sessions.get_mut(self.active).and_then(Session::active_term_mut)
+            {
+                handle.term.term.lock().scroll_display(Scroll::Delta(lines));
                 self.render_term();
             }
         }
@@ -650,8 +727,8 @@ impl App {
             return;
         }
         let (cols, rows) = self.term_renderer.as_ref().unwrap().grid_size(w_px, h_px);
-        if let Some(session) = self.sessions.get_mut(self.active) {
-            session.term.resize(cols, rows, (cell_w as u16, cell_h as u16));
+        if let Some(handle) = self.sessions.get_mut(self.active).and_then(Session::active_term_mut) {
+            handle.term.resize(cols, rows, (cell_w as u16, cell_h as u16));
         }
     }
 
@@ -664,8 +741,8 @@ impl App {
         }
         self.ensure_renderer();
         let focused = ui.get_term_focused();
-        let session = &self.sessions[self.active];
-        let term = session.term.term.lock();
+        let Some(handle) = self.sessions[self.active].active_term() else { return };
+        let term = handle.term.term.lock();
         let renderer = self.term_renderer.as_mut().unwrap();
         let buffer = renderer.render(
             &mut self.font_system,
@@ -688,8 +765,8 @@ impl App {
         if preset.send_enter {
             bytes.push(b'\r');
         }
-        if let Some(session) = self.active_session() {
-            session.term.write(bytes);
+        if let Some(handle) = self.sessions.get_mut(self.active).and_then(Session::active_term_mut) {
+            handle.term.write(bytes);
         }
         if let Some(ui) = self.ui() {
             ui.invoke_focus_terminal();
@@ -800,17 +877,25 @@ impl App {
                         ui.set_editor_dirty(false);
                     }
                 }
-                let exited = session.term.exited.load(Ordering::Acquire);
+                let exited =
+                    session.active_term().is_some_and(|t| t.term.exited.load(Ordering::Acquire));
                 ui.set_term_overlay(SharedString::from(if exited {
-                    "shell exited — close this session (✕ in sidebar)"
+                    "shell exited — close this terminal tab or session"
                 } else {
                     ""
                 }));
+                let tabs: Vec<SharedString> = (1..=session.terms.len())
+                    .map(|n| SharedString::from(n.to_string()))
+                    .collect();
+                ui.set_term_tabs(ModelRc::new(VecModel::from(tabs)));
+                ui.set_active_term(session.active_term as i32);
             }
             None => {
                 ui.set_editor_title(SharedString::default());
                 ui.set_editor_dirty(false);
                 ui.set_term_overlay(SharedString::default());
+                ui.set_term_tabs(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+                ui.set_active_term(0);
             }
         }
     }
@@ -835,7 +920,9 @@ impl App {
         self.persist();
         self.shutting_down = true;
         for session in &mut self.sessions {
-            session.term.shutdown();
+            for handle in &mut session.terms {
+                handle.term.shutdown();
+            }
         }
         self.sessions.clear();
     }

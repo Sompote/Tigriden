@@ -8,15 +8,24 @@ use crate::editor::EditorState;
 use crate::term::TermSession;
 use crate::tree::TreeState;
 
+/// One terminal within a session. `id` is globally unique so background
+/// threads can route repaint/exit events without ambiguity when several
+/// terminals share a folder.
+pub struct TermHandle {
+    pub id: u64,
+    pub term: TermSession,
+    /// Coalesces repaint requests from the PTY reader thread.
+    pub frame_pending: Arc<AtomicBool>,
+}
+
 pub struct Session {
     pub root: PathBuf,
     pub name: String,
-    pub term: TermSession,
+    pub terms: Vec<TermHandle>,
+    pub active_term: usize,
     pub editor: Option<EditorState>,
     pub tree: TreeState,
     pub tree_visible: bool,
-    /// Coalesces repaint requests from the PTY reader thread.
-    pub frame_pending: Arc<AtomicBool>,
     /// Directories whose listings changed on disk since the last model rebuild.
     pub pending_fs: Vec<PathBuf>,
     _watcher: Option<RecommendedWatcher>,
@@ -25,8 +34,7 @@ pub struct Session {
 impl Session {
     pub fn new(
         root: PathBuf,
-        term: TermSession,
-        frame_pending: Arc<AtomicBool>,
+        first_term: TermHandle,
         on_fs_event: impl Fn(Vec<PathBuf>) + Send + 'static,
     ) -> Self {
         let name = root
@@ -47,14 +55,22 @@ impl Session {
         Self {
             root: root.clone(),
             name,
-            term,
+            terms: vec![first_term],
+            active_term: 0,
             editor: None,
             tree: TreeState::new(root),
             tree_visible: true,
-            frame_pending,
             pending_fs: Vec::new(),
             _watcher: watcher,
         }
+    }
+
+    pub fn active_term(&self) -> Option<&TermHandle> {
+        self.terms.get(self.active_term)
+    }
+
+    pub fn active_term_mut(&mut self) -> Option<&mut TermHandle> {
+        self.terms.get_mut(self.active_term)
     }
 
     pub fn relative_name(&self, path: &Path) -> String {
