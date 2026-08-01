@@ -31,26 +31,32 @@ Agentic coding means running several agents in several folders and checking in o
 - **Persistent** — folders, active session, and layout are restored on relaunch (fresh shells each time, by design).
 - **Small on purpose** — no webview, no Electron, no C regex libraries. Slint UI with both panes rasterized straight to pixel buffers.
 
-## Install
+## Quick install (macOS)
 
-**Download** the ready-made app from the [releases page](https://github.com/Sompote/Tigriden/releases) — `Tigriden-0.1.0-macos-universal.app.zip` runs on both Apple Silicon and Intel. Unzip, drag to /Applications, and right-click → Open the first time (the app is not notarized).
+No Rust needed — grab the prebuilt app from the [latest release](https://github.com/Sompote/Tigriden/releases/latest):
 
-Or build from source:
+1. Download **`Tigriden-0.1.0-macos-universal.app.zip`** (one download for both Apple Silicon and Intel).
+2. Unzip and drag **Tigriden.app** into **/Applications**.
+3. First launch only: the app isn't notarized, so **right-click → Open → Open**, or run:
+
+   ```sh
+   xattr -d com.apple.quarantine /Applications/Tigriden.app
+   ```
+
+Prefer a bare binary? The release also ships `tigriden-0.1.0-macos-arm64.tar.gz` (Apple Silicon) and `tigriden-0.1.0-macos-x86_64.tar.gz` (Intel) — untar and run `./tigriden`.
+
+<details>
+<summary><b>Build from source</b> (stable Rust required)</summary>
 
 ```sh
 git clone https://github.com/Sompote/Tigriden.git
 cd Tigriden
 cargo build --release
-./target/release/tigriden
+./target/release/tigriden        # or ./bundle/make-app.sh for dist/Tigriden.app
 ```
 
-On macOS you can build a proper app bundle (Dock icon, drag to /Applications):
-
-```sh
-./bundle/make-app.sh     # produces dist/Tigriden.app
-```
-
-Requires stable Rust. macOS is the primary target (Linux/Windows untested but the stack is cross-platform).
+macOS is the primary target; Linux/Windows are untested but the stack is cross-platform.
+</details>
 
 ## Usage
 
