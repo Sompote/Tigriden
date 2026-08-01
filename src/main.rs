@@ -9,6 +9,7 @@ mod tree;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
 use slint::ComponentHandle;
 
 use app::{with_app, App};
@@ -77,6 +78,25 @@ fn main() {
     ui.on_editor_mouse(|kind, x, y| with_app(|app| app.editor_mouse(kind, x, y)));
     ui.on_editor_wheel(|delta| with_app(|app| app.editor_wheel(delta)));
     ui.on_editor_size_changed(|w, h| with_app(|app| app.editor_resized(w, h)));
+
+    // External file drops arrive as winit events the Slint DropArea never
+    // sees; forward them to the active terminal as a typed path.
+    ui.window().on_winit_window_event(|_, event| match event {
+        winit::event::WindowEvent::DroppedFile(path) => {
+            let path = path.clone();
+            with_app(move |app| app.file_dropped(path));
+            EventResult::PreventDefault
+        }
+        winit::event::WindowEvent::HoveredFile(_) => {
+            with_app(|app| app.file_drop_hover(true));
+            EventResult::PreventDefault
+        }
+        winit::event::WindowEvent::HoveredFileCancelled => {
+            with_app(|app| app.file_drop_hover(false));
+            EventResult::PreventDefault
+        }
+        _ => EventResult::Propagate,
+    });
 
     ui.window().on_close_requested(|| {
         with_app(|app| app.shutdown());

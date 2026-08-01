@@ -283,6 +283,11 @@ impl App {
                     });
                 });
             }
+            if let Ok(path) = std::env::var("TIGRIDEN_TEST_DROP") {
+                slint::Timer::single_shot(std::time::Duration::from_millis(3000), move || {
+                    with_app(|app| app.file_dropped(std::path::PathBuf::from(&path)));
+                });
+            }
             if let Ok(path) = std::env::var("TIGRIDEN_TEST_OPEN") {
                 slint::Timer::single_shot(std::time::Duration::from_millis(1500), move || {
                     with_app(|app| app.open_file(0, std::path::PathBuf::from(&path)));
@@ -919,6 +924,44 @@ impl App {
         if let Some(ui) = self.ui() {
             ui.invoke_focus_terminal();
         }
+    }
+
+    // ----- file drop -----
+
+    /// Quotes a path for the shell unless it is entirely safe characters.
+    fn shell_escape(text: &str) -> String {
+        let safe = |c: char| c.is_ascii_alphanumeric() || "_-./~+=:@%,".contains(c);
+        if !text.is_empty() && text.chars().all(safe) {
+            text.to_string()
+        } else {
+            format!("'{}'", text.replace('\'', "'\\''"))
+        }
+    }
+
+    pub fn file_drop_hover(&mut self, hovering: bool) {
+        if hovering && !self.sessions.is_empty() {
+            if let Some(ui) = self.ui() {
+                ui.set_term_overlay(SharedString::from("release to insert the file path"));
+            }
+        } else {
+            self.update_chrome();
+        }
+    }
+
+    /// Types the dropped file's (escaped) path into the active terminal, the
+    /// way native terminals do — agents receive it as an attached-file path.
+    pub fn file_dropped(&mut self, path: PathBuf) {
+        let escaped = Self::shell_escape(&path.display().to_string());
+        let Some(handle) = self.sessions.get_mut(self.active).and_then(Session::active_term_mut)
+        else {
+            return;
+        };
+        let mode = *handle.term.term.lock().mode();
+        handle.term.write(keys::encode_paste(&format!("{escaped} "), mode));
+        if let Some(ui) = self.ui() {
+            ui.invoke_focus_terminal();
+        }
+        self.update_chrome();
     }
 
     // ----- banner -----
