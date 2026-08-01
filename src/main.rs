@@ -17,6 +17,11 @@ use term::keys::Mods;
 slint::include_modules!();
 
 fn mods(ctrl: bool, alt: bool, meta: bool, shift: bool) -> Mods {
+    // Slint follows the Qt convention on macOS: its `control` modifier is the
+    // ⌘ Command key and `meta` is the physical Ctrl key. Terminal semantics
+    // need the physical keys, so swap them back.
+    #[cfg(target_os = "macos")]
+    let (ctrl, meta) = (meta, ctrl);
     Mods { ctrl, alt, meta, shift }
 }
 

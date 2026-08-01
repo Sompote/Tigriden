@@ -272,6 +272,17 @@ impl App {
                     });
                 });
             }
+            if std::env::var("TIGRIDEN_TEST_PASTE").is_ok() {
+                slint::Timer::single_shot(std::time::Duration::from_millis(3000), || {
+                    with_app(|app| {
+                        let handled = app.term_key(
+                            "v",
+                            crate::term::keys::Mods { ctrl: false, alt: false, meta: true, shift: false },
+                        );
+                        eprintln!("TEST_PASTE handled={handled} clipboard_ok={}", app.clipboard.is_some());
+                    });
+                });
+            }
             if let Ok(path) = std::env::var("TIGRIDEN_TEST_OPEN") {
                 slint::Timer::single_shot(std::time::Duration::from_millis(1500), move || {
                     with_app(|app| app.open_file(0, std::path::PathBuf::from(&path)));
