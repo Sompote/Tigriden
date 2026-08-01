@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::index::{Column, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::viewport_to_point;
 use cosmic_text::{FontSystem, SwashCache, SyntaxSystem};
 use slint::{ComponentHandle, Image, ModelRc, SharedString, VecModel};
 
@@ -100,6 +103,7 @@ pub struct App {
     term_view: (f32, f32),
     editor_view: (f32, f32),
     wheel_accum: f32,
+    term_mouse_down: bool,
     banner: Banner,
     fs_timer_armed: bool,
     resize_timer_armed: bool,
@@ -134,6 +138,7 @@ impl App {
             term_view: (0.0, 0.0),
             editor_view: (0.0, 0.0),
             wheel_accum: 0.0,
+            term_mouse_down: false,
             banner: Banner::None,
             fs_timer_armed: false,
             resize_timer_armed: false,
@@ -251,6 +256,21 @@ impl App {
                         with_app(|app| app.term_tab_clicked(0));
                     });
                 }
+            }
+            if std::env::var("TIGRIDEN_TEST_SELECT").is_ok() {
+                slint::Timer::single_shot(std::time::Duration::from_millis(3000), || {
+                    with_app(|app| {
+                        app.term_mouse(0, 5.0, 5.0);
+                        app.term_mouse(2, 300.0, 5.0);
+                        app.term_mouse(1, 300.0, 5.0);
+                        let copied = app
+                            .sessions
+                            .get(app.active)
+                            .and_then(Session::active_term)
+                            .and_then(|h| h.term.term.lock().selection_to_string());
+                        eprintln!("TEST_SELECT: {copied:?}");
+                    });
+                });
             }
             if let Ok(path) = std::env::var("TIGRIDEN_TEST_OPEN") {
                 slint::Timer::single_shot(std::time::Duration::from_millis(1500), move || {
@@ -717,8 +737,14 @@ impl App {
         };
         match keys::encode(text, &mods, mode) {
             Some(bytes) => {
-                if scrolled {
-                    handle.term.term.lock().scroll_display(Scroll::Bottom);
+                {
+                    let mut term = handle.term.term.lock();
+                    if term.selection.is_some() {
+                        term.selection = None;
+                    }
+                    if scrolled {
+                        term.scroll_display(Scroll::Bottom);
+                    }
                 }
                 handle.term.write(bytes);
                 true
@@ -729,6 +755,19 @@ impl App {
 
     fn term_shortcut(&mut self, text: &str) -> bool {
         match text.chars().next().map(|c| c.to_ascii_lowercase()) {
+            Some('c') => {
+                let selected = self
+                    .sessions
+                    .get(self.active)
+                    .and_then(Session::active_term)
+                    .and_then(|h| h.term.term.lock().selection_to_string());
+                if let (Some(text), Some(cb)) = (selected, self.clipboard.as_mut()) {
+                    if !text.is_empty() {
+                        let _ = cb.set_text(text);
+                    }
+                }
+                true
+            }
             Some('v') => {
                 let pasted = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok());
                 let handle = self.sessions.get_mut(self.active).and_then(Session::active_term_mut);
@@ -740,6 +779,52 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// kind: 0 = down, 1 = up, 2 = move, 3 = double-click (logical px).
+    pub fn term_mouse(&mut self, kind: i32, x: f32, y: f32) {
+        let (cell_w, cell_h) = self.ensure_renderer();
+        let scale = self.scale();
+        let px = (x * scale).max(0.0) as u32;
+        let py = (y * scale).max(0.0) as u32;
+        let side = if px % cell_w.max(1) < cell_w / 2 { Side::Left } else { Side::Right };
+        let mouse_down = &mut self.term_mouse_down;
+        let Some(handle) = self.sessions.get_mut(self.active).and_then(Session::active_term_mut)
+        else {
+            return;
+        };
+        let col = ((px / cell_w.max(1)) as usize).min(handle.term.cols.saturating_sub(1) as usize);
+        let row = ((py / cell_h.max(1)) as usize).min(handle.term.rows.saturating_sub(1) as usize);
+        {
+            let mut term = handle.term.term.lock();
+            let point = viewport_to_point(term.grid().display_offset(), Point::new(row, Column(col)));
+            match kind {
+                0 => {
+                    *mouse_down = true;
+                    term.selection = Some(Selection::new(SelectionType::Simple, point, side));
+                }
+                2 if *mouse_down => {
+                    if let Some(selection) = term.selection.as_mut() {
+                        selection.update(point, side);
+                    }
+                }
+                1 => {
+                    *mouse_down = false;
+                    let empty = match &term.selection {
+                        Some(selection) => selection.to_range(&term).is_none(),
+                        None => true,
+                    };
+                    if empty {
+                        term.selection = None;
+                    }
+                }
+                3 => {
+                    term.selection = Some(Selection::new(SelectionType::Semantic, point, side));
+                }
+                _ => return,
+            }
+        }
+        self.render_term();
     }
 
     pub fn term_wheel(&mut self, delta: f32) {

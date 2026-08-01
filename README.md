@@ -28,7 +28,7 @@ Agentic coding means running several agents in several folders and checking in o
 
 - **One-click agents** — preset buttons type the agent command into the terminal for you (fully configurable).
 - **Multiple terminals per folder** — the `+` tab spawns extra shells in the same workspace, so one agent can run while you use a second terminal for git, tests, or another agent.
-- **Real terminal** — VTE-compliant emulation ([alacritty_terminal](https://crates.io/crates/alacritty_terminal) + a real PTY). TUIs like `vim`, `top`, and the Claude Code interface just work, including bracketed paste and truecolor.
+- **Real terminal** — VTE-compliant emulation ([alacritty_terminal](https://crates.io/crates/alacritty_terminal) + a real PTY). TUIs like `vim`, `top`, and the Claude Code interface just work, including bracketed paste and truecolor. Select with the mouse and Cmd+C to copy out; Cmd+V pastes text in, and image paste into Claude Code works with Ctrl+V (the agent reads your clipboard directly).
 - **Live file tree** — gitignore-aware, refreshes automatically as agents create and delete files.
 - **Built-in editor** — syntax highlighting for 40+ languages ([cosmic-text](https://crates.io/crates/cosmic-text) + syntect), edit and Cmd+S save. When an agent edits the open file on disk, it reloads automatically (or asks, if you have unsaved changes).
 - **Per-folder sessions** — each workspace keeps its own shell, tree, and open file; switching is instant.
@@ -66,7 +66,7 @@ Requires stable Rust. macOS is the primary target (Linux/Windows untested but th
 
 | Context  | Keys |
 |----------|------|
-| Terminal | everything a terminal expects (Ctrl+C, arrows, TUIs); Cmd+V pastes (bracketed); wheel scrolls history |
+| Terminal | everything a terminal expects: Ctrl+C/Z/D/R…, arrows, F1–F12, TUIs; drag to select (double-click = word), Cmd+C copies, Cmd+V pastes (bracketed); wheel scrolls history |
 | Editor   | typing, arrows / Home / End / PgUp / PgDn (+Shift selects, +Alt jumps words), Cmd+A / C / X / V, Cmd+S saves |
 
 ## Configuration
@@ -115,7 +115,6 @@ Only the PTY reader threads run in the background; rendering and editing happen 
 ## Roadmap / known limitations (v1)
 
 - [ ] Editor undo
-- [ ] Terminal text selection & copy
 - [ ] Mouse reporting to TUIs
 - [ ] IME / dead-key composition
 - [ ] Editor tabs (currently one open file per session)

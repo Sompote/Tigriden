@@ -14,6 +14,8 @@ const K_HOME: char = '\u{F729}';
 const K_END: char = '\u{F72B}';
 const K_PAGE_UP: char = '\u{F72C}';
 const K_PAGE_DOWN: char = '\u{F72D}';
+const K_F1: char = '\u{F704}';
+const K_F12: char = '\u{F70F}';
 
 pub struct Mods {
     pub ctrl: bool,
@@ -68,6 +70,19 @@ pub fn encode(text: &str, mods: &Mods, mode: TermMode) -> Option<Vec<u8>> {
         K_END => arrow(b'F', mods),
         K_PAGE_UP => b"\x1b[5~".to_vec(),
         K_PAGE_DOWN => b"\x1b[6~".to_vec(),
+        c if (K_F1..=K_F12).contains(&c) => {
+            match c as u32 - K_F1 as u32 + 1 {
+                1 => b"\x1bOP".to_vec(),
+                2 => b"\x1bOQ".to_vec(),
+                3 => b"\x1bOR".to_vec(),
+                4 => b"\x1bOS".to_vec(),
+                n => {
+                    // xterm codes: F5=15, F6..F10=17..21, F11=23, F12=24
+                    let code = [15, 17, 18, 19, 20, 21, 23, 24][n as usize - 5];
+                    format!("\x1b[{code}~").into_bytes()
+                }
+            }
+        }
         K_DELETE => b"\x1b[3~".to_vec(),
         K_RETURN => vec![b'\r'],
         K_TAB => {
@@ -95,6 +110,9 @@ pub fn encode(text: &str, mods: &Mods, mode: TermMode) -> Option<Vec<u8>> {
                 ']' => Some(0x1d),
                 '^' => Some(0x1e),
                 '_' | '-' => Some(0x1f),
+                // macOS delivers Ctrl+letter as the already-encoded control
+                // character; forward it verbatim.
+                c if (c as u32) < 0x20 => Some(c as u8),
                 _ => None,
             };
             match byte {
@@ -178,6 +196,22 @@ mod tests {
     fn alt_prefixes_escape() {
         let alt = Mods { alt: true, ..plain() };
         assert_eq!(encode("b", &alt, TermMode::empty()), Some(vec![0x1b, b'b']));
+    }
+
+    #[test]
+    fn preencoded_control_chars_pass_through() {
+        // macOS delivers Ctrl+Z as the control char itself.
+        let ctrl = Mods { ctrl: true, ..plain() };
+        assert_eq!(encode("\u{1a}", &ctrl, TermMode::empty()), Some(vec![0x1a]));
+        assert_eq!(encode("\u{03}", &ctrl, TermMode::empty()), Some(vec![0x03]));
+        assert_eq!(encode("z", &ctrl, TermMode::empty()), Some(vec![0x1a]));
+    }
+
+    #[test]
+    fn function_keys() {
+        assert_eq!(encode("\u{F704}", &plain(), TermMode::empty()), Some(b"\x1bOP".to_vec()));
+        assert_eq!(encode("\u{F708}", &plain(), TermMode::empty()), Some(b"\x1b[15~".to_vec()));
+        assert_eq!(encode("\u{F70F}", &plain(), TermMode::empty()), Some(b"\x1b[24~".to_vec()));
     }
 
     #[test]

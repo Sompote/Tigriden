@@ -61,7 +61,7 @@ fn main() {
         handled
     });
     ui.on_term_wheel(|delta| with_app(|app| app.term_wheel(delta)));
-    ui.on_term_mouse(|_, _, _| {}); // selection support is a later milestone
+    ui.on_term_mouse(|kind, x, y| with_app(|app| app.term_mouse(kind, x, y)));
     ui.on_term_size_changed(|w, h| with_app(|app| app.term_resized(w, h)));
 
     ui.on_editor_key(|text, ctrl, alt, meta, shift| {
