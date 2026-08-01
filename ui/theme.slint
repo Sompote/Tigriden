@@ -1,0 +1,13 @@
+export global Theme {
+    in-out property <bool> dark: true;
+
+    out property <color> bg: dark ? #1e2227 : #fafafa;
+    out property <color> panel: dark ? #24292f : #f0f0f0;
+    out property <color> panel-hover: dark ? #2d333b : #e4e4e4;
+    out property <color> selection: dark ? #39414b : #d8d8d8;
+    out property <color> border: dark ? #333a42 : #d0d0d0;
+    out property <color> text: dark ? #d6dbe1 : #24292f;
+    out property <color> text-dim: dark ? #8b949e : #6e7781;
+    out property <color> accent: #e8912d;
+    out property <length> font-size: 13px;
+}

@@ -1,0 +1,306 @@
+import { Theme } from "theme.slint";
+import { Sidebar, TreeRow } from "sidebar.slint";
+
+export { TreeRow }
+
+export struct PresetItem {
+    label: string,
+}
+
+// A pane that displays a Rust-rendered pixel buffer and forwards input.
+// mouse kind: 0 = down, 1 = up, 2 = move, 3 = double-click
+component PixelPane inherits Rectangle {
+    in property <image> frame;
+    out property <bool> pane-focused: fs.has-focus;
+    callback key(string, bool, bool, bool, bool) -> bool;
+    callback mouse(int, length, length);
+    callback wheel(length);
+    callback size-changed(length, length);
+
+    public function grab-focus() {
+        fs.focus();
+    }
+
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+
+        key-pressed(event) => {
+            if (root.key(event.text, event.modifiers.control, event.modifiers.alt, event.modifiers.meta, event.modifiers.shift)) {
+                accept
+            } else {
+                reject
+            }
+        }
+
+        Image {
+            source: root.frame;
+            image-fit: fill;
+            image-rendering: pixelated;
+            width: 100%;
+            height: 100%;
+        }
+
+        TouchArea {
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down) {
+                    fs.focus();
+                    root.mouse(0, self.mouse-x, self.mouse-y);
+                } else if (event.kind == PointerEventKind.up) {
+                    root.mouse(1, self.mouse-x, self.mouse-y);
+                } else if (event.kind == PointerEventKind.move) {
+                    root.mouse(2, self.mouse-x, self.mouse-y);
+                }
+            }
+            double-clicked => {
+                root.mouse(3, self.mouse-x, self.mouse-y);
+            }
+            scroll-event(event) => {
+                root.wheel(event.delta-y);
+                accept
+            }
+        }
+    }
+
+    changed width => { root.size-changed(self.width, self.height); }
+    changed height => { root.size-changed(self.width, self.height); }
+}
+
+export component MainWindow inherits Window {
+    title: "Tigriden";
+    preferred-width: 1100px;
+    preferred-height: 720px;
+    background: Theme.bg;
+
+    in property <[TreeRow]> tree-rows;
+    in property <[PresetItem]> presets;
+    in property <image> editor-frame;
+    in property <image> term-frame;
+    in-out property <float> split-ratio: 0.55;
+    in property <string> editor-title: "";
+    in property <bool> editor-dirty: false;
+    in property <bool> has-session: false;
+    in property <string> term-overlay: "";
+    in property <string> banner-text: "";
+    in property <string> banner-primary-label: "";
+    in property <string> banner-secondary-label: "";
+
+    callback row-clicked(int);
+    callback row-toggled(int);
+    callback close-session(int);
+    callback add-folder();
+    callback preset-clicked(int);
+    callback split-changed();
+    callback banner-primary();
+    callback banner-secondary();
+    callback term-key(string, bool, bool, bool, bool) -> bool;
+    callback term-mouse(int, length, length);
+    callback term-wheel(length);
+    callback term-size-changed(length, length);
+    callback editor-key(string, bool, bool, bool, bool) -> bool;
+    callback editor-mouse(int, length, length);
+    callback editor-wheel(length);
+    callback editor-size-changed(length, length);
+
+    out property <bool> term-focused: term-pane.pane-focused;
+
+    public function focus-terminal() {
+        term-pane.grab-focus();
+    }
+
+    HorizontalLayout {
+        Sidebar {
+            width: 240px;
+            rows: root.tree-rows;
+            row-clicked(id) => { root.row-clicked(id); }
+            row-toggled(id) => { root.row-toggled(id); }
+            close-session(s) => { root.close-session(s); }
+            add-folder => { root.add-folder(); }
+        }
+
+        Rectangle {
+            width: 1px;
+            background: Theme.border;
+        }
+
+        main-area := Rectangle {
+            horizontal-stretch: 1;
+
+            Text {
+                visible: !root.has-session;
+                text: "Add a folder to start an agent session";
+                color: Theme.text-dim;
+                font-size: 15px;
+            }
+
+            Rectangle {
+                visible: root.has-session;
+                width: 100%;
+                height: 100%;
+
+                editor-section := Rectangle {
+                    x: 0;
+                    y: 0;
+                    width: parent.width;
+                    height: parent.height * root.split-ratio - 3px;
+
+                    VerticalLayout {
+                        Rectangle {
+                            height: 28px;
+                            background: Theme.panel;
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                spacing: 6px;
+                                Text {
+                                    text: root.editor-title == "" ? "No file open" : root.editor-title;
+                                    color: root.editor-title == "" ? Theme.text-dim : Theme.text;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                                if root.editor-dirty: Text {
+                                    text: "●";
+                                    color: Theme.accent;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        if root.banner-text != "": Rectangle {
+                            height: 30px;
+                            background: Theme.selection;
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                spacing: 12px;
+                                Text {
+                                    text: root.banner-text;
+                                    color: Theme.text;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                }
+                                primary-touch := TouchArea {
+                                    width: primary-label.preferred-width + 16px;
+                                    primary-label := Text {
+                                        text: root.banner-primary-label;
+                                        color: Theme.accent;
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                        vertical-alignment: center;
+                                        horizontal-alignment: center;
+                                    }
+                                    clicked => { root.banner-primary(); }
+                                }
+                                secondary-touch := TouchArea {
+                                    width: secondary-label.preferred-width + 16px;
+                                    secondary-label := Text {
+                                        text: root.banner-secondary-label;
+                                        color: Theme.text-dim;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                        horizontal-alignment: center;
+                                    }
+                                    clicked => { root.banner-secondary(); }
+                                }
+                            }
+                        }
+
+                        editor-pane := PixelPane {
+                            vertical-stretch: 1;
+                            frame: root.editor-frame;
+                            key(t, c, a, m, s) => { root.editor-key(t, c, a, m, s) }
+                            mouse(k, x, y) => { root.editor-mouse(k, x, y); }
+                            wheel(d) => { root.editor-wheel(d); }
+                            size-changed(w, h) => { root.editor-size-changed(w, h); }
+                        }
+                    }
+                }
+
+                splitter := TouchArea {
+                    x: 0;
+                    y: parent.height * root.split-ratio - 3px;
+                    width: parent.width;
+                    height: 6px;
+                    mouse-cursor: ns-resize;
+                    moved => {
+                        if (self.pressed) {
+                            root.split-ratio = Math.clamp((self.y + self.mouse-y) / main-area.height, 0.15, 0.85);
+                            root.split-changed();
+                        }
+                    }
+                    Rectangle {
+                        y: 2px;
+                        height: 1px;
+                        background: Theme.border;
+                    }
+                }
+
+                term-section := Rectangle {
+                    x: 0;
+                    y: parent.height * root.split-ratio + 3px;
+                    width: parent.width;
+                    height: parent.height - self.y;
+
+                    VerticalLayout {
+                        Rectangle {
+                            height: 30px;
+                            background: Theme.panel;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                spacing: 4px;
+                                alignment: start;
+                                for preset[i] in root.presets: preset-touch := TouchArea {
+                                    width: preset-text.preferred-width + 20px;
+                                    Rectangle {
+                                        y: 4px;
+                                        height: 22px;
+                                        border-radius: 4px;
+                                        background: preset-touch.has-hover ? Theme.panel-hover : Theme.bg;
+                                        border-width: 1px;
+                                        border-color: Theme.border;
+                                        preset-text := Text {
+                                            text: preset.label;
+                                            color: Theme.accent;
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                            horizontal-alignment: center;
+                                        }
+                                    }
+                                    clicked => { root.preset-clicked(i); }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            vertical-stretch: 1;
+
+                            term-pane := PixelPane {
+                                width: 100%;
+                                height: 100%;
+                                frame: root.term-frame;
+                                key(t, c, a, m, s) => { root.term-key(t, c, a, m, s) }
+                                mouse(k, x, y) => { root.term-mouse(k, x, y); }
+                                wheel(d) => { root.term-wheel(d); }
+                                size-changed(w, h) => { root.term-size-changed(w, h); }
+                            }
+
+                            if root.term-overlay != "": Rectangle {
+                                background: Theme.bg.with-alpha(0.8);
+                                Text {
+                                    text: root.term-overlay;
+                                    color: Theme.text-dim;
+                                    font-size: 14px;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

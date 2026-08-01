@@ -1,0 +1,50 @@
+[package]
+name = "tigriden"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal IDE for supervising AI coding agents: per-folder terminals, file trees, and a lightweight editor."
+license = "MIT"
+
+[dependencies]
+slint = { version = "1.17", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "backend-winit",
+    "renderer-femtovg",
+] }
+alacritty_terminal = "0.26"
+portable-pty = "0.9"
+cosmic-text = { version = "0.19", default-features = false, features = [
+    "std",
+    "swash",
+    "syntect",
+] }
+ignore = "0.4"
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+arboard = { version = "3", default-features = false }
+rfd = { version = "0.17", default-features = false }
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+png = { version = "0.18", optional = true }
+
+[features]
+# Debug aid: dump rendered pane frames as PNGs to $TIGRIDEN_DUMP.
+framedump = ["dep:png"]
+
+# cosmic-text pins syntect with default features, which drags in the oniguruma
+# C library; the vendored copy differs only in switching syntect to the
+# pure-Rust fancy-regex engine (see vendor/cosmic-text/Cargo.toml).
+[patch.crates-io]
+cosmic-text = { path = "vendor/cosmic-text" }
+
+[build-dependencies]
+slint-build = "1.17"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

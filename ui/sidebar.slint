@@ -1,0 +1,125 @@
+import { ListView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+// kind: 0 = session header, 1 = directory, 2 = file
+export struct TreeRow {
+    kind: int,
+    indent: int,
+    name: string,
+    expanded: bool,
+    session: int,
+    row-id: int,
+    active: bool,
+}
+
+component TreeRowDelegate inherits Rectangle {
+    in property <TreeRow> data;
+    callback clicked();
+    callback toggled();
+    callback closed();
+
+    height: data.kind == 0 ? 30px : 24px;
+    background: touch.has-hover ? Theme.panel-hover
+        : (data.kind == 0 && data.active ? Theme.selection : transparent);
+
+    touch := TouchArea {
+        clicked => {
+            if (root.data.kind == 2) {
+                root.clicked();
+            } else {
+                root.toggled();
+            }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 8px + data.indent * 14px;
+        padding-right: 6px;
+        spacing: 5px;
+
+        if data.kind != 2: Text {
+            width: 12px;
+            text: data.expanded ? "▾" : "▸";
+            color: Theme.text-dim;
+            font-size: 10px;
+            vertical-alignment: center;
+        }
+        if data.kind == 2: Rectangle { width: 12px; }
+
+        Text {
+            text: data.name;
+            color: data.kind == 0 ? Theme.text : (data.kind == 1 ? Theme.text : Theme.text-dim);
+            font-size: data.kind == 0 ? Theme.font-size : Theme.font-size - 1px;
+            font-weight: data.kind == 0 ? 600 : 400;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+
+        if data.kind == 0 && touch.has-hover: close-touch := TouchArea {
+            width: 18px;
+            Text {
+                text: "✕";
+                color: Theme.text-dim;
+                font-size: 10px;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+            clicked => { root.closed(); }
+        }
+    }
+}
+
+export component Sidebar inherits Rectangle {
+    in property <[TreeRow]> rows;
+    callback row-clicked(int);
+    callback row-toggled(int);
+    callback close-session(int);
+    callback add-folder();
+
+    background: Theme.panel;
+
+    VerticalLayout {
+        Rectangle {
+            height: 34px;
+            HorizontalLayout {
+                padding-left: 10px;
+                Text {
+                    text: "AGENTS";
+                    color: Theme.text-dim;
+                    font-size: 11px;
+                    font-weight: 700;
+                    letter-spacing: 1px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        ListView {
+            vertical-stretch: 1;
+            for row in root.rows: TreeRowDelegate {
+                data: row;
+                clicked => { root.row-clicked(row.row-id); }
+                toggled => { root.row-toggled(row.row-id); }
+                closed => { root.close-session(row.session); }
+            }
+        }
+
+        Rectangle {
+            height: 40px;
+            border-width: 1px;
+            border-color: Theme.border;
+            add-touch := TouchArea {
+                clicked => { root.add-folder(); }
+            }
+            background: add-touch.has-hover ? Theme.panel-hover : transparent;
+            Text {
+                text: "+ Add folder";
+                color: Theme.accent;
+                font-size: Theme.font-size;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+        }
+    }
+}
