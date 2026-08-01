@@ -6,21 +6,9 @@ Run `claude`, `codex`, `gemini` — any terminal agent — each in its own folde
 
 Written in pure Rust. **~10 MB binary, ~40 MB RAM.**
 
-![Tigriden running Claude Code](assets/screenshot.png)
+![Tigriden supervising an agent: the viewer shows a chart the agent produced while the agent CLI runs in one of three terminal tabs below](assets/screenshot.png)
 
-```
-┌──────────┬─────────────────────────────┐
-│ AGENTS   │  editor (click a file)      │
-│ ▸ proj-a │                             │
-│ ▾ proj-b │  fn main() {                │
-│   src/   │      ...                    │
-│   lib.rs │  }                          │
-│          ├─────────────────────────────┤
-│          │ [1][2][+] [claude] [codex]  │
-│          │  ❯ claude                   │
-│ [+ Add]  │  ⏺ Working on task...      │
-└──────────┴─────────────────────────────┘
-```
+*Above: a real session — the agent's workspace file tree on the left, the built-in viewer inspecting a chart the agent just generated, and the agent CLI running in one of three terminal tabs below.*
 
 ## Why
 
