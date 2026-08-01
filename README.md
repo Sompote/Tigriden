@@ -33,6 +33,10 @@ Agentic coding means running several agents in several folders and checking in o
 
 ## Install
 
+**Download** the ready-made app from the [releases page](https://github.com/Sompote/Tigriden/releases) — `Tigriden-0.1.0-macos-universal.app.zip` runs on both Apple Silicon and Intel. Unzip, drag to /Applications, and right-click → Open the first time (the app is not notarized).
+
+Or build from source:
+
 ```sh
 git clone https://github.com/Sompote/Tigriden.git
 cd Tigriden
