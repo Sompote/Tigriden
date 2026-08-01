@@ -6,6 +6,8 @@ Run `claude`, `codex`, `gemini` — any terminal agent — each in its own folde
 
 Written in pure Rust. **~10 MB binary, ~40 MB RAM.**
 
+![Tigriden running Claude Code](assets/screenshot.png)
+
 ```
 ┌──────────┬─────────────────────────────┐
 │ AGENTS   │  editor (click a file)      │
