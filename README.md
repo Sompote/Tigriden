@@ -39,10 +39,16 @@ Agentic coding means running several agents in several folders and checking in o
 ## Install
 
 ```sh
-git clone <this-repo>
+git clone https://github.com/Sompote/Tigriden.git
 cd Tigriden
 cargo build --release
 ./target/release/tigriden
+```
+
+On macOS you can build a proper app bundle (Dock icon, drag to /Applications):
+
+```sh
+./bundle/make-app.sh     # produces dist/Tigriden.app
 ```
 
 Requires stable Rust. macOS is the primary target (Linux/Windows untested but the stack is cross-platform).
