@@ -5,6 +5,7 @@ mod paint;
 mod session;
 mod term;
 mod tree;
+mod viewer;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -67,6 +68,7 @@ fn main() {
     ui.on_tree_context(|action, id| with_app(|app| app.tree_context(action, id)));
     ui.on_name_dialog_accept(|name| with_app(|app| app.name_dialog_accept(name.to_string())));
     ui.on_name_dialog_cancel(|| with_app(|app| app.name_dialog_cancel()));
+    ui.on_toggle_view(|| with_app(|app| app.toggle_view()));
     ui.on_banner_primary(|| with_app(|app| app.banner_primary()));
     ui.on_banner_secondary(|| with_app(|app| app.banner_secondary()));
 

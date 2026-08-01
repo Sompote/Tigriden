@@ -5,6 +5,7 @@ use std::sync::Arc;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::editor::EditorState;
+use crate::viewer::ViewerState;
 use crate::term::TermSession;
 use crate::tree::TreeState;
 
@@ -24,6 +25,7 @@ pub struct Session {
     pub terms: Vec<TermHandle>,
     pub active_term: usize,
     pub editor: Option<EditorState>,
+    pub viewer: Option<ViewerState>,
     pub tree: TreeState,
     pub tree_visible: bool,
     /// Directories whose listings changed on disk since the last model rebuild.
@@ -58,6 +60,7 @@ impl Session {
             terms: vec![first_term],
             active_term: 0,
             editor: None,
+            viewer: None,
             tree: TreeState::new(root),
             tree_visible: true,
             pending_fs: Vec::new(),

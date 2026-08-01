@@ -14,6 +14,7 @@ use slint::{ComponentHandle, Image, ModelRc, SharedString, VecModel};
 use crate::config::{self, Config, PersistedState};
 use crate::editor::{EditorState, KeyOutcome};
 use crate::session::{Session, TermHandle};
+use crate::viewer::{self, ViewerState};
 use crate::term::keys::{self, Mods};
 use crate::term::render::TermRenderer;
 use crate::term::{TermHooks, TermSession};
@@ -578,6 +579,11 @@ impl App {
                     reload_check.push(i);
                 }
             }
+            if let Some(viewer_state) = &session.viewer {
+                if dirs.iter().any(|p| *p == viewer_state.path) {
+                    reload_check.push(i);
+                }
+            }
             session.tree.invalidate(dirs);
             needs_tree = true;
         }
@@ -592,6 +598,11 @@ impl App {
     fn maybe_reload_editor(&mut self, idx: usize) {
         let is_active = idx == self.active;
         let font_family = self.font_family;
+        if let Some(viewer_state) = &self.sessions[idx].viewer {
+            let (path, kind) = (viewer_state.path.clone(), viewer_state.kind);
+            self.open_viewer(idx, path, kind);
+            return;
+        }
         let Some(editor) = self.sessions[idx].editor.as_mut() else { return };
         let mtime = std::fs::metadata(&editor.path).and_then(|m| m.modified()).ok();
         if mtime == editor.disk_mtime {
@@ -624,6 +635,65 @@ impl App {
 
     fn really_open_file(&mut self, idx: usize, path: PathBuf) {
         self.active = idx;
+        if let Some(kind) = viewer::classify(&path) {
+            self.open_viewer(idx, path, kind);
+            return;
+        }
+        self.open_text_editor(idx, path);
+    }
+
+    fn open_viewer(&mut self, idx: usize, path: PathBuf, kind: viewer::ViewKind) {
+        let scale = self.scale();
+        let width_px = (self.editor_view.0 * scale).max(200.0);
+        match ViewerState::open(
+            &mut self.font_system,
+            &path,
+            kind,
+            self.font_family,
+            self.config.font_size * scale,
+            self.dark,
+            width_px,
+        ) {
+            Ok(viewer_state) => {
+                let session = &mut self.sessions[idx];
+                session.viewer = Some(viewer_state);
+                session.editor = None;
+                self.render_editor();
+                self.update_chrome();
+            }
+            Err(err) => {
+                eprintln!("tigriden: {err}");
+                if let Some(ui) = self.ui() {
+                    ui.set_editor_title(SharedString::from(err));
+                }
+            }
+        }
+    }
+
+    /// Reopens the current viewer's file in the text editor, or the current
+    /// text file in its rendered view.
+    pub fn toggle_view(&mut self) {
+        let Some(session) = self.sessions.get_mut(self.active) else { return };
+        if let Some(viewer_state) = &session.viewer {
+            let path = viewer_state.path.clone();
+            session.viewer = None;
+            self.open_text_editor(self.active, path);
+        } else if let Some(editor) = &session.editor {
+            let path = editor.path.clone();
+            if let Some(kind) = viewer::classify(&path) {
+                if editor.dirty {
+                    self.show_banner(Banner::Unsaved(PendingAction::OpenFile(self.active, path)));
+                    return;
+                }
+                session.editor = None;
+                self.open_viewer(self.active, path, kind);
+            }
+        }
+    }
+
+    fn open_text_editor(&mut self, idx: usize, path: PathBuf) {
+        self.active = idx;
+        self.sessions[idx].viewer = None;
         // Binary sniff: NUL byte in the first 8 KiB.
         let is_binary = std::fs::File::open(&path)
             .and_then(|mut f| {
@@ -693,6 +763,11 @@ impl App {
     pub fn editor_wheel(&mut self, delta: f32) {
         let scale = self.scale();
         let Some(session) = self.sessions.get_mut(self.active) else { return };
+        if let Some(viewer_state) = session.viewer.as_mut() {
+            viewer_state.scroll_by(delta * scale);
+            self.render_editor();
+            return;
+        }
         let Some(editor) = session.editor.as_mut() else { return };
         editor.scroll(&mut self.font_system, delta * scale);
         self.render_editor();
@@ -711,6 +786,9 @@ impl App {
         if let Some(editor) = session.editor.as_mut() {
             editor.set_viewport(&mut self.font_system, w * scale, h * scale);
         }
+        if let Some(viewer_state) = session.viewer.as_mut() {
+            viewer_state.set_viewport(&mut self.font_system, w * scale, h * scale);
+        }
     }
 
     pub fn save_editor(&mut self) {
@@ -728,13 +806,20 @@ impl App {
         let scale = self.scale();
         let (w, h) = ((self.editor_view.0 * scale) as u32, (self.editor_view.1 * scale) as u32);
         let Some(session) = self.sessions.get_mut(self.active) else { return };
+        if w == 0 || h == 0 {
+            return;
+        }
+        if let Some(viewer_state) = session.viewer.as_mut() {
+            let buffer = viewer_state.render(&mut self.font_system, &mut self.swash_cache, w, h);
+            #[cfg(feature = "framedump")]
+            dump_frame("editor", &buffer);
+            ui.set_editor_frame(Image::from_rgba8_premultiplied(buffer));
+            return;
+        }
         let Some(editor) = session.editor.as_mut() else {
             ui.set_editor_frame(Image::default());
             return;
         };
-        if w == 0 || h == 0 {
-            return;
-        }
         let buffer = editor.render(&mut self.font_system, &mut self.swash_cache, w, h);
         #[cfg(feature = "framedump")]
         dump_frame("editor", &buffer);
@@ -1126,6 +1211,11 @@ impl App {
                 if let Some(session) = self.sessions.get_mut(idx) {
                     if session.editor.as_ref().is_some_and(|e| e.path.starts_with(&path)) {
                         session.editor = None;
+                    }
+                    if session.viewer.as_ref().is_some_and(|v| v.path.starts_with(&path)) {
+                        session.viewer = None;
+                    }
+                    if session.editor.is_none() && session.viewer.is_none() {
                         if let Some(ui) = self.ui() {
                             ui.set_editor_frame(Image::default());
                         }
@@ -1326,14 +1416,32 @@ impl App {
         ui.set_has_session(!self.sessions.is_empty());
         match self.sessions.get(self.active) {
             Some(session) => {
-                match &session.editor {
-                    Some(editor) => {
+                match (&session.viewer, &session.editor) {
+                    (Some(viewer_state), _) => {
+                        ui.set_editor_title(SharedString::from(
+                            session.relative_name(&viewer_state.path),
+                        ));
+                        ui.set_editor_dirty(false);
+                        ui.set_editor_view_toggle(SharedString::from(match viewer_state.kind {
+                            viewer::ViewKind::Markdown | viewer::ViewKind::Csv => "Source",
+                            viewer::ViewKind::Image | viewer::ViewKind::PdfText => "",
+                        }));
+                    }
+                    (None, Some(editor)) => {
                         ui.set_editor_title(SharedString::from(session.relative_name(&editor.path)));
                         ui.set_editor_dirty(editor.dirty);
+                        ui.set_editor_view_toggle(SharedString::from(
+                            match viewer::classify(&editor.path) {
+                                Some(viewer::ViewKind::Markdown) => "Rendered",
+                                Some(viewer::ViewKind::Csv) => "Table",
+                                _ => "",
+                            },
+                        ));
                     }
-                    None => {
+                    (None, None) => {
                         ui.set_editor_title(SharedString::default());
                         ui.set_editor_dirty(false);
+                        ui.set_editor_view_toggle(SharedString::default());
                     }
                 }
                 let exited =

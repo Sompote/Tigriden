@@ -28,6 +28,10 @@ toml = "0.8"
 arboard = { version = "3", default-features = false }
 rfd = { version = "0.17", default-features = false }
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+csv = "1.4"
+pdf-extract = "0.12"
 png = { version = "0.18", optional = true }
 
 [features]

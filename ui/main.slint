@@ -86,6 +86,7 @@ export component MainWindow inherits Window {
     in property <string> term-overlay: "";
     in property <string> banner-text: "";
     in property <[string]> term-tabs;
+    in property <string> editor-view-toggle: "";
     in property <bool> name-dialog-visible: false;
     in property <string> name-dialog-title: "";
     in-out property <string> name-dialog-value: "";
@@ -112,6 +113,7 @@ export component MainWindow inherits Window {
     callback tree-context(int, int);
     callback name-dialog-accept(string);
     callback name-dialog-cancel();
+    callback toggle-view();
     callback split-changed();
     callback banner-primary();
     callback banner-secondary();
@@ -251,6 +253,25 @@ export component MainWindow inherits Window {
                                     color: Theme.accent;
                                     font-size: 12px;
                                     vertical-alignment: center;
+                                }
+                                if root.editor-view-toggle != "": toggle-touch := TouchArea {
+                                    width: toggle-label.preferred-width + 18px;
+                                    Rectangle {
+                                        y: 3px;
+                                        height: 22px;
+                                        border-radius: 4px;
+                                        border-width: 1px;
+                                        border-color: Theme.border;
+                                        background: toggle-touch.has-hover ? Theme.panel-hover : transparent;
+                                        toggle-label := Text {
+                                            text: root.editor-view-toggle;
+                                            color: Theme.accent;
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                            horizontal-alignment: center;
+                                        }
+                                    }
+                                    clicked => { root.toggle-view(); }
                                 }
                             }
                         }
