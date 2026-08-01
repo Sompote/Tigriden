@@ -1,3 +1,4 @@
+import { LineEdit, Button } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Sidebar, TreeRow } from "sidebar.slint";
 
@@ -85,6 +86,9 @@ export component MainWindow inherits Window {
     in property <string> term-overlay: "";
     in property <string> banner-text: "";
     in property <[string]> term-tabs;
+    in property <bool> name-dialog-visible: false;
+    in property <string> name-dialog-title: "";
+    in-out property <string> name-dialog-value: "";
     in property <int> active-term: 0;
     in property <string> banner-primary-label: "";
     in property <string> banner-secondary-label: "";
@@ -105,6 +109,9 @@ export component MainWindow inherits Window {
     callback menu-select-all();
     callback menu-close-terminal();
     callback menu-close-session();
+    callback tree-context(int, int);
+    callback name-dialog-accept(string);
+    callback name-dialog-cancel();
     callback split-changed();
     callback banner-primary();
     callback banner-secondary();
@@ -194,6 +201,7 @@ export component MainWindow inherits Window {
             add-folder => { root.add-folder(); }
             recent-clicked(i) => { root.recent-clicked(i); }
             recent-forget(i) => { root.recent-forget(i); }
+            row-context(action, id) => { root.tree-context(action, id); }
         }
 
         Rectangle {
@@ -436,6 +444,49 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.name-dialog-visible: Rectangle {
+        background: Theme.bg.with-alpha(0.6);
+        TouchArea { clicked => { root.name-dialog-cancel(); } }
+        Rectangle {
+            width: 340px;
+            height: 118px;
+            background: Theme.panel;
+            border-width: 1px;
+            border-color: Theme.border;
+            border-radius: 8px;
+            TouchArea { }
+            VerticalLayout {
+                padding: 14px;
+                spacing: 10px;
+                Text {
+                    text: root.name-dialog-title;
+                    color: Theme.text;
+                    font-size: 13px;
+                    font-weight: 600;
+                }
+                name-input := LineEdit {
+                    text <=> root.name-dialog-value;
+                    font-size: 13px;
+                    accepted => { root.name-dialog-accept(self.text); }
+                    init => { self.focus(); }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    Button {
+                        text: "Cancel";
+                        clicked => { root.name-dialog-cancel(); }
+                    }
+                    Button {
+                        text: "OK";
+                        primary: true;
+                        clicked => { root.name-dialog-accept(name-input.text); }
                     }
                 }
             }

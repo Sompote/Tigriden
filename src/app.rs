@@ -62,6 +62,13 @@ enum Banner {
     DiskChanged,
 }
 
+/// What the name-input dialog will do with the entered name.
+enum NameAction {
+    NewFile(usize, PathBuf),
+    NewFolder(usize, PathBuf),
+    Rename(usize, PathBuf),
+}
+
 
 #[cfg(feature = "framedump")]
 fn dump_frame(name: &str, buffer: &slint::SharedPixelBuffer<slint::Rgba8Pixel>) {
@@ -105,6 +112,7 @@ pub struct App {
     wheel_accum: f32,
     term_mouse_down: bool,
     banner: Banner,
+    pending_name: Option<NameAction>,
     fs_timer_armed: bool,
     resize_timer_armed: bool,
     shutting_down: bool,
@@ -140,6 +148,7 @@ impl App {
             wheel_accum: 0.0,
             term_mouse_down: false,
             banner: Banner::None,
+            pending_name: None,
             fs_timer_armed: false,
             resize_timer_armed: false,
             shutting_down: false,
@@ -286,6 +295,18 @@ impl App {
             if let Ok(path) = std::env::var("TIGRIDEN_TEST_DROP") {
                 slint::Timer::single_shot(std::time::Duration::from_millis(3000), move || {
                     with_app(|app| app.file_dropped(std::path::PathBuf::from(&path)));
+                });
+            }
+            if std::env::var("TIGRIDEN_TEST_CTX").is_ok() {
+                slint::Timer::single_shot(std::time::Duration::from_millis(3000), || {
+                    with_app(|app| {
+                        app.tree_context(1, 0); // New Folder on session header
+                        app.name_dialog_accept("ctx-folder".into());
+                        app.tree_context(0, 0); // New File on session header
+                        app.name_dialog_accept("ctx-file.txt".into());
+                        eprintln!("TEST_CTX done, editor open: {:?}",
+                            app.sessions.first().and_then(|s| s.editor.as_ref().map(|e| e.path.clone())));
+                    });
                 });
             }
             if let Ok(path) = std::env::var("TIGRIDEN_TEST_OPEN") {
@@ -962,6 +983,214 @@ impl App {
             ui.invoke_focus_terminal();
         }
         self.update_chrome();
+    }
+
+    // ----- tree context menu -----
+
+    /// Resolves a row to (session index, path, is_dir).
+    fn row_target(&self, row_id: i32) -> Option<(usize, PathBuf, bool)> {
+        match self.row_map.get(row_id as usize)? {
+            RowTarget::Header(i) => Some((*i, self.sessions.get(*i)?.root.clone(), true)),
+            RowTarget::Dir(i, p) => Some((*i, p.clone(), true)),
+            RowTarget::File(i, p) => Some((*i, p.clone(), false)),
+        }
+    }
+
+    /// Picks a non-clashing sibling name by appending " 2", " 3", ….
+    fn unique_path(path: &Path) -> PathBuf {
+        if !path.exists() {
+            return path.to_path_buf();
+        }
+        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+        let parent = path.parent().unwrap_or(Path::new("."));
+        (2..)
+            .map(|n| parent.join(format!("{stem} {n}{ext}")))
+            .find(|p| !p.exists())
+            .unwrap()
+    }
+
+    fn copy_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
+        if from.is_dir() {
+            std::fs::create_dir_all(to)?;
+            for entry in std::fs::read_dir(from)? {
+                let entry = entry?;
+                Self::copy_recursive(&entry.path(), &to.join(entry.file_name()))?;
+            }
+        } else {
+            std::fs::copy(from, to)?;
+        }
+        Ok(())
+    }
+
+    fn open_name_dialog(&mut self, title: String, initial: &str, action: NameAction) {
+        self.pending_name = Some(action);
+        if let Some(ui) = self.ui() {
+            ui.set_name_dialog_title(SharedString::from(title));
+            ui.set_name_dialog_value(SharedString::from(initial));
+            ui.set_name_dialog_visible(true);
+        }
+    }
+
+    fn close_name_dialog(&mut self) {
+        self.pending_name = None;
+        if let Some(ui) = self.ui() {
+            ui.set_name_dialog_visible(false);
+        }
+    }
+
+    /// Refreshes a directory listing right away instead of waiting for the
+    /// watcher debounce.
+    fn refresh_dir(&mut self, session_idx: usize, dir: &Path) {
+        if let Some(session) = self.sessions.get_mut(session_idx) {
+            session.tree.invalidate([dir.to_path_buf()]);
+        }
+        self.rebuild_tree();
+    }
+
+    pub fn tree_context(&mut self, action: i32, row_id: i32) {
+        let Some((idx, path, is_dir)) = self.row_target(row_id) else { return };
+        // Where "New File/Folder" creates: the dir itself, or a file's parent.
+        let create_dir = if is_dir {
+            path.clone()
+        } else {
+            path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.clone())
+        };
+        let shown_name =
+            path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match action {
+            0 => self.open_name_dialog(
+                format!("New file in {}", create_dir.display()),
+                "",
+                NameAction::NewFile(idx, create_dir),
+            ),
+            1 => self.open_name_dialog(
+                format!("New folder in {}", create_dir.display()),
+                "",
+                NameAction::NewFolder(idx, create_dir),
+            ),
+            2 => {
+                let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+            }
+            3 => {
+                let _ = std::process::Command::new("open").arg(&path).spawn();
+            }
+            4 => {
+                if let Some(cb) = self.clipboard.as_mut() {
+                    let _ = cb.set_text(path.display().to_string());
+                }
+            }
+            5 => {
+                let rel = self
+                    .sessions
+                    .get(idx)
+                    .map(|s| s.relative_name(&path))
+                    .unwrap_or_else(|| path.display().to_string());
+                if let Some(cb) = self.clipboard.as_mut() {
+                    let _ = cb.set_text(rel);
+                }
+            }
+            6 => {
+                let stem =
+                    path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let ext = path
+                    .extension()
+                    .map(|e| format!(".{}", e.to_string_lossy()))
+                    .unwrap_or_default();
+                let target = Self::unique_path(
+                    &path.parent().unwrap_or(Path::new(".")).join(format!("{stem} copy{ext}")),
+                );
+                if let Err(err) = Self::copy_recursive(&path, &target) {
+                    eprintln!("tigriden: duplicate failed: {err}");
+                }
+                let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                self.refresh_dir(idx, &parent);
+            }
+            7 => self.open_name_dialog(
+                format!("Rename {shown_name}"),
+                &shown_name,
+                NameAction::Rename(idx, path),
+            ),
+            8 => {
+                // Move to ~/.Trash (session roots are protected: close instead).
+                if self.sessions.get(idx).is_some_and(|s| s.root == path) {
+                    self.close_session(idx);
+                    return;
+                }
+                let Some(trash) = dirs::home_dir().map(|h| h.join(".Trash")) else { return };
+                let target = Self::unique_path(&trash.join(path.file_name().unwrap_or_default()));
+                if let Err(err) = std::fs::rename(&path, &target) {
+                    eprintln!("tigriden: trash failed: {err}");
+                    return;
+                }
+                if let Some(session) = self.sessions.get_mut(idx) {
+                    if session.editor.as_ref().is_some_and(|e| e.path.starts_with(&path)) {
+                        session.editor = None;
+                        if let Some(ui) = self.ui() {
+                            ui.set_editor_frame(Image::default());
+                        }
+                    }
+                }
+                let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                self.refresh_dir(idx, &parent);
+                self.update_chrome();
+            }
+            _ => {}
+        }
+    }
+
+    pub fn name_dialog_accept(&mut self, name: String) {
+        let name = name.trim();
+        if name.is_empty() || name.contains('/') {
+            self.close_name_dialog();
+            return;
+        }
+        let Some(action) = self.pending_name.take() else {
+            self.close_name_dialog();
+            return;
+        };
+        match action {
+            NameAction::NewFile(idx, dir) => {
+                let target = dir.join(name);
+                if !target.exists() {
+                    if let Err(err) = std::fs::write(&target, "") {
+                        eprintln!("tigriden: create file failed: {err}");
+                    } else {
+                        self.refresh_dir(idx, &dir);
+                        self.really_open_file(idx, target);
+                    }
+                }
+            }
+            NameAction::NewFolder(idx, dir) => {
+                if let Err(err) = std::fs::create_dir_all(dir.join(name)) {
+                    eprintln!("tigriden: create folder failed: {err}");
+                }
+                self.refresh_dir(idx, &dir);
+            }
+            NameAction::Rename(idx, path) => {
+                let target = path.parent().unwrap_or(Path::new(".")).join(name);
+                if target != path && !target.exists() {
+                    if let Err(err) = std::fs::rename(&path, &target) {
+                        eprintln!("tigriden: rename failed: {err}");
+                    } else {
+                        if let Some(editor) = self.sessions.get_mut(idx).and_then(|s| s.editor.as_mut())
+                        {
+                            if editor.path == path {
+                                editor.path = target.clone();
+                            }
+                        }
+                        let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                        self.refresh_dir(idx, &parent);
+                        self.update_chrome();
+                    }
+                }
+            }
+        }
+        self.close_name_dialog();
+    }
+
+    pub fn name_dialog_cancel(&mut self) {
+        self.close_name_dialog();
     }
 
     // ----- menu -----

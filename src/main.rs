@@ -64,6 +64,9 @@ fn main() {
     ui.on_menu_select_all(|| with_app(|app| app.menu_select_all()));
     ui.on_menu_close_terminal(|| with_app(|app| app.menu_close_terminal()));
     ui.on_menu_close_session(|| with_app(|app| app.menu_close_session()));
+    ui.on_tree_context(|action, id| with_app(|app| app.tree_context(action, id)));
+    ui.on_name_dialog_accept(|name| with_app(|app| app.name_dialog_accept(name.to_string())));
+    ui.on_name_dialog_cancel(|| with_app(|app| app.name_dialog_cancel()));
     ui.on_banner_primary(|| with_app(|app| app.banner_primary()));
     ui.on_banner_secondary(|| with_app(|app| app.banner_secondary()));
 

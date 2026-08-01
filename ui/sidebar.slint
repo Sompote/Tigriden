@@ -17,10 +17,30 @@ component TreeRowDelegate inherits Rectangle {
     callback clicked();
     callback toggled();
     callback closed();
+    callback context(int);
 
     height: data.kind == 0 ? 30px : 24px;
     background: touch.has-hover ? Theme.panel-hover
         : (data.kind == 0 && data.active ? Theme.selection : transparent);
+
+    // action codes: 0 new file, 1 new folder, 2 reveal, 3 open default,
+    // 4 copy path, 5 copy relative path, 6 duplicate, 7 rename, 8 trash
+    ctx-menu := ContextMenuArea {
+        Menu {
+            MenuItem { title: "New File…"; activated => { root.context(0); } }
+            MenuItem { title: "New Folder…"; activated => { root.context(1); } }
+            MenuSeparator { }
+            MenuItem { title: "Reveal in Finder"; activated => { root.context(2); } }
+            MenuItem { title: "Open in Default App"; activated => { root.context(3); } }
+            MenuSeparator { }
+            MenuItem { title: "Copy Path"; activated => { root.context(4); } }
+            MenuItem { title: "Copy Relative Path"; activated => { root.context(5); } }
+            MenuSeparator { }
+            MenuItem { title: "Duplicate"; activated => { root.context(6); } }
+            MenuItem { title: "Rename…"; activated => { root.context(7); } }
+            MenuItem { title: "Move to Trash"; activated => { root.context(8); } }
+        }
+    }
 
     touch := TouchArea {
         clicked => {
@@ -28,6 +48,11 @@ component TreeRowDelegate inherits Rectangle {
                 root.clicked();
             } else {
                 root.toggled();
+            }
+        }
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
+                ctx-menu.show({ x: self.mouse-x, y: self.mouse-y });
             }
         }
     }
@@ -77,6 +102,7 @@ export component Sidebar inherits Rectangle {
     callback row-clicked(int);
     callback row-toggled(int);
     callback close-session(int);
+    callback row-context(int, int);
     callback add-folder();
     callback recent-clicked(int);
     callback recent-forget(int);
@@ -106,6 +132,7 @@ export component Sidebar inherits Rectangle {
                 clicked => { root.row-clicked(row.row-id); }
                 toggled => { root.row-toggled(row.row-id); }
                 closed => { root.close-session(row.session); }
+                context(action) => { root.row-context(action, row.row-id); }
             }
         }
 
