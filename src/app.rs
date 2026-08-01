@@ -22,27 +22,60 @@ use crate::{MainWindow, PresetItem, TreeRow};
 
 static SYNTAX_SYSTEM: OnceLock<SyntaxSystem> = OnceLock::new();
 static NEXT_TERM_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_APP_ID: AtomicU64 = AtomicU64::new(1);
 
 fn syntax_system() -> &'static SyntaxSystem {
     SYNTAX_SYSTEM.get_or_init(SyntaxSystem::new)
 }
 
+struct WindowEntry {
+    id: u64,
+    app: Rc<RefCell<App>>,
+    // Strong handle: keeps the shown window alive while registered.
+    _ui: MainWindow,
+}
+
 thread_local! {
-    static APP: RefCell<Option<Rc<RefCell<App>>>> = const { RefCell::new(None) };
+    static WINDOWS: RefCell<Vec<WindowEntry>> = const { RefCell::new(Vec::new()) };
 }
 
-pub fn install(app: Rc<RefCell<App>>) {
-    APP.with(|slot| *slot.borrow_mut() = Some(app));
+pub fn register(id: u64, app: Rc<RefCell<App>>, ui: MainWindow) {
+    WINDOWS.with(|slot| slot.borrow_mut().push(WindowEntry { id, app, _ui: ui }));
 }
 
-/// Runs `f` against the installed app. Used by closures arriving via
+/// Runs `f` against the window's app; no-op if the window is gone (late PTY
+/// events after close). Used by UI callbacks and closures arriving via
 /// invoke_from_event_loop (PTY repaints, watcher events, timers).
-pub fn with_app(f: impl FnOnce(&mut App)) {
-    APP.with(|slot| {
-        if let Some(rc) = slot.borrow().as_ref() {
-            f(&mut rc.borrow_mut());
-        }
+pub fn with_app_id(id: u64, f: impl FnOnce(&mut App)) {
+    // Clone the Rc out of the registry borrow so `f` can't deadlock a
+    // registry re-borrow.
+    let app = WINDOWS.with(|slot| {
+        slot.borrow().iter().find(|e| e.id == id).map(|e| e.app.clone())
     });
+    if let Some(app) = app {
+        f(&mut app.borrow_mut());
+    }
+}
+
+/// Drops the window's registry entry (closing it); returns how many remain.
+pub fn remove_window(id: u64) -> usize {
+    WINDOWS.with(|slot| {
+        let mut windows = slot.borrow_mut();
+        windows.retain(|e| e.id != id);
+        windows.len()
+    })
+}
+
+/// Shuts down every remaining window's app (⌘Q quits without a per-window
+/// close_requested).
+pub fn shutdown_all() {
+    let apps = WINDOWS.with(|slot| {
+        slot.borrow().iter().map(|e| e.app.clone()).collect::<Vec<_>>()
+    });
+    for app in apps {
+        app.borrow_mut().shutdown();
+    }
+    WINDOWS.with(|slot| slot.borrow_mut().clear());
 }
 
 #[derive(Clone)]
@@ -95,8 +128,11 @@ fn bytemuck_cast(pixels: &[slint::Rgba8Pixel]) -> &[u8] {
 }
 
 pub struct App {
+    pub id: u64,
+    is_primary: bool,
     ui: slint::Weak<MainWindow>,
     pub config: Config,
+    presets: Vec<crate::config::Preset>,
     dark: bool,
     font_family: &'static str,
     sessions: Vec<Session>,
@@ -120,19 +156,38 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(ui: &MainWindow, config: Config, recents: Vec<PathBuf>) -> Self {
+    pub fn new(
+        ui: &MainWindow,
+        config: Config,
+        recents: Vec<PathBuf>,
+        team: Option<usize>,
+        is_primary: bool,
+    ) -> Self {
+        let id = NEXT_APP_ID.fetch_add(1, Ordering::Relaxed);
         let dark = config.theme != "light";
         let font_family: &'static str = Box::leak(config.font_family.clone().into_boxed_str());
-        let presets: Vec<PresetItem> = config
-            .presets
+        let presets: Vec<crate::config::Preset> = config.presets_for(team).to_vec();
+        let preset_items: Vec<PresetItem> = presets
             .iter()
             .map(|p| PresetItem { label: SharedString::from(p.label.as_str()) })
             .collect();
-        ui.set_presets(ModelRc::new(VecModel::from(presets)));
+        ui.set_presets(ModelRc::new(VecModel::from(preset_items)));
+        let team_names: Vec<SharedString> = config
+            .teams
+            .iter()
+            .map(|t| SharedString::from(t.name.as_str()))
+            .collect();
+        ui.set_team_names(ModelRc::new(VecModel::from(team_names)));
+        if let Some(team) = team.and_then(|i| config.teams.get(i)) {
+            ui.set_window_title(SharedString::from(format!("Tigriden — {}", team.name)));
+        }
 
         Self {
+            id,
+            is_primary,
             ui: ui.as_weak(),
             config,
+            presets,
             dark,
             font_family,
             sessions: Vec::new(),
@@ -192,7 +247,7 @@ impl App {
 
         let id = NEXT_TERM_ID.fetch_add(1, Ordering::Relaxed);
         let frame_pending = Arc::new(AtomicBool::new(false));
-        let hooks = Self::make_hooks(id, frame_pending.clone());
+        let hooks = Self::make_hooks(self.id, id, frame_pending.clone());
 
         match TermSession::spawn(
             root,
@@ -224,10 +279,11 @@ impl App {
         let Some(first_term) = self.spawn_term(&root) else { return };
 
         let fs_root = root.clone();
+        let app_id = self.id;
         let session = Session::new(root, first_term, move |paths| {
             let fs_root = fs_root.clone();
             let _ = slint::invoke_from_event_loop(move || {
-                with_app(|app| app.fs_changed(&fs_root, paths));
+                with_app_id(app_id, |app| app.fs_changed(&fs_root, paths));
             });
         });
         self.sessions.push(session);
@@ -241,13 +297,14 @@ impl App {
         // launch (escape \r for Enter).
         #[cfg(feature = "framedump")]
         if self.sessions.len() == 1 {
+            let app_id = self.id;
             if let Ok(cmds) = std::env::var("TIGRIDEN_TEST_INPUT") {
                 // Stages separated by \\t are sent 3 s apart.
                 for (i, stage) in cmds.split("\\t").enumerate() {
                     let bytes = stage.replace("\\r", "\r").into_bytes();
                     let delay = std::time::Duration::from_millis(1500 + i as u64 * 3000);
                     slint::Timer::single_shot(delay, move || {
-                        with_app(|app| {
+                        with_app_id(app_id, |app| {
                             if let Some(handle) =
                                 app.sessions.first().and_then(|s| s.terms.first())
                             {
@@ -258,18 +315,18 @@ impl App {
                 }
             }
             if let Ok(mode) = std::env::var("TIGRIDEN_TEST_NEWTERM") {
-                slint::Timer::single_shot(std::time::Duration::from_millis(2500), || {
-                    with_app(|app| app.new_terminal_active());
+                slint::Timer::single_shot(std::time::Duration::from_millis(2500), move || {
+                    with_app_id(app_id, |app| app.new_terminal_active());
                 });
                 if mode == "back" {
-                    slint::Timer::single_shot(std::time::Duration::from_millis(5000), || {
-                        with_app(|app| app.term_tab_clicked(0));
+                    slint::Timer::single_shot(std::time::Duration::from_millis(5000), move || {
+                        with_app_id(app_id, |app| app.term_tab_clicked(0));
                     });
                 }
             }
             if std::env::var("TIGRIDEN_TEST_SELECT").is_ok() {
-                slint::Timer::single_shot(std::time::Duration::from_millis(3000), || {
-                    with_app(|app| {
+                slint::Timer::single_shot(std::time::Duration::from_millis(3000), move || {
+                    with_app_id(app_id, |app| {
                         app.term_mouse(0, 5.0, 5.0);
                         app.term_mouse(2, 300.0, 5.0);
                         app.term_mouse(1, 300.0, 5.0);
@@ -283,8 +340,8 @@ impl App {
                 });
             }
             if std::env::var("TIGRIDEN_TEST_PASTE").is_ok() {
-                slint::Timer::single_shot(std::time::Duration::from_millis(3000), || {
-                    with_app(|app| {
+                slint::Timer::single_shot(std::time::Duration::from_millis(3000), move || {
+                    with_app_id(app_id, |app| {
                         let handled = app.term_key(
                             "v",
                             crate::term::keys::Mods { ctrl: false, alt: false, meta: true, shift: false },
@@ -295,12 +352,12 @@ impl App {
             }
             if let Ok(path) = std::env::var("TIGRIDEN_TEST_DROP") {
                 slint::Timer::single_shot(std::time::Duration::from_millis(3000), move || {
-                    with_app(|app| app.file_dropped(std::path::PathBuf::from(&path)));
+                    with_app_id(app_id, |app| app.file_dropped(std::path::PathBuf::from(&path)));
                 });
             }
             if std::env::var("TIGRIDEN_TEST_CTX").is_ok() {
-                slint::Timer::single_shot(std::time::Duration::from_millis(3000), || {
-                    with_app(|app| {
+                slint::Timer::single_shot(std::time::Duration::from_millis(3000), move || {
+                    with_app_id(app_id, |app| {
                         app.tree_context(1, 0); // New Folder on session header
                         app.name_dialog_accept("ctx-folder".into());
                         app.tree_context(0, 0); // New File on session header
@@ -312,23 +369,23 @@ impl App {
             }
             if let Ok(path) = std::env::var("TIGRIDEN_TEST_OPEN") {
                 slint::Timer::single_shot(std::time::Duration::from_millis(1500), move || {
-                    with_app(|app| app.open_file(0, std::path::PathBuf::from(&path)));
+                    with_app_id(app_id, |app| app.open_file(0, std::path::PathBuf::from(&path)));
                 });
             }
         }
     }
 
-    fn make_hooks(term_id: u64, pending: Arc<AtomicBool>) -> TermHooks {
+    fn make_hooks(app_id: u64, term_id: u64, pending: Arc<AtomicBool>) -> TermHooks {
         let repaint = Arc::new(move || {
             if !pending.swap(true, Ordering::AcqRel) {
                 let _ = slint::invoke_from_event_loop(move || {
-                    with_app(|app| app.term_repaint(term_id));
+                    with_app_id(app_id, |app| app.term_repaint(term_id));
                 });
             }
         });
         let exited = Arc::new(move || {
             let _ = slint::invoke_from_event_loop(move || {
-                with_app(|app| app.term_exited(term_id));
+                with_app_id(app_id, |app| app.term_exited(term_id));
             });
         });
         TermHooks { repaint, exited }
@@ -559,8 +616,9 @@ impl App {
         }
         if !self.fs_timer_armed {
             self.fs_timer_armed = true;
-            slint::Timer::single_shot(std::time::Duration::from_millis(250), || {
-                with_app(|app| app.drain_fs());
+            let app_id = self.id;
+            slint::Timer::single_shot(std::time::Duration::from_millis(250), move || {
+                with_app_id(app_id, |app| app.drain_fs());
             });
         }
     }
@@ -968,8 +1026,9 @@ impl App {
         self.term_view = (w, h);
         if !self.resize_timer_armed {
             self.resize_timer_armed = true;
-            slint::Timer::single_shot(std::time::Duration::from_millis(50), || {
-                with_app(|app| {
+            let app_id = self.id;
+            slint::Timer::single_shot(std::time::Duration::from_millis(50), move || {
+                with_app_id(app_id, |app| {
                     app.resize_timer_armed = false;
                     app.apply_term_size();
                     app.render_term();
@@ -1019,7 +1078,7 @@ impl App {
     }
 
     pub fn preset_clicked(&mut self, idx: usize) {
-        let Some(preset) = self.config.presets.get(idx) else { return };
+        let Some(preset) = self.presets.get(idx) else { return };
         let mut bytes = preset.command.clone().into_bytes();
         if preset.send_enter {
             bytes.push(b'\r');
@@ -1472,7 +1531,8 @@ impl App {
     }
 
     fn persist(&mut self) {
-        if self.shutting_down {
+        // Only the primary window owns state.toml; secondaries would clobber it.
+        if !self.is_primary || self.shutting_down {
             return;
         }
         let state = PersistedState {

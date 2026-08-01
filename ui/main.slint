@@ -68,7 +68,8 @@ component PixelPane inherits Rectangle {
 }
 
 export component MainWindow inherits Window {
-    title: "Tigriden";
+    in property <string> window-title: "Tigriden";
+    title: window-title;
     icon: @image-url("../assets/icon-256.png");
     preferred-width: 1100px;
     preferred-height: 720px;
@@ -76,6 +77,7 @@ export component MainWindow inherits Window {
 
     in property <[TreeRow]> tree-rows;
     in property <[string]> recent-folders;
+    in property <[string]> team-names;
     in property <[PresetItem]> presets;
     in property <image> editor-frame;
     in property <image> term-frame;
@@ -98,6 +100,7 @@ export component MainWindow inherits Window {
     callback row-toggled(int);
     callback close-session(int);
     callback add-folder();
+    callback new-window(int);
     callback recent-clicked(int);
     callback recent-forget(int);
     callback preset-clicked(int);
@@ -151,6 +154,17 @@ export component MainWindow inherits Window {
                 for folder[i] in root.recent-folders: MenuItem {
                     title: folder;
                     activated => { root.recent-clicked(i); }
+                }
+            }
+            Menu {
+                title: "New Window";
+                MenuItem {
+                    title: "Default";
+                    activated => { root.new-window(-1); }
+                }
+                for name[i] in root.team-names: MenuItem {
+                    title: name;
+                    activated => { root.new-window(i); }
                 }
             }
             MenuSeparator { }

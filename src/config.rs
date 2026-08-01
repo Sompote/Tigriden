@@ -14,6 +14,14 @@ fn default_true() -> bool {
     true
 }
 
+/// A named group of presets shown in its own window ("agent team").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Team {
+    pub name: String,
+    #[serde(default)]
+    pub presets: Vec<Preset>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -22,6 +30,18 @@ pub struct Config {
     pub font_size: f32,
     pub scrollback: usize,
     pub presets: Vec<Preset>,
+    #[serde(default)]
+    pub teams: Vec<Team>,
+}
+
+impl Config {
+    /// Presets for a team index; None or out-of-range falls back to the
+    /// default flat list.
+    pub fn presets_for(&self, team: Option<usize>) -> &[Preset] {
+        team.and_then(|i| self.teams.get(i))
+            .map(|t| t.presets.as_slice())
+            .unwrap_or(&self.presets)
+    }
 }
 
 impl Default for Config {
@@ -36,6 +56,7 @@ impl Default for Config {
                 Preset { label: "codex".into(), command: "codex".into(), send_enter: true },
                 Preset { label: "gemini".into(), command: "gemini".into(), send_enter: true },
             ],
+            teams: Vec::new(),
         }
     }
 }
