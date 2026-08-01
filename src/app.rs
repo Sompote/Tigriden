@@ -964,6 +964,45 @@ impl App {
         self.update_chrome();
     }
 
+    // ----- menu -----
+
+    fn editor_focused(&self) -> bool {
+        self.ui().map(|ui| ui.get_editor_focused()).unwrap_or(false)
+    }
+
+    pub fn menu_copy(&mut self) {
+        if self.editor_focused() {
+            self.editor_key("c", Mods { ctrl: false, alt: false, meta: true, shift: false });
+        } else {
+            self.term_shortcut("c");
+        }
+    }
+
+    pub fn menu_paste(&mut self) {
+        if self.editor_focused() {
+            self.editor_key("v", Mods { ctrl: false, alt: false, meta: true, shift: false });
+        } else {
+            self.term_shortcut("v");
+        }
+    }
+
+    pub fn menu_select_all(&mut self) {
+        if self.editor_focused() {
+            self.editor_key("a", Mods { ctrl: false, alt: false, meta: true, shift: false });
+        }
+    }
+
+    pub fn menu_close_terminal(&mut self) {
+        if let Some(session) = self.sessions.get(self.active) {
+            let tab = session.active_term;
+            self.close_terminal(tab);
+        }
+    }
+
+    pub fn menu_close_session(&mut self) {
+        self.close_session(self.active);
+    }
+
     // ----- banner -----
 
     fn show_banner(&mut self, banner: Banner) {

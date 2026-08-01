@@ -58,6 +58,12 @@ fn main() {
     ui.on_new_terminal(|| with_app(|app| app.new_terminal_active()));
     ui.on_close_terminal(|tab| with_app(|app| app.close_terminal(tab as usize)));
     ui.on_split_changed(|| with_app(|app| app.split_changed()));
+    ui.on_menu_save(|| with_app(|app| app.save_editor()));
+    ui.on_menu_copy(|| with_app(|app| app.menu_copy()));
+    ui.on_menu_paste(|| with_app(|app| app.menu_paste()));
+    ui.on_menu_select_all(|| with_app(|app| app.menu_select_all()));
+    ui.on_menu_close_terminal(|| with_app(|app| app.menu_close_terminal()));
+    ui.on_menu_close_session(|| with_app(|app| app.menu_close_session()));
     ui.on_banner_primary(|| with_app(|app| app.banner_primary()));
     ui.on_banner_secondary(|| with_app(|app| app.banner_secondary()));
 

@@ -35,7 +35,8 @@ Agentic coding means running several agents in several folders and checking in o
 - **Drag & drop files** — drop any file from Finder onto the window and its (shell-quoted) path is typed into the terminal, so you can attach files to an agent prompt the same way as in a native terminal.
 - **Built-in editor** — syntax highlighting for 40+ languages ([cosmic-text](https://crates.io/crates/cosmic-text) + syntect), edit and Cmd+S save. When an agent edits the open file on disk, it reloads automatically (or asks, if you have unsaved changes).
 - **Per-folder sessions** — each workspace keeps its own shell, tree, and open file; switching is instant.
-- **Recent folders** — every folder you add is remembered permanently; the ⟳ button next to *+ Add folder* reopens any of them with one click, even after you removed them from the workbench (✕ next to an entry forgets it).
+- **Recent folders** — every folder you add is remembered permanently; reopen from the ⟳ button or **File ▸ Open Recent**, even after removing it from the workbench.
+- **Native menu bar** — File (Add Folder ⌘O, New Terminal ⌘T, Open Recent, Save ⌘S, Close Terminal ⌘W, Close Folder ⇧⌘W) and Edit (Copy/Paste/Select All) menus, routed to whichever pane has focus.
 - **Persistent** — folders, active session, and layout are restored on relaunch (fresh shells each time, by design).
 - **Small on purpose** — no webview, no Electron, no C regex libraries. Slint UI with both panes rasterized straight to pixel buffers.
 

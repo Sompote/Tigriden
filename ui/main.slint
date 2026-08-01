@@ -99,6 +99,12 @@ export component MainWindow inherits Window {
     callback term-tab-clicked(int);
     callback new-terminal();
     callback close-terminal(int);
+    callback menu-save();
+    callback menu-copy();
+    callback menu-paste();
+    callback menu-select-all();
+    callback menu-close-terminal();
+    callback menu-close-session();
     callback split-changed();
     callback banner-primary();
     callback banner-secondary();
@@ -112,9 +118,69 @@ export component MainWindow inherits Window {
     callback editor-size-changed(length, length);
 
     out property <bool> term-focused: term-pane.pane-focused;
+    out property <bool> editor-focused: editor-pane.pane-focused;
 
     public function focus-terminal() {
         term-pane.grab-focus();
+    }
+
+    MenuBar {
+        Menu {
+            title: "File";
+            MenuItem {
+                title: "Add Folder…";
+                shortcut: @keys(Control + O);
+                activated => { root.add-folder(); }
+            }
+            MenuItem {
+                title: "New Terminal";
+                shortcut: @keys(Control + T);
+                activated => { root.new-terminal(); }
+            }
+            Menu {
+                title: "Open Recent";
+                for folder[i] in root.recent-folders: MenuItem {
+                    title: folder;
+                    activated => { root.recent-clicked(i); }
+                }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: "Save";
+                shortcut: @keys(Control + S);
+                activated => { root.menu-save(); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: "Close Terminal";
+                shortcut: @keys(Control + W);
+                activated => { root.menu-close-terminal(); }
+            }
+            MenuItem {
+                title: "Close Folder";
+                shortcut: @keys(Control + Shift + W);
+                activated => { root.menu-close-session(); }
+            }
+        }
+        Menu {
+            title: "Edit";
+            MenuItem {
+                title: "Copy";
+                shortcut: @keys(Control + C);
+                activated => { root.menu-copy(); }
+            }
+            MenuItem {
+                title: "Paste";
+                shortcut: @keys(Control + V);
+                activated => { root.menu-paste(); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: "Select All";
+                shortcut: @keys(Control + A);
+                activated => { root.menu-select-all(); }
+            }
+        }
     }
 
     HorizontalLayout {
