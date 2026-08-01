@@ -56,11 +56,12 @@ component TreeRowDelegate inherits Rectangle {
             horizontal-stretch: 1;
         }
 
-        if data.kind == 0 && touch.has-hover: close-touch := TouchArea {
+        // Remove-from-workbench button (the folder stays in Recent).
+        if data.kind == 0: close-touch := TouchArea {
             width: 18px;
             Text {
                 text: "✕";
-                color: Theme.text-dim;
+                color: close-touch.has-hover ? Theme.text : Theme.text-dim;
                 font-size: 10px;
                 vertical-alignment: center;
                 horizontal-alignment: center;
@@ -72,10 +73,13 @@ component TreeRowDelegate inherits Rectangle {
 
 export component Sidebar inherits Rectangle {
     in property <[TreeRow]> rows;
+    in property <[string]> recent-folders;
     callback row-clicked(int);
     callback row-toggled(int);
     callback close-session(int);
     callback add-folder();
+    callback recent-clicked(int);
+    callback recent-forget(int);
 
     background: Theme.panel;
 
@@ -105,20 +109,108 @@ export component Sidebar inherits Rectangle {
             }
         }
 
-        Rectangle {
+        bottom-bar := Rectangle {
             height: 40px;
             border-width: 1px;
             border-color: Theme.border;
-            add-touch := TouchArea {
-                clicked => { root.add-folder(); }
+
+            recent-popup := PopupWindow {
+                x: 4px;
+                y: -(min(max(root.recent-folders.length, 1), 10) * 28px + 14px);
+                width: root.width - 8px;
+                close-policy: close-on-click-outside;
+
+                Rectangle {
+                    background: Theme.panel;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    border-radius: 6px;
+
+                    VerticalLayout {
+                        padding: 4px;
+
+                        if root.recent-folders.length == 0: Rectangle {
+                            height: 28px;
+                            Text {
+                                text: "No recent folders";
+                                color: Theme.text-dim;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                horizontal-alignment: center;
+                            }
+                        }
+
+                        for folder[i] in root.recent-folders: recent-row := TouchArea {
+                            height: 28px;
+                            Rectangle {
+                                background: recent-row.has-hover ? Theme.panel-hover : transparent;
+                                border-radius: 4px;
+                                HorizontalLayout {
+                                    padding-left: 8px;
+                                    padding-right: 4px;
+                                    spacing: 4px;
+                                    Text {
+                                        text: folder;
+                                        color: Theme.text;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                    }
+                                    forget-touch := TouchArea {
+                                        width: 18px;
+                                        Text {
+                                            text: "✕";
+                                            color: forget-touch.has-hover ? Theme.text : Theme.text-dim;
+                                            font-size: 10px;
+                                            vertical-alignment: center;
+                                            horizontal-alignment: center;
+                                        }
+                                        clicked => { root.recent-forget(i); }
+                                    }
+                                }
+                            }
+                            clicked => {
+                                recent-popup.close();
+                                root.recent-clicked(i);
+                            }
+                        }
+                    }
+                }
             }
-            background: add-touch.has-hover ? Theme.panel-hover : transparent;
-            Text {
-                text: "+ Add folder";
-                color: Theme.accent;
-                font-size: Theme.font-size;
-                vertical-alignment: center;
-                horizontal-alignment: center;
+
+            HorizontalLayout {
+                add-touch := TouchArea {
+                    horizontal-stretch: 1;
+                    Rectangle {
+                        background: add-touch.has-hover ? Theme.panel-hover : transparent;
+                        Text {
+                            text: "+ Add folder";
+                            color: Theme.accent;
+                            font-size: Theme.font-size;
+                            vertical-alignment: center;
+                            horizontal-alignment: center;
+                        }
+                    }
+                    clicked => { root.add-folder(); }
+                }
+
+                recent-touch := TouchArea {
+                    width: 40px;
+                    Rectangle {
+                        background: recent-touch.has-hover ? Theme.panel-hover : transparent;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        Text {
+                            text: "⟳";
+                            color: Theme.accent;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                            horizontal-alignment: center;
+                        }
+                    }
+                    clicked => { recent-popup.show(); }
+                }
             }
         }
     }

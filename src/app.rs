@@ -90,6 +90,7 @@ pub struct App {
     font_family: &'static str,
     sessions: Vec<Session>,
     active: usize,
+    recents: Vec<PathBuf>,
     row_map: Vec<RowTarget>,
     font_system: FontSystem,
     swash_cache: SwashCache,
@@ -106,7 +107,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(ui: &MainWindow, config: Config) -> Self {
+    pub fn new(ui: &MainWindow, config: Config, recents: Vec<PathBuf>) -> Self {
         let dark = config.theme != "light";
         let font_family: &'static str = Box::leak(config.font_family.clone().into_boxed_str());
         let presets: Vec<PresetItem> = config
@@ -123,6 +124,7 @@ impl App {
             font_family,
             sessions: Vec::new(),
             active: 0,
+            recents,
             row_map: Vec::new(),
             font_system: FontSystem::new(),
             swash_cache: SwashCache::new(),
@@ -196,6 +198,9 @@ impl App {
 
     pub fn add_session(&mut self, root: PathBuf, persist: bool) {
         let root = root.canonicalize().unwrap_or(root);
+        if persist {
+            self.touch_recent(&root);
+        }
         if let Some(idx) = self.sessions.iter().position(|s| s.root == root) {
             self.set_active(idx);
             return;
@@ -327,6 +332,53 @@ impl App {
         }
         self.apply_term_size();
         self.refresh_all();
+    }
+
+    // ----- recent folders -----
+
+    /// Moves `root` to the front of the recent list (kept even after the
+    /// folder is removed from the workbench).
+    fn touch_recent(&mut self, root: &Path) {
+        self.recents.retain(|p| p != root);
+        self.recents.insert(0, root.to_path_buf());
+        self.recents.truncate(10);
+        self.update_recents_model();
+    }
+
+    pub fn update_recents_model(&mut self) {
+        let Some(ui) = self.ui() else { return };
+        let home = dirs::home_dir();
+        let labels: Vec<SharedString> = self
+            .recents
+            .iter()
+            .map(|p| {
+                let shown = home
+                    .as_ref()
+                    .and_then(|h| p.strip_prefix(h).ok())
+                    .map(|rel| format!("~/{}", rel.display()))
+                    .unwrap_or_else(|| p.display().to_string());
+                SharedString::from(shown)
+            })
+            .collect();
+        ui.set_recent_folders(ModelRc::new(VecModel::from(labels)));
+    }
+
+    pub fn recent_clicked(&mut self, idx: usize) {
+        let Some(path) = self.recents.get(idx).cloned() else { return };
+        if !path.is_dir() {
+            // Folder vanished since it was last used; drop it from the list.
+            self.forget_recent(idx);
+            return;
+        }
+        self.add_session(path, true);
+    }
+
+    pub fn forget_recent(&mut self, idx: usize) {
+        if idx < self.recents.len() {
+            self.recents.remove(idx);
+            self.update_recents_model();
+            self.persist();
+        }
     }
 
     pub fn close_session(&mut self, idx: usize) {
@@ -912,6 +964,7 @@ impl App {
             folders: self.sessions.iter().map(|s| s.root.clone()).collect(),
             active: self.active,
             split_ratio: self.ui().map(|ui| ui.get_split_ratio()),
+            recent_folders: self.recents.clone(),
         };
         config::save_state(&state);
     }

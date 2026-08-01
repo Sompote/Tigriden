@@ -29,8 +29,9 @@ fn main() {
         ui.set_split_ratio(ratio.clamp(0.15, 0.85));
     }
 
-    let app = Rc::new(RefCell::new(App::new(&ui, config)));
+    let app = Rc::new(RefCell::new(App::new(&ui, config, state.recent_folders.clone())));
     app::install(app.clone());
+    with_app(|app| app.update_recents_model());
 
     if malformed_config {
         eprintln!("tigriden: config.toml is malformed; using defaults (file left untouched)");
@@ -41,6 +42,8 @@ fn main() {
             with_app(|app| app.add_session(folder, true));
         }
     });
+    ui.on_recent_clicked(|i| with_app(|app| app.recent_clicked(i as usize)));
+    ui.on_recent_forget(|i| with_app(|app| app.forget_recent(i as usize)));
     ui.on_row_clicked(|id| with_app(|app| app.row_clicked(id)));
     ui.on_row_toggled(|id| with_app(|app| app.row_toggled(id)));
     ui.on_close_session(|idx| with_app(|app| app.close_session(idx as usize)));

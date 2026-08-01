@@ -46,6 +46,9 @@ pub struct PersistedState {
     pub folders: Vec<PathBuf>,
     pub active: usize,
     pub split_ratio: Option<f32>,
+    /// Every folder ever added, most recent first — survives removal from the
+    /// workbench so it can be re-opened from the Recent menu.
+    pub recent_folders: Vec<PathBuf>,
 }
 
 fn config_dir() -> Option<PathBuf> {

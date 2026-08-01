@@ -32,6 +32,7 @@ Agentic coding means running several agents in several folders and checking in o
 - **Live file tree** — gitignore-aware, refreshes automatically as agents create and delete files.
 - **Built-in editor** — syntax highlighting for 40+ languages ([cosmic-text](https://crates.io/crates/cosmic-text) + syntect), edit and Cmd+S save. When an agent edits the open file on disk, it reloads automatically (or asks, if you have unsaved changes).
 - **Per-folder sessions** — each workspace keeps its own shell, tree, and open file; switching is instant.
+- **Recent folders** — every folder you add is remembered permanently; the ⟳ button next to *+ Add folder* reopens any of them with one click, even after you removed them from the workbench (✕ next to an entry forgets it).
 - **Persistent** — folders, active session, and layout are restored on relaunch (fresh shells each time, by design).
 - **Small on purpose** — no webview, no Electron, no C regex libraries. Slint UI with both panes rasterized straight to pixel buffers.
 
@@ -52,7 +53,8 @@ Requires stable Rust. macOS is the primary target (Linux/Windows untested but th
 2. Click a preset button (e.g. **claude**) to launch the agent, or type any command.
 3. Watch the file tree update as the agent works; click any file to inspect or tweak it.
 4. Click **+** in the terminal tab strip to open more terminals in the same folder (each tab is its own shell; ✕ on hover closes one).
-5. Add more folders to run more agents in parallel; switch by clicking a session in the sidebar.
+5. Add more folders to run more agents in parallel; switch by clicking a session in the sidebar. The ✕ on a session header removes the folder from the workbench (its shells are stopped; the folder stays in Recent).
+6. Click **⟳** (bottom of the sidebar) to reopen any previously added folder without the file dialog.
 
 ### Keys
 

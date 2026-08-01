@@ -73,6 +73,7 @@ export component MainWindow inherits Window {
     background: Theme.bg;
 
     in property <[TreeRow]> tree-rows;
+    in property <[string]> recent-folders;
     in property <[PresetItem]> presets;
     in property <image> editor-frame;
     in property <image> term-frame;
@@ -91,6 +92,8 @@ export component MainWindow inherits Window {
     callback row-toggled(int);
     callback close-session(int);
     callback add-folder();
+    callback recent-clicked(int);
+    callback recent-forget(int);
     callback preset-clicked(int);
     callback term-tab-clicked(int);
     callback new-terminal();
@@ -117,10 +120,13 @@ export component MainWindow inherits Window {
         Sidebar {
             width: 240px;
             rows: root.tree-rows;
+            recent-folders: root.recent-folders;
             row-clicked(id) => { root.row-clicked(id); }
             row-toggled(id) => { root.row-toggled(id); }
             close-session(s) => { root.close-session(s); }
             add-folder => { root.add-folder(); }
+            recent-clicked(i) => { root.recent-clicked(i); }
+            recent-forget(i) => { root.recent-forget(i); }
         }
 
         Rectangle {
