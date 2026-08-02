@@ -90,10 +90,14 @@ impl TermSession {
             })
             .map_err(|e| format!("openpty: {e}"))?;
 
+        #[cfg(not(windows))]
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        #[cfg(windows)]
+        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
         let mut cmd = CommandBuilder::new(&shell);
         // Interactive login shell so the user's PATH (where agent CLIs live)
-        // is available.
+        // is available. (cmd.exe takes no such flags.)
+        #[cfg(not(windows))]
         cmd.arg("-il");
         cmd.cwd(root);
         cmd.env("TERM", "xterm-256color");
