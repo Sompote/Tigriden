@@ -24,7 +24,8 @@ component TreeRowDelegate inherits Rectangle {
         : (data.kind == 0 && data.active ? Theme.selection : transparent);
 
     // action codes: 0 new file, 1 new folder, 2 reveal, 3 open default,
-    // 4 copy path, 5 copy relative path, 6 duplicate, 7 rename, 8 trash
+    // 4 copy path, 5 copy relative path, 6 duplicate, 7 rename, 8 trash,
+    // 9 discard changes (changes-panel rows only), 10 discard all (changes header)
     ctx-menu := ContextMenuArea {
         Menu {
             MenuItem { title: "New File…"; activated => { root.context(0); } }
@@ -39,12 +40,22 @@ component TreeRowDelegate inherits Rectangle {
             MenuItem { title: "Duplicate"; activated => { root.context(6); } }
             MenuItem { title: "Rename…"; activated => { root.context(7); } }
             MenuItem { title: "Move to Trash"; activated => { root.context(8); } }
+            if root.data.kind == 4: MenuSeparator { }
+            if root.data.kind == 4: MenuItem {
+                title: "Discard Changes…";
+                activated => { root.context(9); }
+            }
+            if root.data.kind == 3: MenuSeparator { }
+            if root.data.kind == 3: MenuItem {
+                title: "Discard All Changes…";
+                activated => { root.context(10); }
+            }
         }
     }
 
     touch := TouchArea {
         clicked => {
-            if (root.data.kind == 2) {
+            if (root.data.kind == 2 || root.data.kind == 4) {
                 root.clicked();
             } else {
                 root.toggled();
@@ -62,20 +73,20 @@ component TreeRowDelegate inherits Rectangle {
         padding-right: 6px;
         spacing: 5px;
 
-        if data.kind != 2: Text {
+        if data.kind != 2 && data.kind != 4: Text {
             width: 12px;
             text: data.expanded ? "▾" : "▸";
             color: Theme.text-dim;
             font-size: 10px;
             vertical-alignment: center;
         }
-        if data.kind == 2: Rectangle { width: 12px; }
+        if data.kind == 2 || data.kind == 4: Rectangle { width: 12px; }
 
         Text {
             text: data.name;
             color: data.kind == 0 ? Theme.text : (data.kind == 1 ? Theme.text : Theme.text-dim);
             font-size: data.kind == 0 ? Theme.font-size : Theme.font-size - 1px;
-            font-weight: data.kind == 0 ? 600 : 400;
+            font-weight: data.kind == 0 || data.kind == 3 ? 600 : 400;
             vertical-alignment: center;
             overflow: elide;
             horizontal-stretch: 1;
@@ -92,6 +103,19 @@ component TreeRowDelegate inherits Rectangle {
                 horizontal-alignment: center;
             }
             clicked => { root.closed(); }
+        }
+
+        // Discard-all button on the Changes subheader.
+        if data.kind == 3: discard-touch := TouchArea {
+            width: 18px;
+            Text {
+                text: "↺";
+                color: discard-touch.has-hover ? Theme.text : Theme.text-dim;
+                font-size: 11px;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+            clicked => { root.context(10); }
         }
     }
 }

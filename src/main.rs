@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod editor;
+mod git;
 mod paint;
 mod session;
 mod term;
@@ -112,6 +113,7 @@ fn wire_callbacks(ui: &MainWindow, app_id: u64, config: config::Config) {
     });
     ui.on_name_dialog_cancel(move || with_app_id(app_id, |app| app.name_dialog_cancel()));
     ui.on_toggle_view(move || with_app_id(app_id, |app| app.toggle_view()));
+    ui.on_toggle_changes(move || with_app_id(app_id, |app| app.toggle_changes()));
     ui.on_banner_primary(move || with_app_id(app_id, |app| app.banner_primary()));
     ui.on_banner_secondary(move || with_app_id(app_id, |app| app.banner_secondary()));
 

@@ -83,10 +83,14 @@ enum RowTarget {
     Header(usize),
     Dir(usize, PathBuf),
     File(usize, PathBuf),
+    ChangesHeader(usize),
+    /// Absolute path + combined status letter (M/A/D) of a changed file.
+    Change(usize, PathBuf, char),
 }
 
 enum PendingAction {
     OpenFile(usize, PathBuf),
+    OpenDiff(usize, PathBuf),
     CloseSession(usize),
 }
 
@@ -94,6 +98,8 @@ enum Banner {
     None,
     Unsaved(PendingAction),
     DiskChanged,
+    ConfirmDiscard(usize, PathBuf, char),
+    ConfirmDiscardAll(usize),
 }
 
 /// What the name-input dialog will do with the entered name.
@@ -152,6 +158,8 @@ pub struct App {
     pending_name: Option<NameAction>,
     fs_timer_armed: bool,
     resize_timer_armed: bool,
+    /// Runtime toggle for the git Changes panel; every window starts off.
+    changes_enabled: bool,
     shutting_down: bool,
 }
 
@@ -207,8 +215,30 @@ impl App {
             pending_name: None,
             fs_timer_armed: false,
             resize_timer_armed: false,
+            changes_enabled: false,
             shutting_down: false,
         }
+    }
+
+    /// File → Show/Hide Changes Panel.
+    pub fn toggle_changes(&mut self) {
+        self.changes_enabled = !self.changes_enabled;
+        if let Some(ui) = self.ui() {
+            ui.set_changes_enabled(self.changes_enabled);
+        }
+        if self.changes_enabled {
+            for idx in 0..self.sessions.len() {
+                self.sessions[idx].tracking = crate::git::detect(&self.sessions[idx].root);
+                // Shadow folders get a fresh baseline: "watch from now".
+                self.refresh_changes(idx, true);
+            }
+        } else {
+            for session in &mut self.sessions {
+                session.tracking = None;
+                session.changes.clear();
+            }
+        }
+        self.rebuild_tree();
     }
 
     fn ui(&self) -> Option<MainWindow> {
@@ -287,7 +317,12 @@ impl App {
             });
         });
         self.sessions.push(session);
-        self.set_active(self.sessions.len() - 1);
+        let new_idx = self.sessions.len() - 1;
+        if self.changes_enabled {
+            self.sessions[new_idx].tracking = crate::git::detect(&self.sessions[new_idx].root);
+            self.refresh_changes(new_idx, true);
+        }
+        self.set_active(new_idx);
         if persist {
             self.persist();
         }
@@ -540,6 +575,8 @@ impl App {
                 self.sessions[idx].tree.toggle(&path);
                 self.rebuild_tree();
             }
+            Some(RowTarget::Change(idx, path, _)) => self.open_diff_view(idx, path),
+            Some(RowTarget::ChangesHeader(idx)) => self.toggle_changes_section(idx),
             None => {}
         }
     }
@@ -556,12 +593,22 @@ impl App {
                 self.rebuild_tree();
             }
             Some(RowTarget::File(idx, path)) => self.open_file(idx, path),
+            Some(RowTarget::Change(idx, path, _)) => self.open_diff_view(idx, path),
+            Some(RowTarget::ChangesHeader(idx)) => self.toggle_changes_section(idx),
             None => {}
         }
     }
 
+    fn toggle_changes_section(&mut self, idx: usize) {
+        if let Some(session) = self.sessions.get_mut(idx) {
+            session.changes_visible = !session.changes_visible;
+        }
+        self.rebuild_tree();
+    }
+
     fn rebuild_tree(&mut self) {
         let Some(ui) = self.ui() else { return };
+        let changes_enabled = self.changes_enabled;
         let mut rows: Vec<TreeRow> = Vec::new();
         self.row_map.clear();
         for (i, session) in self.sessions.iter_mut().enumerate() {
@@ -577,6 +624,36 @@ impl App {
             self.row_map.push(RowTarget::Header(i));
             if !session.tree_visible {
                 continue;
+            }
+            if changes_enabled && session.tracking.is_some() {
+                rows.push(TreeRow {
+                    kind: 3,
+                    indent: 1,
+                    name: SharedString::from(format!("Changes ({})", session.changes.len())),
+                    expanded: session.changes_visible,
+                    session: i as i32,
+                    row_id: self.row_map.len() as i32,
+                    active: false,
+                });
+                self.row_map.push(RowTarget::ChangesHeader(i));
+                if session.changes_visible {
+                    for change in &session.changes {
+                        rows.push(TreeRow {
+                            kind: 4,
+                            indent: 2,
+                            name: SharedString::from(format!("{}  {}", change.status, change.rel)),
+                            expanded: false,
+                            session: i as i32,
+                            row_id: self.row_map.len() as i32,
+                            active: false,
+                        });
+                        self.row_map.push(RowTarget::Change(
+                            i,
+                            change.abs(&session.root),
+                            change.status,
+                        ));
+                    }
+                }
             }
             for flat in session.tree.flatten() {
                 rows.push(TreeRow {
@@ -627,9 +704,13 @@ impl App {
         self.fs_timer_armed = false;
         let mut needs_tree = false;
         let mut reload_check: Vec<usize> = Vec::new();
+        let mut git_refresh: Vec<usize> = Vec::new();
         for (i, session) in self.sessions.iter_mut().enumerate() {
             if session.pending_fs.is_empty() {
                 continue;
+            }
+            if session.tracking.is_some() {
+                git_refresh.push(i);
             }
             let dirs = std::mem::take(&mut session.pending_fs);
             if let Some(editor) = &session.editor {
@@ -651,6 +732,51 @@ impl App {
         for idx in reload_check {
             self.maybe_reload_editor(idx);
         }
+        for idx in git_refresh {
+            self.refresh_changes(idx, false);
+        }
+    }
+
+    // ----- git changes panel -----
+
+    /// Re-runs `git status` for one session on a background thread. Results
+    /// arrive in `changes_ready`; a generation counter drops stale ones.
+    /// `rebaseline` re-snapshots shadow-tracked folders ("watch from now").
+    fn refresh_changes(&mut self, idx: usize, rebaseline: bool) {
+        if !self.changes_enabled {
+            return;
+        }
+        let Some(session) = self.sessions.get_mut(idx) else { return };
+        let Some(tracking) = session.tracking.clone() else { return };
+        session.changes_gen += 1;
+        let generation = session.changes_gen;
+        let root = session.root.clone();
+        let app_id = self.id;
+        std::thread::spawn(move || {
+            if let crate::git::Tracking::Shadow(dir) = &tracking {
+                if rebaseline || !dir.join("HEAD").exists() {
+                    crate::git::snapshot_baseline(&root, dir);
+                }
+            }
+            let changes = crate::git::status(&root, &tracking);
+            let _ = slint::invoke_from_event_loop(move || {
+                with_app_id(app_id, |app| app.changes_ready(&root, generation, changes));
+            });
+        });
+    }
+
+    fn changes_ready(&mut self, root: &Path, generation: u64, changes: Vec<crate::git::Change>) {
+        // Look up by root — session indices may have shifted meanwhile.
+        let Some(idx) = self.sessions.iter().position(|s| s.root == root) else { return };
+        let session = &mut self.sessions[idx];
+        if session.tracking.is_none() || session.changes_gen != generation {
+            return; // panel toggled off, or a newer refresh is in flight
+        }
+        if session.changes == changes {
+            return;
+        }
+        session.changes = changes;
+        self.rebuild_tree();
     }
 
     fn maybe_reload_editor(&mut self, idx: usize) {
@@ -659,6 +785,13 @@ impl App {
         if let Some(viewer_state) = &self.sessions[idx].viewer {
             let (path, kind) = (viewer_state.path.clone(), viewer_state.kind);
             self.open_viewer(idx, path, kind);
+            return;
+        }
+        // A read-only diff has no disk_mtime; re-run the diff instead of
+        // letting the mtime check replace it with raw file text.
+        if self.sessions[idx].editor.as_ref().is_some_and(|e| e.read_only) {
+            let path = self.sessions[idx].editor.as_ref().unwrap().path.clone();
+            self.open_diff_view(idx, path);
             return;
         }
         let Some(editor) = self.sessions[idx].editor.as_mut() else { return };
@@ -732,6 +865,14 @@ impl App {
     /// text file in its rendered view.
     pub fn toggle_view(&mut self) {
         let Some(session) = self.sessions.get_mut(self.active) else { return };
+        // Diff view's "File" chip: jump to the editable file (one-way; the
+        // diff is reopened from the Changes panel).
+        if session.editor.as_ref().is_some_and(|e| e.read_only) {
+            let path = session.editor.as_ref().unwrap().path.clone();
+            session.editor = None;
+            self.really_open_file(self.active, path);
+            return;
+        }
         if let Some(viewer_state) = &session.viewer {
             let path = viewer_state.path.clone();
             session.viewer = None;
@@ -782,6 +923,54 @@ impl App {
             self.dark,
         ) {
             Ok(editor) => {
+                self.sessions[idx].editor = Some(editor);
+                self.apply_editor_size();
+                self.render_editor();
+                self.update_chrome();
+            }
+            Err(err) => eprintln!("tigriden: {err}"),
+        }
+    }
+
+    /// Opens a read-only diff of `path` vs HEAD in the editor pane.
+    fn open_diff_view(&mut self, idx: usize, path: PathBuf) {
+        if self.sessions[idx].editor.as_ref().is_some_and(|e| e.dirty && !e.read_only) {
+            self.active = idx;
+            self.show_banner(Banner::Unsaved(PendingAction::OpenDiff(idx, path)));
+            return;
+        }
+        self.active = idx;
+        let session = &mut self.sessions[idx];
+        let Some(tracking) = session.tracking.clone() else { return };
+        session.diff_gen += 1;
+        let generation = session.diff_gen;
+        let root = session.root.clone();
+        let app_id = self.id;
+        std::thread::spawn(move || {
+            let text = crate::git::diff_file(&root, &tracking, &path);
+            let _ = slint::invoke_from_event_loop(move || {
+                with_app_id(app_id, |app| app.diff_ready(&root, generation, path, text));
+            });
+        });
+    }
+
+    fn diff_ready(&mut self, root: &Path, generation: u64, path: PathBuf, text: String) {
+        let Some(idx) = self.sessions.iter().position(|s| s.root == root) else { return };
+        if self.sessions[idx].diff_gen != generation {
+            return;
+        }
+        let scale = self.scale();
+        match EditorState::open_diff(
+            &mut self.font_system,
+            syntax_system(),
+            &path,
+            &text,
+            self.font_family,
+            self.config.font_size * scale,
+            self.dark,
+        ) {
+            Ok(editor) => {
+                self.sessions[idx].viewer = None;
                 self.sessions[idx].editor = Some(editor);
                 self.apply_editor_size();
                 self.render_editor();
@@ -1137,6 +1326,8 @@ impl App {
             RowTarget::Header(i) => Some((*i, self.sessions.get(*i)?.root.clone(), true)),
             RowTarget::Dir(i, p) => Some((*i, p.clone(), true)),
             RowTarget::File(i, p) => Some((*i, p.clone(), false)),
+            RowTarget::ChangesHeader(i) => Some((*i, self.sessions.get(*i)?.root.clone(), true)),
+            RowTarget::Change(i, p, _) => Some((*i, p.clone(), false)),
         }
     }
 
@@ -1193,6 +1384,27 @@ impl App {
     }
 
     pub fn tree_context(&mut self, action: i32, row_id: i32) {
+        // Discard Changes: only meaningful on a Changes-panel row.
+        if action == 9 {
+            if let Some(RowTarget::Change(idx, path, status)) =
+                self.row_map.get(row_id as usize).cloned()
+            {
+                self.active = idx;
+                self.show_banner(Banner::ConfirmDiscard(idx, path, status));
+            }
+            return;
+        }
+        // Discard All: only meaningful on the Changes subheader.
+        if action == 10 {
+            if let Some(RowTarget::ChangesHeader(idx)) = self.row_map.get(row_id as usize).cloned()
+            {
+                if !self.sessions[idx].changes.is_empty() {
+                    self.active = idx;
+                    self.show_banner(Banner::ConfirmDiscardAll(idx));
+                }
+            }
+            return;
+        }
         let Some((idx, path, is_dir)) = self.row_target(row_id) else { return };
         // Where "New File/Folder" creates: the dir itself, or a file's parent.
         let create_dir = if is_dir {
@@ -1396,6 +1608,26 @@ impl App {
             Banner::DiskChanged => {
                 ("File changed on disk".to_string(), "Reload", "Keep mine")
             }
+            Banner::ConfirmDiscard(idx, path, _) => {
+                let name = self
+                    .sessions
+                    .get(*idx)
+                    .map(|s| s.relative_name(path))
+                    .unwrap_or_else(|| path.display().to_string());
+                (
+                    format!("Discard changes to {name}? This restores the last-committed version."),
+                    "Discard",
+                    "Cancel",
+                )
+            }
+            Banner::ConfirmDiscardAll(idx) => {
+                let count = self.sessions.get(*idx).map(|s| s.changes.len()).unwrap_or(0);
+                (
+                    format!("Discard all {count} changes? This restores every file to the baseline."),
+                    "Discard All",
+                    "Cancel",
+                )
+            }
             Banner::None => (String::new(), "", ""),
         };
         self.banner = banner;
@@ -1424,6 +1656,48 @@ impl App {
                 self.render_editor();
                 self.update_chrome();
             }
+            Banner::ConfirmDiscard(idx, path, status) => {
+                let (root, tracking) = match self.sessions.get(idx) {
+                    Some(session) => match &session.tracking {
+                        Some(tracking) => (session.root.clone(), tracking.clone()),
+                        None => return,
+                    },
+                    None => return,
+                };
+                let app_id = self.id;
+                std::thread::spawn(move || {
+                    crate::git::discard(&root, &tracking, &path, status);
+                    let _ = slint::invoke_from_event_loop(move || {
+                        with_app_id(app_id, |app| {
+                            if let Some(i) = app.sessions.iter().position(|s| s.root == root) {
+                                app.refresh_changes(i, false);
+                            }
+                        });
+                    });
+                });
+            }
+            Banner::ConfirmDiscardAll(idx) => {
+                let (root, tracking, changes) = match self.sessions.get(idx) {
+                    Some(session) => match &session.tracking {
+                        Some(tracking) => {
+                            (session.root.clone(), tracking.clone(), session.changes.clone())
+                        }
+                        None => return,
+                    },
+                    None => return,
+                };
+                let app_id = self.id;
+                std::thread::spawn(move || {
+                    crate::git::discard_all(&root, &tracking, &changes);
+                    let _ = slint::invoke_from_event_loop(move || {
+                        with_app_id(app_id, |app| {
+                            if let Some(i) = app.sessions.iter().position(|s| s.root == root) {
+                                app.refresh_changes(i, false);
+                            }
+                        });
+                    });
+                });
+            }
             Banner::None => {}
         }
         self.show_banner(Banner::None);
@@ -1449,6 +1723,7 @@ impl App {
                         std::fs::metadata(&editor.path).and_then(|m| m.modified()).ok();
                 }
             }
+            Banner::ConfirmDiscard(..) | Banner::ConfirmDiscardAll(..) => {} // Cancel
             Banner::None => {}
         }
         self.show_banner(Banner::None);
@@ -1457,6 +1732,7 @@ impl App {
     fn run_pending(&mut self, action: PendingAction) {
         match action {
             PendingAction::OpenFile(idx, path) => self.really_open_file(idx, path),
+            PendingAction::OpenDiff(idx, path) => self.open_diff_view(idx, path),
             PendingAction::CloseSession(idx) => self.really_close_session(idx),
         }
     }
@@ -1485,6 +1761,14 @@ impl App {
                             viewer::ViewKind::Markdown | viewer::ViewKind::Csv => "Source",
                             viewer::ViewKind::Image | viewer::ViewKind::PdfText => "",
                         }));
+                    }
+                    (None, Some(editor)) if editor.read_only => {
+                        ui.set_editor_title(SharedString::from(format!(
+                            "Diff — {}",
+                            session.relative_name(&editor.path)
+                        )));
+                        ui.set_editor_dirty(false);
+                        ui.set_editor_view_toggle(SharedString::from("File"));
                     }
                     (None, Some(editor)) => {
                         ui.set_editor_title(SharedString::from(session.relative_name(&editor.path)));

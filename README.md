@@ -1,6 +1,6 @@
 # Tigriden — Terminal for Agentic Coding
 
-![Version](https://img.shields.io/badge/version-0.1.0-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
+![Version](https://img.shields.io/badge/version-0.1.1-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 
 **A tiny desktop IDE built for one job: supervising AI coding agents.**
 
@@ -14,7 +14,7 @@ Written in pure Rust. **~10 MB binary, ~40 MB RAM.**
 
 ## Why
 
-Agentic coding means running several agents in several folders and checking in on them. A full IDE is overkill for that; a bare terminal multiplexer gives you no file browser and no editor. Tigriden is the minimal middle: **one window, one session per folder, agent + files + editor together.**
+Agentic coding means running several agents in several folders and checking in on them. A full IDE is overkill for that; a bare terminal multiplexer gives you no file browser and no editor. Tigriden is the minimal middle: **one session per folder — agent, files, editor, and change tracking together.**
 
 ## Features
 
@@ -22,12 +22,14 @@ Agentic coding means running several agents in several folders and checking in o
 - **Multiple terminals per folder** — the `+` tab spawns extra shells in the same workspace, so one agent can run while you use a second terminal for git, tests, or another agent.
 - **Real terminal** — VTE-compliant emulation ([alacritty_terminal](https://crates.io/crates/alacritty_terminal) + a real PTY). TUIs like `vim`, `top`, and the Claude Code interface just work, including bracketed paste and truecolor. Select with the mouse and Cmd+C to copy out; Cmd+V pastes text in, and image paste into Claude Code works with Ctrl+V (the agent reads your clipboard directly).
 - **Live file tree** — gitignore-aware, refreshes automatically as agents create and delete files. Right-click any entry for New File/Folder, Reveal in Finder, Open in Default App, Copy (Relative) Path, Duplicate, Rename, and Move to Trash.
+- **File change tracking & rollback** *(new in 0.1.1)* — **File ▸ Show Changes Panel** adds a live **Changes (N)** list under each folder showing every file the agent has modified/added/deleted since the baseline, updated automatically within ~1 s of a write. Click a row for a syntax-highlighted diff; right-click ▸ **Discard Changes…** reverts one file, the **↺** button (or **Discard All Changes…**) reverts everything — always behind a confirmation. Two modes, picked automatically: folders with git compare against the last commit; folders **without git get invisible shadow snapshots** (stored in the app's data dir — your folder stays untouched, the agent never sees them). Off by default with zero overhead; toggling on snapshots "now" as the baseline.
+- **Multiple windows & agent teams** *(new in 0.1.1)* — **File ▸ New Window** opens an independent window with its own folders, running in parallel. Define named preset groups (`[[teams]]` in config.toml) and pick one per window to give different windows different agent buttons.
 - **Drag & drop files** — drop any file from Finder onto the window and its (shell-quoted) path is typed into the terminal, so you can attach files to an agent prompt the same way as in a native terminal.
 - **Built-in editor** — syntax highlighting for 40+ languages ([cosmic-text](https://crates.io/crates/cosmic-text) + syntect), edit and Cmd+S save. When an agent edits the open file on disk, it reloads automatically (or asks, if you have unsaved changes).
 - **File viewers** — images (png/jpg/gif/webp/bmp/tiff), Markdown rendered with headings, code blocks and inline pictures, CSV/TSV as an aligned table, and PDF text extraction. A header button toggles Markdown/CSV between the rendered view and editable source.
 - **Per-folder sessions** — each workspace keeps its own shell, tree, and open file; switching is instant.
 - **Recent folders** — every folder you add is remembered permanently; reopen from the ⟳ button or **File ▸ Open Recent**, even after removing it from the workbench.
-- **Native menu bar** — File (Add Folder ⌘O, New Terminal ⌘T, Open Recent, Save ⌘S, Close Terminal ⌘W, Close Folder ⇧⌘W) and Edit (Copy/Paste/Select All) menus, routed to whichever pane has focus.
+- **Native menu bar** — File (Add Folder ⌘O, New Terminal ⌘T, Show/Hide Changes Panel, Open Recent, New Window ▸ team, Save ⌘S, Close Terminal ⌘W, Close Folder ⇧⌘W) and Edit (Copy/Paste/Select All) menus, routed to whichever pane has focus.
 - **Persistent** — folders, active session, and layout are restored on relaunch (fresh shells each time, by design).
 - **Small on purpose** — no webview, no Electron, no C regex libraries. Slint UI with both panes rasterized straight to pixel buffers.
 
@@ -35,7 +37,7 @@ Agentic coding means running several agents in several folders and checking in o
 
 No Rust needed — grab the prebuilt app from the [latest release](https://github.com/Sompote/Tigriden/releases/latest):
 
-1. Download **`Tigriden-0.1.0-macos-universal.app.zip`** (one download for both Apple Silicon and Intel).
+1. Download **`Tigriden-0.1.1-macos-universal.app.zip`** (one download for both Apple Silicon and Intel).
 2. Unzip and drag **Tigriden.app** into **/Applications**.
 3. First launch only: the app isn't notarized, so **right-click → Open → Open**, or run:
 
@@ -43,7 +45,7 @@ No Rust needed — grab the prebuilt app from the [latest release](https://githu
    xattr -d com.apple.quarantine /Applications/Tigriden.app
    ```
 
-Prefer a bare binary? The release also ships `tigriden-0.1.0-macos-arm64.tar.gz` (Apple Silicon) and `tigriden-0.1.0-macos-x86_64.tar.gz` (Intel) — untar and run `./tigriden`.
+Prefer a bare binary? The release also ships `tigriden-0.1.1-macos-arm64.tar.gz` (Apple Silicon) and `tigriden-0.1.1-macos-x86_64.tar.gz` (Intel) — untar and run `./tigriden`.
 
 <details>
 <summary><b>Build from source</b> (stable Rust required)</summary>
@@ -66,6 +68,18 @@ macOS is the primary target; Linux/Windows are untested but the stack is cross-p
 4. Click **+** in the terminal tab strip to open more terminals in the same folder (each tab is its own shell; ✕ on hover closes one).
 5. Add more folders to run more agents in parallel; switch by clicking a session in the sidebar. The ✕ on a session header removes the folder from the workbench (its shells are stopped; the folder stays in Recent).
 6. Click **⟳** (bottom of the sidebar) to reopen any previously added folder without the file dialog.
+
+### Track & roll back what the agent changes
+
+1. **File ▸ Show Changes Panel** — a **Changes (N)** section appears under each folder in the sidebar (off by default; it always starts off on launch).
+2. Tracking mode is chosen automatically per folder:
+   - **Git folders** compare against the last commit — commit in the terminal to accept work and reset the list to zero.
+   - **Folders without git** get an invisible **shadow snapshot** taken the moment you enable the panel (stored under `~/Library/Application Support/tigriden/snapshots/`; no `.git` appears in your project). Re-enabling the panel re-snapshots "now".
+3. As the agent works, changed files appear within ~1 s as `M` (modified) / `A` (added) / `D` (deleted) rows — the count is files, not edits.
+4. **Click a row** to see the accumulated diff against the baseline; the **File** chip jumps to the editable file.
+5. Don't like a change? **Right-click the row ▸ Discard Changes…** restores that file to the baseline (new files are deleted, deleted files come back). The **↺** button on the Changes header — or right-click ▸ **Discard All Changes…** — reverts the whole run. Both ask for confirmation first.
+
+Detection is watcher-driven (no polling): bursts of writes are coalesced for 250 ms, `git status` runs on a background thread, and nothing at all runs while the panel is off or the agent is idle.
 
 ### Keys
 
@@ -96,9 +110,17 @@ command = "codex"
 [[presets]]
 label = "gemini"
 command = "gemini"
+
+# Optional: named preset groups for File ▸ New Window ▸ <team>.
+[[teams]]
+name = "reviewers"
+[[teams.presets]]
+label = "claude-review"
+command = "claude /review"
+send_enter = true
 ```
 
-Runtime state (restored folders, split position) lives next to it in `state.toml`.
+Runtime state (restored folders, split position) lives next to it in `state.toml`; shadow snapshots for the Changes panel live in `snapshots/`.
 
 ## Architecture
 

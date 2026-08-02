@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use cosmic_text::{
-    Action, Attrs, Buffer, Edit, Family, FontSystem, Metrics, Motion, Selection, SwashCache,
-    SyntaxEditor, SyntaxSystem,
+    Action, Attrs, Buffer, Edit, Family, FontSystem, Metrics, Motion, Selection, Shaping,
+    SwashCache, SyntaxEditor, SyntaxSystem,
 };
 use slint::{Rgba8Pixel, SharedPixelBuffer};
 
@@ -47,6 +47,9 @@ pub struct EditorState {
     /// mtime recorded at load/save, used to suppress self-inflicted watcher
     /// events and detect external changes.
     pub disk_mtime: Option<SystemTime>,
+    /// Read-only mode for generated content (diff views); `path` then points
+    /// at the underlying file, not at what the buffer holds.
+    pub read_only: bool,
     mouse_down: bool,
 }
 
@@ -73,7 +76,46 @@ impl EditorState {
             .map_err(|e| format!("open {}: {e}", path.display()))?;
         editor.set_tab_width(4);
         let disk_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-        Ok(Self { editor, path: path.to_path_buf(), dirty: false, disk_mtime, mouse_down: false })
+        Ok(Self {
+            editor,
+            path: path.to_path_buf(),
+            dirty: false,
+            disk_mtime,
+            read_only: false,
+            mouse_down: false,
+        })
+    }
+
+    /// Read-only view of a unified diff, highlighted via the built-in Diff
+    /// syntax. `path` is the underlying file (used for the title and to jump
+    /// to the editable view).
+    pub fn open_diff(
+        font_system: &mut FontSystem,
+        syntax_system: &'static SyntaxSystem,
+        path: &Path,
+        diff_text: &str,
+        font_family: &'static str,
+        font_size_px: f32,
+        dark: bool,
+    ) -> Result<Self, String> {
+        let metrics = Metrics::new(font_size_px, (font_size_px * 1.45).round());
+        let buffer = Buffer::new(font_system, metrics);
+        let theme = if dark { dark_theme_name() } else { light_theme_name() };
+        let mut editor = SyntaxEditor::new(buffer, syntax_system, theme)
+            .ok_or_else(|| format!("missing syntect theme {theme}"))?;
+        editor.syntax_by_extension("diff");
+        editor.with_buffer_mut(|buffer| {
+            buffer.set_text(diff_text, &mono_attrs(font_family), Shaping::Advanced, None);
+        });
+        editor.set_tab_width(4);
+        Ok(Self {
+            editor,
+            path: path.to_path_buf(),
+            dirty: false,
+            disk_mtime: None,
+            read_only: true,
+            mouse_down: false,
+        })
     }
 
     pub fn reload(&mut self, font_system: &mut FontSystem, font_family: &'static str) {
@@ -95,6 +137,9 @@ impl EditorState {
     }
 
     pub fn save(&mut self) -> Result<(), String> {
+        if self.read_only {
+            return Ok(());
+        }
         let text = self.text();
         let tmp = self.path.with_extension("tigriden-tmp");
         std::fs::write(&tmp, &text).map_err(|e| e.to_string())?;
@@ -116,6 +161,14 @@ impl EditorState {
         let Some(ch) = text.chars().next() else { return KeyOutcome::Ignored };
 
         if mods.meta {
+            if self.read_only {
+                // Copy and select-all only; swallow the mutating shortcuts.
+                match ch.to_ascii_lowercase() {
+                    's' | 'x' | 'v' => return KeyOutcome::Consumed,
+                    'a' | 'c' => {}
+                    _ => return KeyOutcome::Ignored,
+                }
+            }
             match ch.to_ascii_lowercase() {
                 's' => return KeyOutcome::Save,
                 'a' => {
@@ -179,6 +232,15 @@ impl EditorState {
             }
             self.editor.action(font_system, Action::Motion(m));
             return KeyOutcome::Consumed;
+        }
+
+        if self.read_only {
+            // Escape still clears the selection; everything else is inert.
+            if ch == K_ESCAPE {
+                self.editor.action(font_system, Action::Escape);
+                return KeyOutcome::Consumed;
+            }
+            return KeyOutcome::Ignored;
         }
 
         let mutating = match ch {

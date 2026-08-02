@@ -30,6 +30,14 @@ pub struct Session {
     pub tree_visible: bool,
     /// Directories whose listings changed on disk since the last model rebuild.
     pub pending_fs: Vec<PathBuf>,
+    /// Set while the changes panel is enabled: real git or shadow snapshot.
+    /// Assigned by App after construction so the toggle check stays there.
+    pub tracking: Option<crate::git::Tracking>,
+    pub changes: Vec<crate::git::Change>,
+    /// Generation counters so stale background git results are dropped.
+    pub changes_gen: u64,
+    pub diff_gen: u64,
+    pub changes_visible: bool,
     _watcher: Option<RecommendedWatcher>,
 }
 
@@ -64,6 +72,11 @@ impl Session {
             tree: TreeState::new(root),
             tree_visible: true,
             pending_fs: Vec::new(),
+            tracking: None,
+            changes: Vec::new(),
+            changes_gen: 0,
+            diff_gen: 0,
+            changes_visible: true,
             _watcher: watcher,
         }
     }

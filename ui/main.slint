@@ -89,6 +89,7 @@ export component MainWindow inherits Window {
     in property <string> banner-text: "";
     in property <[string]> term-tabs;
     in property <string> editor-view-toggle: "";
+    in property <bool> changes-enabled: false;
     in property <bool> name-dialog-visible: false;
     in property <string> name-dialog-title: "";
     in-out property <string> name-dialog-value: "";
@@ -117,6 +118,7 @@ export component MainWindow inherits Window {
     callback name-dialog-accept(string);
     callback name-dialog-cancel();
     callback toggle-view();
+    callback toggle-changes();
     callback split-changed();
     callback banner-primary();
     callback banner-secondary();
@@ -148,6 +150,10 @@ export component MainWindow inherits Window {
                 title: "New Terminal";
                 shortcut: @keys(Control + T);
                 activated => { root.new-terminal(); }
+            }
+            MenuItem {
+                title: root.changes-enabled ? "Hide Changes Panel" : "Show Changes Panel";
+                activated => { root.toggle-changes(); }
             }
             Menu {
                 title: "Open Recent";
