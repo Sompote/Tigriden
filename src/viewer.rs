@@ -7,6 +7,7 @@ use slint::{Rgba8Pixel, SharedPixelBuffer};
 
 use crate::paint::Canvas;
 use crate::term::colors;
+use crate::theme::ThemeDef;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum ViewKind {
@@ -36,7 +37,9 @@ pub struct ViewerState {
     margin: f32,
     spacing: f32,
     font_px: f32,
-    dark: bool,
+    theme: &'static ThemeDef,
+    /// Effective accent (theme default or the user's override).
+    accent: [u8; 3],
     font_family: &'static str,
 }
 
@@ -55,7 +58,8 @@ impl ViewerState {
         kind: ViewKind,
         font_family: &'static str,
         font_px: f32,
-        dark: bool,
+        theme: &'static ThemeDef,
+        accent: [u8; 3],
         width_px: f32,
     ) -> Result<Self, String> {
         let mut viewer = Self {
@@ -69,7 +73,8 @@ impl ViewerState {
             margin: (font_px * 1.2).round(),
             spacing: (font_px * 0.5).round(),
             font_px,
-            dark,
+            theme,
+            accent,
             font_family,
         };
         match kind {
@@ -83,7 +88,7 @@ impl ViewerState {
     }
 
     fn fg(&self) -> [u8; 3] {
-        colors::base_palette(self.dark)[7]
+        colors::base_palette(self.theme)[7]
     }
 
     fn text_color(&self) -> Color {
@@ -231,8 +236,8 @@ impl ViewerState {
         let source = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        let accent: [u8; 3] = [0xe8, 0x91, 0x2d];
-        let code_bg = if self.dark { [0x2b, 0x31, 0x38] } else { [0xe8, 0xe8, 0xe8] };
+        let accent = self.accent;
+        let code_bg = self.theme.ui.panel_hover;
 
         let mut spans: Vec<(String, Attrs<'static>)> = Vec::new();
         let mut bold = 0usize;
@@ -464,7 +469,7 @@ impl ViewerState {
         height_px: u32,
     ) -> SharedPixelBuffer<Rgba8Pixel> {
         let mut frame = SharedPixelBuffer::<Rgba8Pixel>::new(width_px.max(1), height_px.max(1));
-        let bg = colors::base_palette(self.dark)[0];
+        let bg = colors::base_palette(self.theme)[0];
         let (w, h) = (frame.width() as i32, frame.height() as i32);
         let mut canvas = Canvas { pixels: frame.make_mut_slice(), width: w, height: h };
         canvas.fill(bg);
@@ -504,7 +509,7 @@ impl ViewerState {
                 }
                 Block::Rule => {
                     let ry = (y + self.font_px / 2.0) as i32;
-                    let dim = colors::base_palette(self.dark)[8];
+                    let dim = colors::base_palette(self.theme)[8];
                     canvas.fill_rect(margin as i32, ry, text_w as i32, 1, dim);
                     y += self.font_px + self.spacing;
                 }

@@ -1,6 +1,6 @@
 # Tigriden — Terminal for Agentic Coding
 
-![Version](https://img.shields.io/badge/version-0.1.1-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
+![Version](https://img.shields.io/badge/version-0.1.2-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 
 **A tiny desktop IDE built for one job: supervising AI coding agents.**
 
@@ -29,7 +29,8 @@ Agentic coding means running several agents in several folders and checking in o
 - **File viewers** — images (png/jpg/gif/webp/bmp/tiff), Markdown rendered with headings, code blocks and inline pictures, CSV/TSV as an aligned table, and PDF text extraction. A header button toggles Markdown/CSV between the rendered view and editable source.
 - **Per-folder sessions** — each workspace keeps its own shell, tree, and open file; switching is instant.
 - **Recent folders** — every folder you add is remembered permanently; reopen from the ⟳ button or **File ▸ Open Recent**, even after removing it from the workbench.
-- **Native menu bar** — File (Add Folder ⌘O, New Terminal ⌘T, Show/Hide Changes Panel, Open Recent, New Window ▸ team, Save ⌘S, Close Terminal ⌘W, Close Folder ⇧⌘W) and Edit (Copy/Paste/Select All) menus, routed to whichever pane has focus.
+- **Settings UI** *(new in 0.1.2)* — **File ▸ Settings… (⌘,)** picks the theme (Dark/Light × Classic/Minimal/Vivid), an accent color, the terminal/editor font and size, the interface text size, terminal scrollback, and whether new windows start with the Changes panel. Every change applies immediately to all open windows — chrome, terminal palette and editor highlighting together — and is saved to config.toml.
+- **Native menu bar** — File (Add Folder ⌘O, New Terminal ⌘T, Show/Hide Changes Panel, Open Recent, New Window ▸ team, Save ⌘S, Settings ⌘,, Close Terminal ⌘W, Close Folder ⇧⌘W) and Edit (Copy/Paste/Select All) menus, routed to whichever pane has focus.
 - **Persistent** — folders, active session, and layout are restored on relaunch (fresh shells each time, by design).
 - **Small on purpose** — no webview, no Electron, no C regex libraries. Slint UI with both panes rasterized straight to pixel buffers.
 
@@ -37,7 +38,7 @@ Agentic coding means running several agents in several folders and checking in o
 
 No Rust needed — grab the prebuilt app from the [latest release](https://github.com/Sompote/Tigriden/releases/latest):
 
-1. Download **`Tigriden-0.1.1-macos-universal.app.zip`** (one download for both Apple Silicon and Intel).
+1. Download **`Tigriden-0.1.2-macos-universal.app.zip`** (one download for both Apple Silicon and Intel).
 2. Unzip and drag **Tigriden.app** into **/Applications**.
 3. First launch only: the app isn't notarized, so **right-click → Open → Open**, or run:
 
@@ -45,7 +46,7 @@ No Rust needed — grab the prebuilt app from the [latest release](https://githu
    xattr -d com.apple.quarantine /Applications/Tigriden.app
    ```
 
-Prefer a bare binary? The release also ships `tigriden-0.1.1-macos-arm64.tar.gz` (Apple Silicon) and `tigriden-0.1.1-macos-x86_64.tar.gz` (Intel) — untar and run `./tigriden`.
+Prefer a bare binary? The release also ships `tigriden-0.1.2-macos-arm64.tar.gz` (Apple Silicon) and `tigriden-0.1.2-macos-x86_64.tar.gz` (Intel) — untar and run `./tigriden`.
 
 <details>
 <summary><b>Build from source</b> (stable Rust required)</summary>
@@ -90,13 +91,18 @@ Detection is watcher-driven (no polling): bursts of writes are coalesced for 250
 
 ## Configuration
 
+Most of it is editable in **File ▸ Settings… (⌘,)**; the file is
 `~/Library/Application Support/tigriden/config.toml`, created on first run:
 
 ```toml
-theme = "dark"          # "dark" | "light"
-font_family = "Menlo"
+# Theme: classic-|minimal-|vivid- × -dark|-light ("dark"/"light" still work).
+theme = "classic-dark"
+accent = ""             # "" = theme accent, or "#rrggbb"
+font_family = "Menlo"   # terminal + editor
 font_size = 13.0
+ui_font_size = 13.0     # sidebar, tabs, dialogs (10-18)
 scrollback = 10000
+show_changes = false    # start new windows with the Changes panel on
 
 [[presets]]
 label = "claude"
@@ -120,6 +126,8 @@ command = "claude /review"
 send_enter = true
 ```
 
+Presets and teams are file-only — the Settings dialog links to config.toml for those. Saving from Settings rewrites the whole file, so comments you add by hand are not preserved.
+
 Runtime state (restored folders, split position) lives next to it in `state.toml`; shadow snapshots for the Changes panel live in `snapshots/`.
 
 ## Architecture
@@ -131,13 +139,15 @@ Slint provides only the chrome (sidebar, layout, splitter). The two hard parts a
 | Terminal | headless `alacritty_terminal` grid fed by `portable-pty` | glyphs rasterized per cell via cosmic-text's swash cache |
 | Editor | cosmic-text `SyntaxEditor` (syntect highlighting) | draws itself into the same pixel-buffer canvas |
 
+Because the two panes paint themselves, a theme is one definition in `src/theme.rs` feeding three consumers: the Slint `Theme` global (chrome), the ANSI 0-15 palette (terminal, shared with the PTY threads for OSC color queries), and a syntect theme name (editor).
+
 Only the PTY reader threads run in the background; rendering and editing happen on the UI thread with coalesced repaints.
 
 `vendor/cosmic-text/` is a verbatim copy of cosmic-text 0.19 with one change: its syntect dependency uses the pure-Rust `fancy-regex` engine instead of the oniguruma C library (smaller binary, no C build dependency).
 
 ### Debug builds
 
-`cargo build --features framedump`, then run with `TIGRIDEN_DUMP=/tmp/frames` to dump both panes as PNGs. `TIGRIDEN_TEST_INPUT='claude\r'` and `TIGRIDEN_TEST_OPEN=path` script the first session for headless testing.
+`cargo build --features framedump`, then run with `TIGRIDEN_DUMP=/tmp/frames` to dump both panes as PNGs. `TIGRIDEN_TEST_INPUT='claude\r'`, `TIGRIDEN_TEST_OPEN=path`, `TIGRIDEN_TEST_SETTINGS='style=vivid,font-size-step=2'` and `TIGRIDEN_TEST_CHANGES=1` (reports the Changes panel's tracking mode and contents around a write) script the first session for headless testing.
 
 ## Roadmap / known limitations (v1)
 

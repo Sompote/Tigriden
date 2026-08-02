@@ -19,7 +19,7 @@ component TreeRowDelegate inherits Rectangle {
     callback closed();
     callback context(int);
 
-    height: data.kind == 0 ? 30px : 24px;
+    height: data.kind == 0 ? Theme.row-height * 1.2 : Theme.row-height;
     background: touch.has-hover ? Theme.panel-hover
         : (data.kind == 0 && data.active ? Theme.selection : transparent);
 
@@ -77,7 +77,7 @@ component TreeRowDelegate inherits Rectangle {
             width: 12px;
             text: data.expanded ? "▾" : "▸";
             color: Theme.text-dim;
-            font-size: 10px;
+            font-size: Theme.font-size-tiny - 1px;
             vertical-alignment: center;
         }
         if data.kind == 2 || data.kind == 4: Rectangle { width: 12px; }
@@ -85,7 +85,7 @@ component TreeRowDelegate inherits Rectangle {
         Text {
             text: data.name;
             color: data.kind == 0 ? Theme.text : (data.kind == 1 ? Theme.text : Theme.text-dim);
-            font-size: data.kind == 0 ? Theme.font-size : Theme.font-size - 1px;
+            font-size: data.kind == 0 ? Theme.font-size : Theme.font-size-small;
             font-weight: data.kind == 0 || data.kind == 3 ? 600 : 400;
             vertical-alignment: center;
             overflow: elide;
@@ -98,7 +98,7 @@ component TreeRowDelegate inherits Rectangle {
             Text {
                 text: "✕";
                 color: close-touch.has-hover ? Theme.text : Theme.text-dim;
-                font-size: 10px;
+                font-size: Theme.font-size-tiny - 1px;
                 vertical-alignment: center;
                 horizontal-alignment: center;
             }
@@ -111,7 +111,7 @@ component TreeRowDelegate inherits Rectangle {
             Text {
                 text: "↺";
                 color: discard-touch.has-hover ? Theme.text : Theme.text-dim;
-                font-size: 11px;
+                font-size: Theme.font-size-tiny;
                 vertical-alignment: center;
                 horizontal-alignment: center;
             }
@@ -135,13 +135,13 @@ export component Sidebar inherits Rectangle {
 
     VerticalLayout {
         Rectangle {
-            height: 34px;
+            height: Theme.header-height + 4px;
             HorizontalLayout {
                 padding-left: 10px;
                 Text {
                     text: "AGENTS";
                     color: Theme.text-dim;
-                    font-size: 11px;
+                    font-size: Theme.font-size-tiny;
                     font-weight: 700;
                     letter-spacing: 1px;
                     vertical-alignment: center;
@@ -161,13 +161,13 @@ export component Sidebar inherits Rectangle {
         }
 
         bottom-bar := Rectangle {
-            height: 40px;
+            height: Theme.font-size * 3.1;
             border-width: 1px;
             border-color: Theme.border;
 
             recent-popup := PopupWindow {
                 x: 4px;
-                y: -(min(max(root.recent-folders.length, 1), 10) * 28px + 14px);
+                y: -(min(max(root.recent-folders.length, 1), 10) * (Theme.row-height + 4px) + 14px);
                 width: root.width - 8px;
                 close-policy: close-on-click-outside;
 
@@ -181,18 +181,18 @@ export component Sidebar inherits Rectangle {
                         padding: 4px;
 
                         if root.recent-folders.length == 0: Rectangle {
-                            height: 28px;
+                            height: Theme.row-height + 4px;
                             Text {
                                 text: "No recent folders";
                                 color: Theme.text-dim;
-                                font-size: 12px;
+                                font-size: Theme.font-size-small;
                                 vertical-alignment: center;
                                 horizontal-alignment: center;
                             }
                         }
 
                         for folder[i] in root.recent-folders: recent-row := TouchArea {
-                            height: 28px;
+                            height: Theme.row-height + 4px;
                             Rectangle {
                                 background: recent-row.has-hover ? Theme.panel-hover : transparent;
                                 border-radius: 4px;
@@ -203,7 +203,7 @@ export component Sidebar inherits Rectangle {
                                     Text {
                                         text: folder;
                                         color: Theme.text;
-                                        font-size: 12px;
+                                        font-size: Theme.font-size-small;
                                         vertical-alignment: center;
                                         overflow: elide;
                                         horizontal-stretch: 1;
@@ -213,7 +213,7 @@ export component Sidebar inherits Rectangle {
                                         Text {
                                             text: "✕";
                                             color: forget-touch.has-hover ? Theme.text : Theme.text-dim;
-                                            font-size: 10px;
+                                            font-size: Theme.font-size-tiny - 1px;
                                             vertical-alignment: center;
                                             horizontal-alignment: center;
                                         }
@@ -255,7 +255,7 @@ export component Sidebar inherits Rectangle {
                         Text {
                             text: "⟳";
                             color: Theme.accent;
-                            font-size: 14px;
+                            font-size: Theme.font-size-large;
                             vertical-alignment: center;
                             horizontal-alignment: center;
                         }

@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use alacritty_terminal::grid::Scroll;
@@ -18,7 +18,8 @@ use crate::viewer::{self, ViewerState};
 use crate::term::keys::{self, Mods};
 use crate::term::render::TermRenderer;
 use crate::term::{TermHooks, TermSession};
-use crate::{MainWindow, PresetItem, TreeRow};
+use crate::theme::{self, ThemeDef};
+use crate::{AccentOption, MainWindow, PresetItem, Theme as UiTheme, TreeRow};
 
 static SYNTAX_SYSTEM: OnceLock<SyntaxSystem> = OnceLock::new();
 static NEXT_TERM_ID: AtomicU64 = AtomicU64::new(1);
@@ -37,6 +38,32 @@ struct WindowEntry {
 
 thread_local! {
     static WINDOWS: RefCell<Vec<WindowEntry>> = const { RefCell::new(Vec::new()) };
+    /// The live config, shared by every window: Settings edits go here first,
+    /// then out to disk and to each window.
+    static CONFIG: RefCell<Config> = RefCell::new(Config::default());
+    /// Font family names handed to cosmic-text, which wants `&'static str`.
+    /// Interned so repeated Settings edits do not leak a string each time.
+    static FONT_NAMES: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn set_config(config: Config) {
+    CONFIG.with(|slot| *slot.borrow_mut() = config);
+}
+
+pub fn config() -> Config {
+    CONFIG.with(|slot| slot.borrow().clone())
+}
+
+fn intern_font(name: &str) -> &'static str {
+    FONT_NAMES.with(|slot| {
+        let mut names = slot.borrow_mut();
+        if let Some(found) = names.iter().find(|n| **n == name) {
+            return *found;
+        }
+        let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+        names.push(leaked);
+        leaked
+    })
 }
 
 pub fn register(id: u64, app: Rc<RefCell<App>>, ui: MainWindow) {
@@ -76,6 +103,96 @@ pub fn shutdown_all() {
         app.borrow_mut().shutdown();
     }
     WINDOWS.with(|slot| slot.borrow_mut().clear());
+}
+
+fn slint_color(rgb: [u8; 3]) -> slint::Color {
+    slint::Color::from_rgb_u8(rgb[0], rgb[1], rgb[2])
+}
+
+/// Copies the active theme (and the accent / UI text size overrides) into the
+/// Slint `Theme` global that the chrome binds to.
+fn push_theme(ui: &MainWindow, config: &Config) {
+    let theme = theme::by_id(&config.theme);
+    let global = ui.global::<UiTheme>();
+    global.set_dark(theme.dark);
+    global.set_bg(slint_color(theme.ui.bg));
+    global.set_panel(slint_color(theme.ui.panel));
+    global.set_panel_hover(slint_color(theme.ui.panel_hover));
+    global.set_selection(slint_color(theme.ui.selection));
+    global.set_border(slint_color(theme.ui.border));
+    global.set_text(slint_color(theme.ui.text));
+    global.set_text_dim(slint_color(theme.ui.text_dim));
+    global.set_accent(slint_color(config.accent_rgb()));
+    global.set_font_size(config.ui_font_size);
+}
+
+/// Saves the edited config and pushes it into every open window. Called from
+/// UI callbacks that are *not* wrapped in `with_app_id`, so no window is
+/// borrowed while we walk the registry.
+fn apply_and_save(config: Config) {
+    set_config(config.clone());
+    config::save_config(&config);
+    let apps = WINDOWS.with(|slot| slot.borrow().iter().map(|e| e.app.clone()).collect::<Vec<_>>());
+    for app in apps {
+        app.borrow_mut().apply_config(config.clone());
+    }
+}
+
+/// One control in the Settings dialog changed. Values arrive as strings;
+/// anything unparseable leaves the config untouched.
+pub fn settings_changed(key: &str, value: &str) {
+    let mut config = config();
+    let current = theme::by_id(&config.theme);
+    match key {
+        "mode" => config.theme = theme::by_style_mode(current.style, value).id.into(),
+        "style" => config.theme = theme::by_style_mode(value, current.mode()).id.into(),
+        "accent" => config.accent = value.to_string(),
+        "font-family" => config.font_family = value.to_string(),
+        "font-size" => match value.parse::<f32>() {
+            Ok(size) => config.font_size = size,
+            Err(_) => return,
+        },
+        "font-size-step" => match value.parse::<f32>() {
+            Ok(step) => config.font_size += step,
+            Err(_) => return,
+        },
+        "ui-font-size" => match value.parse::<f32>() {
+            Ok(size) => config.ui_font_size = size,
+            Err(_) => return,
+        },
+        "scrollback" => match value.parse::<usize>() {
+            Ok(lines) => config.scrollback = lines,
+            Err(_) => return,
+        },
+        "show-changes" => config.show_changes = value == "true",
+        _ => return,
+    }
+    config.sanitize();
+    apply_and_save(config);
+}
+
+/// Settings ▸ Reset to defaults — keeps the user's presets and teams, which
+/// the dialog does not edit.
+pub fn settings_reset() {
+    let current = config();
+    let fresh = Config { presets: current.presets, teams: current.teams, ..Config::default() };
+    apply_and_save(fresh);
+}
+
+/// Shows config.toml in the file manager (presets and teams are edited there).
+pub fn reveal_config() {
+    let Some(path) = config::config_path() else { return };
+    if !path.exists() {
+        config::save_config(&config());
+    }
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer").arg("/select,").arg(&path).spawn();
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let _ = std::process::Command::new("xdg-open")
+        .arg(path.parent().unwrap_or(&path))
+        .spawn();
 }
 
 #[derive(Clone)]
@@ -138,8 +255,12 @@ pub struct App {
     is_primary: bool,
     ui: slint::Weak<MainWindow>,
     pub config: Config,
+    /// Team index this window was opened with (None = the flat preset list).
+    team: Option<usize>,
     presets: Vec<crate::config::Preset>,
-    dark: bool,
+    theme: &'static ThemeDef,
+    /// Theme index shared with the PTY threads for OSC color answerbacks.
+    theme_index: Arc<AtomicU8>,
     font_family: &'static str,
     sessions: Vec<Session>,
     active: usize,
@@ -158,7 +279,8 @@ pub struct App {
     pending_name: Option<NameAction>,
     fs_timer_armed: bool,
     resize_timer_armed: bool,
-    /// Runtime toggle for the git Changes panel; every window starts off.
+    /// Runtime toggle for the git Changes panel; the initial value comes from
+    /// `show_changes` in the config.
     changes_enabled: bool,
     shutting_down: bool,
 }
@@ -172,8 +294,9 @@ impl App {
         is_primary: bool,
     ) -> Self {
         let id = NEXT_APP_ID.fetch_add(1, Ordering::Relaxed);
-        let dark = config.theme != "light";
-        let font_family: &'static str = Box::leak(config.font_family.clone().into_boxed_str());
+        let theme = theme::by_id(&config.theme);
+        let theme_index = Arc::new(AtomicU8::new(theme::index_of(&config.theme)));
+        let font_family = intern_font(&config.font_family);
         let presets: Vec<crate::config::Preset> = config.presets_for(team).to_vec();
         let preset_items: Vec<PresetItem> = presets
             .iter()
@@ -189,14 +312,21 @@ impl App {
         if let Some(team) = team.and_then(|i| config.teams.get(i)) {
             ui.set_window_title(SharedString::from(format!("Tigriden — {}", team.name)));
         }
+        // Colors before the first frame, so the window never flashes the
+        // built-in Slint defaults.
+        push_theme(ui, &config);
+        let changes_enabled = config.show_changes;
+        ui.set_changes_enabled(changes_enabled);
 
         Self {
             id,
             is_primary,
             ui: ui.as_weak(),
             config,
+            team,
             presets,
-            dark,
+            theme,
+            theme_index,
             font_family,
             sessions: Vec::new(),
             active: 0,
@@ -215,9 +345,129 @@ impl App {
             pending_name: None,
             fs_timer_armed: false,
             resize_timer_armed: false,
-            changes_enabled: false,
+            changes_enabled,
             shutting_down: false,
         }
+    }
+
+    // ----- settings -----
+
+    /// Tigriden → Settings…
+    pub fn open_settings(&mut self) {
+        self.push_settings();
+        if let Some(ui) = self.ui() {
+            ui.set_settings_visible(true);
+        }
+    }
+
+    pub fn close_settings(&mut self) {
+        let Some(ui) = self.ui() else { return };
+        ui.set_settings_visible(false);
+        // The dialog took focus from the panes; hand it back to the terminal.
+        ui.invoke_focus_terminal();
+    }
+
+    /// Monospaced families cosmic-text can actually resolve, plus whatever the
+    /// config names (so a hand-written family still shows as selected).
+    fn font_families(&self) -> Vec<SharedString> {
+        let mut names: Vec<String> = self
+            .font_system
+            .db()
+            .faces()
+            .filter(|face| face.monospaced)
+            .filter_map(|face| face.families.first().map(|(name, _)| name.clone()))
+            .collect();
+        names.push(self.config.font_family.clone());
+        names.sort_by_key(|n| n.to_lowercase());
+        names.dedup();
+        names.into_iter().map(SharedString::from).collect()
+    }
+
+    /// Mirrors the config into the dialog's properties.
+    fn push_settings(&mut self) {
+        let Some(ui) = self.ui() else { return };
+        let theme = theme::by_id(&self.config.theme);
+        ui.set_settings_mode(SharedString::from(theme.mode()));
+        ui.set_settings_style(SharedString::from(theme.style));
+        ui.set_settings_theme_label(SharedString::from(theme.label));
+        ui.set_settings_accent(SharedString::from(self.config.accent.as_str()));
+
+        let accents: Vec<AccentOption> = theme::ACCENTS
+            .iter()
+            .map(|(id, label)| AccentOption {
+                id: SharedString::from(*id),
+                label: SharedString::from(*label),
+                color: slint_color(theme::parse_hex(id).unwrap_or(theme.ui.accent)),
+            })
+            .collect();
+        ui.set_settings_accent_options(ModelRc::new(VecModel::from(accents)));
+
+        // A taste of the palette: accent plus six ANSI colors.
+        let mut preview = vec![slint_color(self.config.accent_rgb())];
+        preview.extend((1..=6).map(|i| slint_color(theme.term[i])));
+        ui.set_settings_preview_colors(ModelRc::new(VecModel::from(preview)));
+
+        ui.set_settings_font_families(ModelRc::new(VecModel::from(self.font_families())));
+        ui.set_settings_font_family(SharedString::from(self.config.font_family.as_str()));
+        ui.set_settings_font_size(self.config.font_size);
+        ui.set_settings_ui_font_size(self.config.ui_font_size);
+        ui.set_settings_scrollback(self.config.scrollback as i32);
+        ui.set_settings_show_changes(self.config.show_changes);
+        ui.set_settings_config_path(SharedString::from(
+            config::config_path().map(|p| p.display().to_string()).unwrap_or_default(),
+        ));
+    }
+
+    /// Adopts an edited config: chrome colors, terminal palette, editor theme
+    /// and fonts all change in place, without restarting shells.
+    pub fn apply_config(&mut self, config: Config) {
+        let theme = theme::by_id(&config.theme);
+        let font_family = intern_font(&config.font_family);
+        let text_changed = !std::ptr::eq(font_family, self.font_family)
+            || (config.font_size - self.config.font_size).abs() > f32::EPSILON;
+        let theme_changed = !std::ptr::eq(theme, self.theme);
+
+        self.config = config;
+        self.theme = theme;
+        self.theme_index.store(theme::index_of(theme.id), Ordering::Relaxed);
+        self.font_family = font_family;
+        self.presets = self.config.presets_for(self.team).to_vec();
+
+        if let Some(ui) = self.ui() {
+            push_theme(&ui, &self.config);
+        }
+        self.push_settings();
+
+        if !text_changed && !theme_changed {
+            return;
+        }
+        if text_changed {
+            // Cell metrics moved: rebuild on the next render, then re-grid.
+            self.term_renderer = None;
+        }
+
+        let scale = self.scale();
+        let font_px = self.config.font_size * scale;
+        for idx in 0..self.sessions.len() {
+            if let Some(editor) = self.sessions[idx].editor.as_mut() {
+                editor.restyle(&mut self.font_system, font_family, font_px, theme);
+            }
+        }
+        // Viewers bake colors and layout into their blocks, so rebuild them.
+        let viewers: Vec<(usize, PathBuf, viewer::ViewKind)> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.viewer.as_ref().map(|v| (i, v.path.clone(), v.kind)))
+            .collect();
+        for (idx, path, kind) in viewers {
+            self.open_viewer(idx, path, kind);
+        }
+
+        self.apply_editor_size();
+        self.apply_term_size();
+        self.render_editor();
+        self.render_term();
     }
 
     /// File → Show/Hide Changes Panel.
@@ -285,7 +535,7 @@ impl App {
             rows,
             (cell_w as u16, cell_h as u16),
             self.config.scrollback,
-            self.dark,
+            self.theme_index.clone(),
             hooks,
         ) {
             Ok(term) => Some(TermHandle { id, term, frame_pending }),
@@ -405,6 +655,37 @@ impl App {
             if let Ok(path) = std::env::var("TIGRIDEN_TEST_OPEN") {
                 slint::Timer::single_shot(std::time::Duration::from_millis(1500), move || {
                     with_app_id(app_id, |app| app.open_file(0, std::path::PathBuf::from(&path)));
+                });
+            }
+            // Reports the Changes panel's tracking mode and contents before
+            // and after a write into the folder.
+            if std::env::var("TIGRIDEN_TEST_CHANGES").is_ok() {
+                let probe = self.sessions[0].root.join("tigriden-probe.txt");
+                let report = move |app: &mut App, when: &str| {
+                    let session = &app.sessions[0];
+                    eprintln!(
+                        "TEST_CHANGES[{when}] enabled={} tracking={:?} changes={:?}",
+                        app.changes_enabled, session.tracking, session.changes
+                    );
+                };
+                slint::Timer::single_shot(std::time::Duration::from_millis(3000), move || {
+                    with_app_id(app_id, |app| report(app, "baseline"));
+                    let _ = std::fs::write(&probe, "probe\n");
+                    slint::Timer::single_shot(std::time::Duration::from_millis(4000), move || {
+                        with_app_id(app_id, |app| report(app, "after-write"));
+                    });
+                });
+            }
+            // Comma-separated "key=value" settings edits, applied like clicks
+            // in the Settings dialog (e.g. "style=vivid,font-size=16").
+            if let Ok(edits) = std::env::var("TIGRIDEN_TEST_SETTINGS") {
+                slint::Timer::single_shot(std::time::Duration::from_millis(2500), move || {
+                    for edit in edits.split(',') {
+                        if let Some((key, value)) = edit.split_once('=') {
+                            settings_changed(key, value);
+                        }
+                    }
+                    eprintln!("TEST_SETTINGS applied: {:?}", config());
                 });
             }
         }
@@ -842,7 +1123,8 @@ impl App {
             kind,
             self.font_family,
             self.config.font_size * scale,
-            self.dark,
+            self.theme,
+            self.config.accent_rgb(),
             width_px,
         ) {
             Ok(viewer_state) => {
@@ -920,7 +1202,7 @@ impl App {
             &path,
             self.font_family,
             self.config.font_size * scale,
-            self.dark,
+            self.theme,
         ) {
             Ok(editor) => {
                 self.sessions[idx].editor = Some(editor);
@@ -967,7 +1249,7 @@ impl App {
             &text,
             self.font_family,
             self.config.font_size * scale,
-            self.dark,
+            self.theme,
         ) {
             Ok(editor) => {
                 self.sessions[idx].viewer = None;
@@ -1255,7 +1537,7 @@ impl App {
             &mut self.font_system,
             &mut self.swash_cache,
             &term,
-            self.dark,
+            self.theme,
             focused,
             w_px,
             h_px,

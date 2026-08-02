@@ -1,13 +1,26 @@
+// Every value here is pushed from Rust (App::push_theme) out of the active
+// entry in src/theme.rs; the defaults below are Classic Dark so the first
+// frame already looks right.
 export global Theme {
     in-out property <bool> dark: true;
 
-    out property <color> bg: dark ? #1e2227 : #fafafa;
-    out property <color> panel: dark ? #24292f : #f0f0f0;
-    out property <color> panel-hover: dark ? #2d333b : #e4e4e4;
-    out property <color> selection: dark ? #39414b : #d8d8d8;
-    out property <color> border: dark ? #333a42 : #d0d0d0;
-    out property <color> text: dark ? #d6dbe1 : #24292f;
-    out property <color> text-dim: dark ? #8b949e : #6e7781;
-    out property <color> accent: #e8912d;
-    out property <length> font-size: 13px;
+    in-out property <color> bg: #1e2227;
+    in-out property <color> panel: #24292f;
+    in-out property <color> panel-hover: #2d333b;
+    in-out property <color> selection: #39414b;
+    in-out property <color> border: #333a42;
+    in-out property <color> text: #d6dbe1;
+    in-out property <color> text-dim: #8b949e;
+    in-out property <color> accent: #e8912d;
+
+    // Chrome text size; everything else scales off it.
+    in-out property <length> font-size: 13px;
+    out property <length> font-size-small: font-size - 1px;
+    out property <length> font-size-tiny: font-size - 2px;
+    out property <length> font-size-large: font-size + 2px;
+
+    // Row / control metrics, so a larger UI size does not clip text.
+    out property <length> row-height: font-size * 1.85;
+    out property <length> header-height: font-size * 2.3;
+    out property <length> chip-height: font-size * 1.7;
 }

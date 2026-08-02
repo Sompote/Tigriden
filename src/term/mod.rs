@@ -4,7 +4,7 @@ pub mod render;
 
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -29,7 +29,8 @@ pub struct EventProxy {
     input_tx: Sender<Vec<u8>>,
     hooks: TermHooks,
     win_size: Arc<Mutex<WindowSize>>,
-    dark: bool,
+    /// Shared with the app so OSC color answerbacks follow theme changes.
+    theme: Arc<AtomicU8>,
 }
 
 impl EventListener for EventProxy {
@@ -40,7 +41,8 @@ impl EventListener for EventProxy {
                 let _ = self.input_tx.send(text.into_bytes());
             }
             Event::ColorRequest(index, format) => {
-                let rgb = to_rgb(colors::osc_color(index, self.dark));
+                let theme = crate::theme::by_index(self.theme.load(Ordering::Relaxed));
+                let rgb = to_rgb(colors::osc_color(index, theme));
                 let _ = self.input_tx.send(format(rgb).into_bytes());
             }
             Event::TextAreaSizeRequest(format) => {
@@ -78,7 +80,7 @@ impl TermSession {
         rows: u16,
         cell_px: (u16, u16),
         scrollback: usize,
-        dark: bool,
+        theme: Arc<AtomicU8>,
         hooks: TermHooks,
     ) -> Result<Self, String> {
         let pty = native_pty_system()
@@ -122,7 +124,7 @@ impl TermSession {
             input_tx: input_tx.clone(),
             hooks: hooks.clone(),
             win_size: win_size.clone(),
-            dark,
+            theme,
         };
 
         let term_config = TermConfig { scrolling_history: scrollback, ..Default::default() };

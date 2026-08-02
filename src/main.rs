@@ -5,6 +5,7 @@ mod git;
 mod paint;
 mod session;
 mod term;
+mod theme;
 mod tree;
 mod viewer;
 
@@ -55,7 +56,7 @@ fn open_window(config: config::Config, recents: Vec<PathBuf>, opts: WindowOpts) 
     app::register(app_id, app, ui.clone_strong());
     with_app_id(app_id, |app| app.update_recents_model());
 
-    wire_callbacks(&ui, app_id, config);
+    wire_callbacks(&ui, app_id);
 
     // Open initial folders (silently dropping folders that vanished).
     for folder in &opts.initial_folders {
@@ -68,7 +69,7 @@ fn open_window(config: config::Config, recents: Vec<PathBuf>, opts: WindowOpts) 
     ui.show().expect("failed to show window");
 }
 
-fn wire_callbacks(ui: &MainWindow, app_id: u64, config: config::Config) {
+fn wire_callbacks(ui: &MainWindow, app_id: u64) {
     ui.on_add_folder(move || {
         if let Some(folder) = rfd::FileDialog::new().pick_folder() {
             with_app_id(app_id, |app| app.add_session(folder, true));
@@ -80,7 +81,7 @@ fn wire_callbacks(ui: &MainWindow, app_id: u64, config: config::Config) {
         let Some(folder) = rfd::FileDialog::new().pick_folder() else { return };
         let team = (team_idx >= 0).then_some(team_idx as usize);
         open_window(
-            config.clone(),
+            app::config(),
             config::load_state().recent_folders,
             WindowOpts {
                 team,
@@ -112,6 +113,13 @@ fn wire_callbacks(ui: &MainWindow, app_id: u64, config: config::Config) {
         with_app_id(app_id, |app| app.name_dialog_accept(name.to_string()))
     });
     ui.on_name_dialog_cancel(move || with_app_id(app_id, |app| app.name_dialog_cancel()));
+    ui.on_settings_open(move || with_app_id(app_id, |app| app.open_settings()));
+    ui.on_settings_close(move || with_app_id(app_id, |app| app.close_settings()));
+    // The settings callbacks below touch every window, so they must not run
+    // inside with_app_id (which holds a borrow on this one).
+    ui.on_settings_changed(|key, value| app::settings_changed(&key, &value));
+    ui.on_settings_reset(app::settings_reset);
+    ui.on_settings_reveal_config(app::reveal_config);
     ui.on_toggle_view(move || with_app_id(app_id, |app| app.toggle_view()));
     ui.on_toggle_changes(move || with_app_id(app_id, |app| app.toggle_changes()));
     ui.on_banner_primary(move || with_app_id(app_id, |app| app.banner_primary()));
@@ -175,6 +183,7 @@ fn main() {
     if malformed_config {
         eprintln!("tigriden: config.toml is malformed; using defaults (file left untouched)");
     }
+    app::set_config(config.clone());
 
     open_window(
         config,

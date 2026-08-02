@@ -1,0 +1,514 @@
+import { Button, ScrollView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+export struct AccentOption {
+    id: string,
+    label: string,
+    color: color,
+}
+
+// A selectable pill used for the mode / style / size rows.
+component Chip inherits TouchArea {
+    in property <string> label;
+    in property <bool> selected;
+
+    width: text.preferred-width + 22px;
+    height: Theme.chip-height;
+
+    Rectangle {
+        border-radius: 5px;
+        border-width: 1px;
+        border-color: root.selected ? Theme.accent : Theme.border;
+        background: root.selected ? Theme.accent.with-alpha(0.16)
+            : (root.has-hover ? Theme.panel-hover : transparent);
+        text := Text {
+            text: root.label;
+            color: root.selected ? Theme.accent : Theme.text;
+            font-size: Theme.font-size-small;
+            font-weight: root.selected ? 600 : 400;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+// Dropdown built from plain elements: unlike std-widgets' ComboBox it holds no
+// state of its own, so "Reset to defaults" can never leave it showing a value
+// the config no longer has.
+component Dropdown inherits Rectangle {
+    in property <[string]> options;
+    in property <string> value;
+    callback picked(string);
+
+    height: Theme.chip-height + 4px;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: touch.has-hover ? Theme.accent : Theme.border;
+    background: Theme.bg;
+
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        spacing: 6px;
+        Text {
+            text: root.value;
+            color: Theme.text;
+            font-size: Theme.font-size-small;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: "▾";
+            color: Theme.text-dim;
+            font-size: Theme.font-size-tiny;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { popup.show(); }
+    }
+
+    popup := PopupWindow {
+        x: 0;
+        y: parent.height + 2px;
+        width: root.width;
+        height: 220px;
+        close-policy: close-on-click-outside;
+
+        Rectangle {
+            background: Theme.panel;
+            border-width: 1px;
+            border-color: Theme.border;
+            border-radius: 6px;
+
+            ScrollView {
+                x: 4px;
+                y: 4px;
+                width: parent.width - 8px;
+                height: parent.height - 8px;
+
+                VerticalLayout {
+                    alignment: start;
+                    for option in root.options: option-row := TouchArea {
+                        height: Theme.row-height;
+                        Rectangle {
+                            border-radius: 4px;
+                            background: option-row.has-hover ? Theme.panel-hover
+                                : (option == root.value ? Theme.selection : transparent);
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                Text {
+                                    text: option;
+                                    color: option == root.value ? Theme.accent : Theme.text;
+                                    font-size: Theme.font-size-small;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+                        clicked => {
+                            popup.close();
+                            root.picked(option);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component SectionTitle inherits Text {
+    color: Theme.text-dim;
+    font-size: Theme.font-size-tiny;
+    font-weight: 700;
+    letter-spacing: 0.8px;
+}
+
+component FieldLabel inherits Text {
+    color: Theme.text;
+    font-size: Theme.font-size-small;
+    vertical-alignment: center;
+    overflow: elide;
+    width: 106px;
+}
+
+export component SettingsDialog inherits Rectangle {
+    in property <string> mode;
+    in property <string> style;
+    in property <string> accent;
+    in property <[AccentOption]> accent-options;
+    in property <[color]> preview-colors;
+    in property <string> theme-label;
+    in property <[string]> font-families;
+    in property <string> font-family;
+    in property <float> font-size;
+    in property <float> ui-font-size;
+    in property <int> scrollback;
+    in property <bool> show-changes;
+    in property <string> config-path;
+
+    // key/value pairs consumed by App::settings_changed.
+    callback changed(string, string);
+    callback close();
+    callback reset();
+    callback reveal-config();
+
+    background: Theme.bg.with-alpha(0.62);
+
+    // Swallows clicks on the scrim (and closes, like the name dialog).
+    TouchArea {
+        clicked => { root.close(); }
+    }
+
+    FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.close();
+                accept
+            } else {
+                reject
+            }
+        }
+        init => { self.focus(); }
+    }
+
+    Rectangle {
+        width: min(root.width - 40px, 520px);
+        height: min(root.height - 40px, 620px);
+        background: Theme.panel;
+        border-width: 1px;
+        border-color: Theme.border;
+        border-radius: 10px;
+
+        // Keeps scrim clicks from passing through the card.
+        TouchArea { }
+
+        VerticalLayout {
+            padding: 0px;
+
+            // ----- header -----
+            Rectangle {
+                height: Theme.font-size * 3.2;
+                HorizontalLayout {
+                    padding-left: 18px;
+                    padding-right: 10px;
+                    Text {
+                        text: "Settings";
+                        color: Theme.text;
+                        font-size: Theme.font-size-large;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    close-touch := TouchArea {
+                        width: 28px;
+                        Text {
+                            text: "✕";
+                            color: close-touch.has-hover ? Theme.text : Theme.text-dim;
+                            font-size: Theme.font-size-small;
+                            vertical-alignment: center;
+                            horizontal-alignment: center;
+                        }
+                        clicked => { root.close(); }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 1px;
+                background: Theme.border;
+            }
+
+            ScrollView {
+                vertical-stretch: 1;
+
+                VerticalLayout {
+                    padding: 18px;
+                    spacing: 16px;
+                    alignment: start;
+
+                    // ----- appearance -----
+                    VerticalLayout {
+                        spacing: 9px;
+                        SectionTitle { text: "APPEARANCE"; }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            FieldLabel { text: "Mode"; }
+                            Chip {
+                                label: "Dark";
+                                selected: root.mode == "dark";
+                                clicked => { root.changed("mode", "dark"); }
+                            }
+                            Chip {
+                                label: "Light";
+                                selected: root.mode == "light";
+                                clicked => { root.changed("mode", "light"); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            FieldLabel { text: "Style"; }
+                            Chip {
+                                label: "Classic";
+                                selected: root.style == "classic";
+                                clicked => { root.changed("style", "classic"); }
+                            }
+                            Chip {
+                                label: "Minimal";
+                                selected: root.style == "minimal";
+                                clicked => { root.changed("style", "minimal"); }
+                            }
+                            Chip {
+                                label: "Vivid";
+                                selected: root.style == "vivid";
+                                clicked => { root.changed("style", "vivid"); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+
+                        // Live swatch strip of the selected theme's palette.
+                        HorizontalLayout {
+                            spacing: 8px;
+                            FieldLabel { text: "Preview"; }
+                            Rectangle {
+                                height: Theme.chip-height;
+                                horizontal-stretch: 1;
+                                border-radius: 5px;
+                                border-width: 1px;
+                                border-color: Theme.border;
+                                background: Theme.bg;
+                                HorizontalLayout {
+                                    padding-left: 8px;
+                                    padding-right: 8px;
+                                    spacing: 6px;
+                                    alignment: start;
+                                    Text {
+                                        text: root.theme-label;
+                                        color: Theme.text;
+                                        font-size: Theme.font-size-tiny;
+                                        vertical-alignment: center;
+                                    }
+                                    for swatch in root.preview-colors: Rectangle {
+                                        y: (parent.height - 10px) / 2;
+                                        width: 10px;
+                                        height: 10px;
+                                        border-radius: 5px;
+                                        background: swatch;
+                                    }
+                                }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            FieldLabel { text: "Accent"; }
+                            for option in root.accent-options: accent-touch := TouchArea {
+                                width: Theme.chip-height;
+                                height: Theme.chip-height;
+                                Rectangle {
+                                    border-radius: self.height / 2;
+                                    border-width: root.accent == option.id ? 2px : 1px;
+                                    border-color: root.accent == option.id ? Theme.text : Theme.border;
+                                    background: accent-touch.has-hover ? Theme.panel-hover : transparent;
+                                    Rectangle {
+                                        width: parent.height - 10px;
+                                        height: self.width;
+                                        border-radius: self.width / 2;
+                                        background: option.color;
+                                    }
+                                }
+                                clicked => { root.changed("accent", option.id); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: Theme.border; }
+
+                    // ----- typography -----
+                    VerticalLayout {
+                        spacing: 9px;
+                        SectionTitle { text: "TYPOGRAPHY"; }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            FieldLabel { text: "Font"; }
+                            Dropdown {
+                                horizontal-stretch: 1;
+                                options: root.font-families;
+                                value: root.font-family;
+                                picked(name) => { root.changed("font-family", name); }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            FieldLabel { text: "Text size"; }
+                            Chip {
+                                label: "−";
+                                clicked => { root.changed("font-size-step", "-1"); }
+                            }
+                            Rectangle {
+                                width: 52px;
+                                Text {
+                                    text: root.font-size + " px";
+                                    color: Theme.text;
+                                    font-size: Theme.font-size-small;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: center;
+                                }
+                            }
+                            Chip {
+                                label: "+";
+                                clicked => { root.changed("font-size-step", "1"); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            FieldLabel { text: "Interface"; }
+                            Chip {
+                                label: "Small";
+                                selected: root.ui-font-size <= 11;
+                                clicked => { root.changed("ui-font-size", "11"); }
+                            }
+                            Chip {
+                                label: "Normal";
+                                selected: root.ui-font-size > 11 && root.ui-font-size < 15;
+                                clicked => { root.changed("ui-font-size", "13"); }
+                            }
+                            Chip {
+                                label: "Large";
+                                selected: root.ui-font-size >= 15;
+                                clicked => { root.changed("ui-font-size", "15"); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: Theme.border; }
+
+                    // ----- terminal & panels -----
+                    VerticalLayout {
+                        spacing: 9px;
+                        SectionTitle { text: "TERMINAL"; }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            FieldLabel { text: "Scrollback"; }
+                            Chip {
+                                label: "1k";
+                                selected: root.scrollback == 1000;
+                                clicked => { root.changed("scrollback", "1000"); }
+                            }
+                            Chip {
+                                label: "10k";
+                                selected: root.scrollback == 10000;
+                                clicked => { root.changed("scrollback", "10000"); }
+                            }
+                            Chip {
+                                label: "50k";
+                                selected: root.scrollback == 50000;
+                                clicked => { root.changed("scrollback", "50000"); }
+                            }
+                            Chip {
+                                label: "100k";
+                                selected: root.scrollback == 100000;
+                                clicked => { root.changed("scrollback", "100000"); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+
+                        Text {
+                            text: "New terminals only — open tabs keep the history they were given.";
+                            color: Theme.text-dim;
+                            font-size: Theme.font-size-tiny;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            FieldLabel { text: "Changes panel"; }
+                            Chip {
+                                label: "Off";
+                                selected: !root.show-changes;
+                                clicked => { root.changed("show-changes", "false"); }
+                            }
+                            Chip {
+                                label: "On";
+                                selected: root.show-changes;
+                                clicked => { root.changed("show-changes", "true"); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+
+                        Text {
+                            text: "Applies to windows opened from now on; File ▸ Show Changes Panel toggles this window.";
+                            color: Theme.text-dim;
+                            font-size: Theme.font-size-tiny;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: Theme.border; }
+
+                    // ----- config file -----
+                    VerticalLayout {
+                        spacing: 6px;
+                        SectionTitle { text: "AGENT PRESETS & TEAMS"; }
+                        Text {
+                            text: "Preset buttons and window teams live in config.toml. Saving here rewrites that file, so comments in it are not preserved.";
+                            color: Theme.text-dim;
+                            font-size: Theme.font-size-tiny;
+                            wrap: word-wrap;
+                        }
+                        reveal-touch := TouchArea {
+                            height: Theme.chip-height;
+                            horizontal-stretch: 1;
+                            Text {
+                                text: root.config-path;
+                                color: reveal-touch.has-hover ? Theme.accent : Theme.text-dim;
+                                font-size: Theme.font-size-tiny;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            clicked => { root.reveal-config(); }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 1px;
+                background: Theme.border;
+            }
+
+            // ----- footer -----
+            Rectangle {
+                height: Theme.font-size * 3.6;
+                HorizontalLayout {
+                    padding-left: 18px;
+                    padding-right: 18px;
+                    spacing: 8px;
+                    alignment: end;
+                    Button {
+                        text: "Reset to defaults";
+                        clicked => { root.reset(); }
+                    }
+                    Button {
+                        text: "Done";
+                        primary: true;
+                        clicked => { root.close(); }
+                    }
+                }
+            }
+        }
+    }
+}

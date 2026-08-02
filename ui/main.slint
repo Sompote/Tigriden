@@ -1,8 +1,9 @@
 import { LineEdit, Button } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Sidebar, TreeRow } from "sidebar.slint";
+import { SettingsDialog, AccentOption } from "settings.slint";
 
-export { TreeRow }
+export { TreeRow, Theme, AccentOption }
 
 export struct PresetItem {
     label: string,
@@ -97,6 +98,22 @@ export component MainWindow inherits Window {
     in property <string> banner-primary-label: "";
     in property <string> banner-secondary-label: "";
 
+    // ----- settings -----
+    in property <bool> settings-visible: false;
+    in property <string> settings-mode: "dark";
+    in property <string> settings-style: "classic";
+    in property <string> settings-accent: "";
+    in property <[AccentOption]> settings-accent-options;
+    in property <[color]> settings-preview-colors;
+    in property <string> settings-theme-label: "";
+    in property <[string]> settings-font-families;
+    in property <string> settings-font-family: "";
+    in property <float> settings-font-size: 13;
+    in property <float> settings-ui-font-size: 13;
+    in property <int> settings-scrollback: 10000;
+    in property <bool> settings-show-changes: false;
+    in property <string> settings-config-path: "";
+
     callback row-clicked(int);
     callback row-toggled(int);
     callback close-session(int);
@@ -117,6 +134,11 @@ export component MainWindow inherits Window {
     callback tree-context(int, int);
     callback name-dialog-accept(string);
     callback name-dialog-cancel();
+    callback settings-open();
+    callback settings-changed(string, string);
+    callback settings-close();
+    callback settings-reset();
+    callback settings-reveal-config();
     callback toggle-view();
     callback toggle-changes();
     callback split-changed();
@@ -181,6 +203,12 @@ export component MainWindow inherits Window {
             }
             MenuSeparator { }
             MenuItem {
+                title: "Settings…";
+                shortcut: @keys(Control + ",");
+                activated => { root.settings-open(); }
+            }
+            MenuSeparator { }
+            MenuItem {
                 title: "Close Terminal";
                 shortcut: @keys(Control + W);
                 activated => { root.menu-close-terminal(); }
@@ -238,7 +266,7 @@ export component MainWindow inherits Window {
                 visible: !root.has-session;
                 text: "Add a folder to start an agent session";
                 color: Theme.text-dim;
-                font-size: 15px;
+                font-size: Theme.font-size-large;
             }
 
             Rectangle {
@@ -254,7 +282,7 @@ export component MainWindow inherits Window {
 
                     VerticalLayout {
                         Rectangle {
-                            height: 28px;
+                            height: Theme.header-height;
                             background: Theme.panel;
                             HorizontalLayout {
                                 padding-left: 10px;
@@ -263,7 +291,7 @@ export component MainWindow inherits Window {
                                 Text {
                                     text: root.editor-title == "" ? "No file open" : root.editor-title;
                                     color: root.editor-title == "" ? Theme.text-dim : Theme.text;
-                                    font-size: 12px;
+                                    font-size: Theme.font-size-small;
                                     vertical-alignment: center;
                                     overflow: elide;
                                     horizontal-stretch: 1;
@@ -271,14 +299,14 @@ export component MainWindow inherits Window {
                                 if root.editor-dirty: Text {
                                     text: "●";
                                     color: Theme.accent;
-                                    font-size: 12px;
+                                    font-size: Theme.font-size-small;
                                     vertical-alignment: center;
                                 }
                                 if root.editor-view-toggle != "": toggle-touch := TouchArea {
                                     width: toggle-label.preferred-width + 18px;
                                     Rectangle {
                                         y: 3px;
-                                        height: 22px;
+                                        height: Theme.chip-height;
                                         border-radius: 4px;
                                         border-width: 1px;
                                         border-color: Theme.border;
@@ -286,7 +314,7 @@ export component MainWindow inherits Window {
                                         toggle-label := Text {
                                             text: root.editor-view-toggle;
                                             color: Theme.accent;
-                                            font-size: 11px;
+                                            font-size: Theme.font-size-tiny;
                                             vertical-alignment: center;
                                             horizontal-alignment: center;
                                         }
@@ -297,7 +325,7 @@ export component MainWindow inherits Window {
                         }
 
                         if root.banner-text != "": Rectangle {
-                            height: 30px;
+                            height: Theme.font-size * 2.4;
                             background: Theme.selection;
                             HorizontalLayout {
                                 padding-left: 10px;
@@ -306,7 +334,7 @@ export component MainWindow inherits Window {
                                 Text {
                                     text: root.banner-text;
                                     color: Theme.text;
-                                    font-size: 12px;
+                                    font-size: Theme.font-size-small;
                                     vertical-alignment: center;
                                     horizontal-stretch: 1;
                                     overflow: elide;
@@ -316,7 +344,7 @@ export component MainWindow inherits Window {
                                     primary-label := Text {
                                         text: root.banner-primary-label;
                                         color: Theme.accent;
-                                        font-size: 12px;
+                                        font-size: Theme.font-size-small;
                                         font-weight: 600;
                                         vertical-alignment: center;
                                         horizontal-alignment: center;
@@ -328,7 +356,7 @@ export component MainWindow inherits Window {
                                     secondary-label := Text {
                                         text: root.banner-secondary-label;
                                         color: Theme.text-dim;
-                                        font-size: 12px;
+                                        font-size: Theme.font-size-small;
                                         vertical-alignment: center;
                                         horizontal-alignment: center;
                                     }
@@ -375,7 +403,7 @@ export component MainWindow inherits Window {
 
                     VerticalLayout {
                         Rectangle {
-                            height: 30px;
+                            height: Theme.header-height + 2px;
                             background: Theme.panel;
                             HorizontalLayout {
                                 padding-left: 8px;
@@ -386,7 +414,7 @@ export component MainWindow inherits Window {
                                     width: root.term-tabs.length > 1 && self.has-hover ? 46px : 30px;
                                     Rectangle {
                                         y: 4px;
-                                        height: 22px;
+                                        height: Theme.chip-height;
                                         border-radius: 4px;
                                         background: i == root.active-term ? Theme.selection
                                             : (tab-touch.has-hover ? Theme.panel-hover : transparent);
@@ -397,7 +425,7 @@ export component MainWindow inherits Window {
                                             Text {
                                                 text: label;
                                                 color: i == root.active-term ? Theme.text : Theme.text-dim;
-                                                font-size: 11px;
+                                                font-size: Theme.font-size-tiny;
                                                 vertical-alignment: center;
                                             }
                                             if root.term-tabs.length > 1 && tab-touch.has-hover: TouchArea {
@@ -405,7 +433,7 @@ export component MainWindow inherits Window {
                                                 Text {
                                                     text: "✕";
                                                     color: Theme.text-dim;
-                                                    font-size: 9px;
+                                                    font-size: Theme.font-size-tiny - 2px;
                                                     vertical-alignment: center;
                                                     horizontal-alignment: center;
                                                 }
@@ -420,13 +448,13 @@ export component MainWindow inherits Window {
                                     width: 24px;
                                     Rectangle {
                                         y: 4px;
-                                        height: 22px;
+                                        height: Theme.chip-height;
                                         border-radius: 4px;
                                         background: new-term-touch.has-hover ? Theme.panel-hover : transparent;
                                         Text {
                                             text: "+";
                                             color: Theme.accent;
-                                            font-size: 13px;
+                                            font-size: Theme.font-size;
                                             vertical-alignment: center;
                                             horizontal-alignment: center;
                                         }
@@ -445,7 +473,7 @@ export component MainWindow inherits Window {
                                     width: preset-text.preferred-width + 20px;
                                     Rectangle {
                                         y: 4px;
-                                        height: 22px;
+                                        height: Theme.chip-height;
                                         border-radius: 4px;
                                         background: preset-touch.has-hover ? Theme.panel-hover : Theme.bg;
                                         border-width: 1px;
@@ -453,7 +481,7 @@ export component MainWindow inherits Window {
                                         preset-text := Text {
                                             text: preset.label;
                                             color: Theme.accent;
-                                            font-size: 11px;
+                                            font-size: Theme.font-size-tiny;
                                             vertical-alignment: center;
                                             horizontal-alignment: center;
                                         }
@@ -481,7 +509,7 @@ export component MainWindow inherits Window {
                                 Text {
                                     text: root.term-overlay;
                                     color: Theme.text-dim;
-                                    font-size: 14px;
+                                    font-size: Theme.font-size-large;
                                 }
                             }
                         }
@@ -489,6 +517,28 @@ export component MainWindow inherits Window {
                 }
             }
         }
+    }
+
+    if root.settings-visible: SettingsDialog {
+        width: 100%;
+        height: 100%;
+        mode: root.settings-mode;
+        style: root.settings-style;
+        accent: root.settings-accent;
+        accent-options: root.settings-accent-options;
+        preview-colors: root.settings-preview-colors;
+        theme-label: root.settings-theme-label;
+        font-families: root.settings-font-families;
+        font-family: root.settings-font-family;
+        font-size: root.settings-font-size;
+        ui-font-size: root.settings-ui-font-size;
+        scrollback: root.settings-scrollback;
+        show-changes: root.settings-show-changes;
+        config-path: root.settings-config-path;
+        changed(key, value) => { root.settings-changed(key, value); }
+        close => { root.settings-close(); }
+        reset => { root.settings-reset(); }
+        reveal-config => { root.settings-reveal-config(); }
     }
 
     if root.name-dialog-visible: Rectangle {
@@ -508,12 +558,12 @@ export component MainWindow inherits Window {
                 Text {
                     text: root.name-dialog-title;
                     color: Theme.text;
-                    font-size: 13px;
+                    font-size: Theme.font-size;
                     font-weight: 600;
                 }
                 name-input := LineEdit {
                     text <=> root.name-dialog-value;
-                    font-size: 13px;
+                    font-size: Theme.font-size;
                     accepted => { root.name-dialog-accept(self.text); }
                     init => { self.focus(); }
                 }

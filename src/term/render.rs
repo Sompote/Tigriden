@@ -9,6 +9,7 @@ use slint::{Rgba8Pixel, SharedPixelBuffer};
 use crate::paint::Canvas;
 use crate::term::colors;
 use crate::term::EventProxy;
+use crate::theme::ThemeDef;
 
 #[derive(Clone, Copy)]
 struct GlyphPos {
@@ -92,14 +93,14 @@ impl TermRenderer {
         font_system: &mut FontSystem,
         swash_cache: &mut SwashCache,
         term: &Term<EventProxy>,
-        dark: bool,
+        theme: &'static ThemeDef,
         focused: bool,
         width_px: u32,
         height_px: u32,
     ) -> SharedPixelBuffer<Rgba8Pixel> {
         let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width_px.max(1), height_px.max(1));
-        let bg = colors::base_palette(dark)[0];
-        let default_fg = colors::base_palette(dark)[7];
+        let bg = colors::base_palette(theme)[0];
+        let default_fg = colors::base_palette(theme)[7];
         let (buf_w, buf_h) = (buffer.width() as i32, buffer.height() as i32);
         let mut canvas = Canvas { pixels: buffer.make_mut_slice(), width: buf_w, height: buf_h };
         canvas.fill(bg);
@@ -129,8 +130,8 @@ impl TermRenderer {
             let Some(view) = point_to_viewport(display_offset, indexed.point) else { continue };
             let (col, row) = (view.column.0 as i32, view.line as i32);
 
-            let mut fg = colors::resolve(indexed.cell.fg, overrides, dark);
-            let mut cell_bg = colors::resolve(indexed.cell.bg, overrides, dark);
+            let mut fg = colors::resolve(indexed.cell.fg, overrides, theme);
+            let mut cell_bg = colors::resolve(indexed.cell.bg, overrides, theme);
             let selected = selection.is_some_and(|range| range.contains(indexed.point));
             if flags.contains(Flags::INVERSE) != selected {
                 std::mem::swap(&mut fg, &mut cell_bg);

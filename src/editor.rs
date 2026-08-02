@@ -2,13 +2,14 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use cosmic_text::{
-    Action, Attrs, Buffer, Edit, Family, FontSystem, Metrics, Motion, Selection, Shaping,
-    SwashCache, SyntaxEditor, SyntaxSystem,
+    Action, Attrs, AttrsList, Buffer, Edit, Family, FontSystem, Metrics, Motion, Selection,
+    Shaping, SwashCache, SyntaxEditor, SyntaxSystem,
 };
 use slint::{Rgba8Pixel, SharedPixelBuffer};
 
 use crate::paint::Canvas;
 use crate::term::keys::Mods;
+use crate::theme::ThemeDef;
 
 // Slint special-key characters relevant to editing.
 const K_BACKSPACE: char = '\u{0008}';
@@ -25,12 +26,8 @@ const K_END: char = '\u{F72B}';
 const K_PAGE_UP: char = '\u{F72C}';
 const K_PAGE_DOWN: char = '\u{F72D}';
 
-pub fn dark_theme_name() -> &'static str {
-    "base16-eighties.dark"
-}
-
-pub fn light_theme_name() -> &'static str {
-    "InspiredGitHub"
+fn metrics_for(font_size_px: f32) -> Metrics {
+    Metrics::new(font_size_px, (font_size_px * 1.45).round())
 }
 
 /// What the app should do after a key event.
@@ -64,13 +61,11 @@ impl EditorState {
         path: &Path,
         font_family: &'static str,
         font_size_px: f32,
-        dark: bool,
+        theme: &'static ThemeDef,
     ) -> Result<Self, String> {
-        let metrics = Metrics::new(font_size_px, (font_size_px * 1.45).round());
-        let buffer = Buffer::new(font_system, metrics);
-        let theme = if dark { dark_theme_name() } else { light_theme_name() };
-        let mut editor = SyntaxEditor::new(buffer, syntax_system, theme)
-            .ok_or_else(|| format!("missing syntect theme {theme}"))?;
+        let buffer = Buffer::new(font_system, metrics_for(font_size_px));
+        let mut editor = SyntaxEditor::new(buffer, syntax_system, theme.syntect)
+            .ok_or_else(|| format!("missing syntect theme {}", theme.syntect))?;
         editor
             .load_text(font_system, path, mono_attrs(font_family))
             .map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -96,13 +91,11 @@ impl EditorState {
         diff_text: &str,
         font_family: &'static str,
         font_size_px: f32,
-        dark: bool,
+        theme: &'static ThemeDef,
     ) -> Result<Self, String> {
-        let metrics = Metrics::new(font_size_px, (font_size_px * 1.45).round());
-        let buffer = Buffer::new(font_system, metrics);
-        let theme = if dark { dark_theme_name() } else { light_theme_name() };
-        let mut editor = SyntaxEditor::new(buffer, syntax_system, theme)
-            .ok_or_else(|| format!("missing syntect theme {theme}"))?;
+        let buffer = Buffer::new(font_system, metrics_for(font_size_px));
+        let mut editor = SyntaxEditor::new(buffer, syntax_system, theme.syntect)
+            .ok_or_else(|| format!("missing syntect theme {}", theme.syntect))?;
         editor.syntax_by_extension("diff");
         editor.with_buffer_mut(|buffer| {
             buffer.set_text(diff_text, &mono_attrs(font_family), Shaping::Advanced, None);
@@ -123,6 +116,27 @@ impl EditorState {
         let _ = self.editor.load_text(font_system, &path, mono_attrs(font_family));
         self.dirty = false;
         self.disk_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    }
+
+    /// Applies a new theme / font without losing unsaved edits: the syntect
+    /// theme is swapped in place and every line's default attrs are reset so
+    /// the next shaping pass re-highlights with the new family.
+    pub fn restyle(
+        &mut self,
+        font_system: &mut FontSystem,
+        font_family: &'static str,
+        font_size_px: f32,
+        theme: &'static ThemeDef,
+    ) {
+        self.editor.update_theme(theme.syntect);
+        let attrs = AttrsList::new(&mono_attrs(font_family));
+        self.editor.with_buffer_mut(|buffer| {
+            buffer.set_metrics(metrics_for(font_size_px));
+            for line in buffer.lines.iter_mut() {
+                line.set_attrs_list(attrs.clone());
+            }
+        });
+        self.editor.shape_as_needed(font_system, true);
     }
 
     pub fn text(&self) -> String {
