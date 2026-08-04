@@ -140,7 +140,9 @@ Slint provides only the chrome (sidebar, layout, splitter). The two hard parts a
 | Terminal | headless `alacritty_terminal` grid fed by `portable-pty` | glyphs rasterized per cell via cosmic-text's swash cache |
 | Editor | cosmic-text `SyntaxEditor` (syntect highlighting) | draws itself into the same pixel-buffer canvas |
 
-Because the two panes paint themselves, a theme is one definition in `src/theme.rs` feeding three consumers: the Slint `Theme` global (chrome), the ANSI 0-15 palette (terminal, shared with the PTY threads for OSC color queries), and a syntect theme name (editor).
+The file viewer paints into the same kind of pixel buffer: Markdown/CSV layout via cosmic-text, and PDF pages rasterized by [hayro](https://crates.io/crates/hayro) on demand — only the pages in (or next to) the viewport are kept in memory.
+
+Because the panes paint themselves, a theme is one definition in `src/theme.rs` feeding three consumers: the Slint `Theme` global (chrome), the ANSI 0-15 palette (terminal, shared with the PTY threads for OSC color queries), and a syntect theme name (editor).
 
 Only the PTY reader threads run in the background; rendering and editing happen on the UI thread with coalesced repaints.
 
@@ -149,6 +151,13 @@ Only the PTY reader threads run in the background; rendering and editing happen 
 ### Debug builds
 
 `cargo build --features framedump`, then run with `TIGRIDEN_DUMP=/tmp/frames` to dump both panes as PNGs. `TIGRIDEN_TEST_INPUT='claude\r'`, `TIGRIDEN_TEST_OPEN=path`, `TIGRIDEN_TEST_SETTINGS='style=vivid,font-size-step=2'` and `TIGRIDEN_TEST_CHANGES=1` (reports the Changes panel's tracking mode and contents around a write) script the first session for headless testing.
+
+## Changelog
+
+- **0.1.3** — viewer zoom for images and PDFs (Cmd+=/-/0, Ctrl/Cmd+wheel, header magnifier buttons, panning), PDFs rendered as actual pages, Markdown tables drawn as real grids, terminal scrollback keys (Shift+PageUp/PageDown/Home/End/↑/↓).
+- **0.1.2** — Settings UI (⌘,): 6 themes, accent colors, fonts and sizes, scrollback, all applied live to every window.
+- **0.1.1** — file change tracking with per-file/all rollback (git or invisible shadow snapshots), multiple windows with per-window agent teams.
+- **0.1.0** — first release: per-folder sessions with terminal, file tree, editor, viewers, presets.
 
 ## Roadmap / known limitations (v1)
 
