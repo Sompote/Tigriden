@@ -121,6 +121,8 @@ fn wire_callbacks(ui: &MainWindow, app_id: u64) {
     ui.on_settings_reset(app::settings_reset);
     ui.on_settings_reveal_config(app::reveal_config);
     ui.on_toggle_view(move || with_app_id(app_id, |app| app.toggle_view()));
+    ui.on_viewer_zoom_in(move || with_app_id(app_id, |app| app.viewer_zoom_in()));
+    ui.on_viewer_zoom_out(move || with_app_id(app_id, |app| app.viewer_zoom_out()));
     ui.on_toggle_changes(move || with_app_id(app_id, |app| app.toggle_changes()));
     ui.on_banner_primary(move || with_app_id(app_id, |app| app.banner_primary()));
     ui.on_banner_secondary(move || with_app_id(app_id, |app| app.banner_secondary()));
@@ -140,7 +142,9 @@ fn wire_callbacks(ui: &MainWindow, app_id: u64) {
         handled
     });
     ui.on_editor_mouse(move |kind, x, y| with_app_id(app_id, |app| app.editor_mouse(kind, x, y)));
-    ui.on_editor_wheel(move |delta| with_app_id(app_id, |app| app.editor_wheel(delta)));
+    ui.on_editor_wheel(move |dx, dy, zoom| {
+        with_app_id(app_id, |app| app.editor_wheel(dx, dy, zoom))
+    });
     ui.on_editor_size_changed(move |w, h| with_app_id(app_id, |app| app.editor_resized(w, h)));
 
     // External file drops arrive as winit events the Slint DropArea never

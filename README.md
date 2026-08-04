@@ -1,6 +1,6 @@
 # Tigriden — Terminal for Agentic Coding
 
-![Version](https://img.shields.io/badge/version-0.1.2-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
+![Version](https://img.shields.io/badge/version-0.1.3-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 
 **A tiny desktop IDE built for one job: supervising AI coding agents.**
 
@@ -20,13 +20,13 @@ Agentic coding means running several agents in several folders and checking in o
 
 - **One-click agents** — preset buttons type the agent command into the terminal for you (fully configurable).
 - **Multiple terminals per folder** — the `+` tab spawns extra shells in the same workspace, so one agent can run while you use a second terminal for git, tests, or another agent.
-- **Real terminal** — VTE-compliant emulation ([alacritty_terminal](https://crates.io/crates/alacritty_terminal) + a real PTY). TUIs like `vim`, `top`, and the Claude Code interface just work, including bracketed paste and truecolor. Select with the mouse and Cmd+C to copy out; Cmd+V pastes text in, and image paste into Claude Code works with Ctrl+V (the agent reads your clipboard directly).
+- **Real terminal** — VTE-compliant emulation ([alacritty_terminal](https://crates.io/crates/alacritty_terminal) + a real PTY). TUIs like `vim`, `top`, and the Claude Code interface just work, including bracketed paste and truecolor. Select with the mouse and Cmd+C to copy out; Cmd+V pastes text in, and image paste into Claude Code works with Ctrl+V (the agent reads your clipboard directly). *(new in 0.1.3)* Keyboard scrollback: Shift+PageUp/PageDown page through history, Shift+Home/End jump to its ends, Shift+↑/↓ go line by line — the unshifted keys still reach the shell, and full-screen apps are left alone.
 - **Live file tree** — gitignore-aware, refreshes automatically as agents create and delete files. Right-click any entry for New File/Folder, Reveal in Finder, Open in Default App, Copy (Relative) Path, Duplicate, Rename, and Move to Trash.
 - **File change tracking & rollback** *(new in 0.1.1)* — **File ▸ Show Changes Panel** adds a live **Changes (N)** list under each folder showing every file the agent has modified/added/deleted since the baseline, updated automatically within ~1 s of a write. Click a row for a syntax-highlighted diff; right-click ▸ **Discard Changes…** reverts one file, the **↺** button (or **Discard All Changes…**) reverts everything — always behind a confirmation. Two modes, picked automatically: folders with git compare against the last commit; folders **without git get invisible shadow snapshots** (stored in the app's data dir — your folder stays untouched, the agent never sees them). Off by default with zero overhead; toggling on snapshots "now" as the baseline.
 - **Multiple windows & agent teams** *(new in 0.1.1)* — **File ▸ New Window** opens an independent window with its own folders, running in parallel. Define named preset groups (`[[teams]]` in config.toml) and pick one per window to give different windows different agent buttons.
 - **Drag & drop files** — drop any file from Finder onto the window and its (shell-quoted) path is typed into the terminal, so you can attach files to an agent prompt the same way as in a native terminal.
 - **Built-in editor** — syntax highlighting for 40+ languages ([cosmic-text](https://crates.io/crates/cosmic-text) + syntect), edit and Cmd+S save. When an agent edits the open file on disk, it reloads automatically (or asks, if you have unsaved changes).
-- **File viewers** — images (png/jpg/gif/webp/bmp/tiff), Markdown rendered with headings, code blocks and inline pictures, CSV/TSV as an aligned table, and PDF text extraction. A header button toggles Markdown/CSV between the rendered view and editable source.
+- **File viewers** *(upgraded in 0.1.3)* — images (png/jpg/gif/webp/bmp/tiff), Markdown rendered with headings, code blocks, inline pictures **and real tables** (grid lines, shaded header row, wrapped cells), CSV/TSV as an aligned table, and **PDFs shown as actual pages** — rasterized lazily as you scroll, with text extraction as the fallback for files that can't be parsed. Images and PDF pages **zoom** with Cmd+= / Cmd+- / Cmd+0, Ctrl/Cmd+wheel, or the magnifier buttons in the header, and pan in every direction while zoomed in. A header button toggles Markdown/CSV between the rendered view and editable source.
 - **Per-folder sessions** — each workspace keeps its own shell, tree, and open file; switching is instant.
 - **Recent folders** — every folder you add is remembered permanently; reopen from the ⟳ button or **File ▸ Open Recent**, even after removing it from the workbench.
 - **Settings UI** *(new in 0.1.2)* — **File ▸ Settings… (⌘,)** picks the theme (Dark/Light × Classic/Minimal/Vivid), an accent color, the terminal/editor font and size, the interface text size, terminal scrollback, and whether new windows start with the Changes panel. Every change applies immediately to all open windows — chrome, terminal palette and editor highlighting together — and is saved to config.toml.
@@ -38,7 +38,7 @@ Agentic coding means running several agents in several folders and checking in o
 
 No Rust needed — grab the prebuilt app from the [latest release](https://github.com/Sompote/Tigriden/releases/latest):
 
-1. Download **`Tigriden-0.1.2-macos-universal.app.zip`** (one download for both Apple Silicon and Intel).
+1. Download **`Tigriden-0.1.3-macos-universal.app.zip`** (one download for both Apple Silicon and Intel).
 2. Unzip and drag **Tigriden.app** into **/Applications**.
 3. First launch only: the app isn't notarized, so **right-click → Open → Open**, or run:
 
@@ -46,7 +46,7 @@ No Rust needed — grab the prebuilt app from the [latest release](https://githu
    xattr -d com.apple.quarantine /Applications/Tigriden.app
    ```
 
-Prefer a bare binary? The release also ships `tigriden-0.1.2-macos-arm64.tar.gz` (Apple Silicon) and `tigriden-0.1.2-macos-x86_64.tar.gz` (Intel) — untar and run `./tigriden`.
+Prefer a bare binary? The release also ships `tigriden-0.1.3-macos-arm64.tar.gz` (Apple Silicon) and `tigriden-0.1.3-macos-x86_64.tar.gz` (Intel) — untar and run `./tigriden`.
 
 <details>
 <summary><b>Build from source</b> (stable Rust required)</summary>
@@ -86,8 +86,9 @@ Detection is watcher-driven (no polling): bursts of writes are coalesced for 250
 
 | Context  | Keys |
 |----------|------|
-| Terminal | everything a terminal expects: Ctrl+C/Z/D/R…, arrows, F1–F12, TUIs; drag to select (double-click = word), Cmd+C copies, Cmd+V pastes (bracketed); wheel scrolls history |
+| Terminal | everything a terminal expects: Ctrl+C/Z/D/R…, arrows, F1–F12, TUIs; drag to select (double-click = word), Cmd+C copies, Cmd+V pastes (bracketed); wheel scrolls history, Shift+PgUp/PgDn pages it, Shift+Home/End jump to the ends, Shift+↑/↓ go line by line |
 | Editor   | typing, arrows / Home / End / PgUp / PgDn (+Shift selects, +Alt jumps words), Cmd+A / C / X / V, Cmd+S saves |
+| Viewer   | wheel scrolls; on images & PDFs: Cmd+= / Cmd+- zoom, Cmd+0 resets, Ctrl/Cmd+wheel zooms, and a zoomed view pans horizontally |
 
 ## Configuration
 
@@ -155,7 +156,7 @@ Only the PTY reader threads run in the background; rendering and editing happen 
 - [ ] Mouse reporting to TUIs
 - [ ] IME / dead-key composition
 - [ ] Editor tabs (currently one open file per session)
-- [ ] PDF page rendering (currently text extraction)
+- [x] PDF page rendering *(done in 0.1.3)*
 - [ ] Linux / Windows testing
 
 ## License
