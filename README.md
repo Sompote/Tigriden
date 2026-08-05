@@ -26,10 +26,10 @@ Agentic coding means running several agents in several folders and checking in o
 - **Multiple windows & agent teams** *(new in 0.1.1)* — **File ▸ New Window** opens an independent window with its own folders, running in parallel. Define named preset groups (`[[teams]]` in config.toml) and pick one per window to give different windows different agent buttons.
 - **Drag & drop files** — drop any file from Finder onto the window and its (shell-quoted) path is typed into the terminal, so you can attach files to an agent prompt the same way as in a native terminal.
 - **Built-in editor** — syntax highlighting for 40+ languages ([cosmic-text](https://crates.io/crates/cosmic-text) + syntect), edit and Cmd+S save. When an agent edits the open file on disk, it reloads automatically (or asks, if you have unsaved changes).
-- **File viewers** *(upgraded in 0.1.3)* — images (png/jpg/gif/webp/bmp/tiff), Markdown rendered with headings, code blocks, inline pictures **and real tables** (grid lines, shaded header row, wrapped cells), CSV/TSV as an aligned table, and **PDFs shown as actual pages** — rasterized lazily as you scroll, with text extraction as the fallback for files that can't be parsed. Images and PDF pages **zoom** with Cmd+= / Cmd+- / Cmd+0, Ctrl/Cmd+wheel, or the magnifier buttons in the header, and pan in every direction while zoomed in. A header button toggles Markdown/CSV between the rendered view and editable source.
+- **File viewers** *(upgraded in 0.1.3, fast & async in 0.1.4)* — images (png/jpg/gif/webp/bmp/tiff), Markdown rendered with headings, code blocks, inline pictures **and real tables** (grid lines, shaded header row, wrapped cells), CSV/TSV as an aligned table, and **PDFs shown as actual pages** — with text extraction as the fallback for files that can't be parsed. PDF pages rasterize and images decode on **background worker threads** with the next page prefetched, so scrolling and zooming never stall the UI: you get an instant preview that sharpens the moment the full-quality bitmap lands. Zoom with Cmd+= / Cmd+- / Cmd+0, Ctrl/Cmd+wheel, or the magnifier buttons in the header, and pan in every direction while zoomed in. A **scrollbar** on the right (drag the thumb or click the track) plus PageUp/PageDown, Home/End and ↑/↓ navigate long documents. A header button toggles Markdown/CSV between the rendered view and editable source.
 - **Per-folder sessions** — each workspace keeps its own shell, tree, and open file; switching is instant.
 - **Recent folders** — every folder you add is remembered permanently; reopen from the ⟳ button or **File ▸ Open Recent**, even after removing it from the workbench.
-- **Settings UI** *(new in 0.1.2)* — **File ▸ Settings… (⌘,)** picks the theme (Dark/Light × Classic/Minimal/Vivid), an accent color, the terminal/editor font and size, the interface text size, terminal scrollback, and whether new windows start with the Changes panel. Every change applies immediately to all open windows — chrome, terminal palette and editor highlighting together — and is saved to config.toml.
+- **Settings UI** *(new in 0.1.2)* — **File ▸ Settings… (⌘,)** picks the theme (Dark/Light × Classic/Minimal/Vivid), an accent color, the terminal/editor font and size, the interface text size, terminal scrollback (since 0.1.4 applied to already-running terminals too), and whether new windows start with the Changes panel. Every change applies immediately to all open windows — chrome, terminal palette and editor highlighting together — and is saved to config.toml.
 - **Native menu bar** — File (Add Folder ⌘O, New Terminal ⌘T, Show/Hide Changes Panel, Open Recent, New Window ▸ team, Save ⌘S, Settings ⌘,, Close Terminal ⌘W, Close Folder ⇧⌘W) and Edit (Copy/Paste/Select All) menus, routed to whichever pane has focus.
 - **Persistent** — folders, active session, and layout are restored on relaunch (fresh shells each time, by design).
 - **Small on purpose** — no webview, no Electron, no C regex libraries. Slint UI with both panes rasterized straight to pixel buffers.
@@ -88,7 +88,7 @@ Detection is watcher-driven (no polling): bursts of writes are coalesced for 250
 |----------|------|
 | Terminal | everything a terminal expects: Ctrl+C/Z/D/R…, arrows, F1–F12, TUIs; drag to select (double-click = word), Cmd+C copies, Cmd+V pastes (bracketed); wheel scrolls history, Shift+PgUp/PgDn pages it, Shift+Home/End jump to the ends, Shift+↑/↓ go line by line |
 | Editor   | typing, arrows / Home / End / PgUp / PgDn (+Shift selects, +Alt jumps words), Cmd+A / C / X / V, Cmd+S saves |
-| Viewer   | wheel scrolls; on images & PDFs: Cmd+= / Cmd+- zoom, Cmd+0 resets, Ctrl/Cmd+wheel zooms, and a zoomed view pans horizontally |
+| Viewer   | wheel scrolls, right-edge scrollbar drags or click-jumps, PgUp/PgDn page, Home/End jump to the ends, ↑/↓ step; on images & PDFs: Cmd+= / Cmd+- zoom, Cmd+0 resets, Ctrl/Cmd+wheel zooms, and a zoomed view pans horizontally |
 
 ## Configuration
 
@@ -140,11 +140,11 @@ Slint provides only the chrome (sidebar, layout, splitter). The two hard parts a
 | Terminal | headless `alacritty_terminal` grid fed by `portable-pty` | glyphs rasterized per cell via cosmic-text's swash cache |
 | Editor | cosmic-text `SyntaxEditor` (syntect highlighting) | draws itself into the same pixel-buffer canvas |
 
-The file viewer paints into the same kind of pixel buffer: Markdown/CSV layout via cosmic-text, and PDF pages rasterized by [hayro](https://crates.io/crates/hayro) on demand — only the pages in (or next to) the viewport are kept in memory.
+The file viewer paints into the same kind of pixel buffer: Markdown/CSV layout via cosmic-text, PDF pages rasterized by [hayro](https://crates.io/crates/hayro), and images decoded/resampled by the [image](https://crates.io/crates/image) crate — both on per-document worker threads, so the UI thread never waits on them. Only the pages in (or next to) the viewport are kept in memory, requests coalesce so a zoom gesture renders just the final size, and a nearest-neighbor preview covers the gap until each full-quality bitmap arrives.
 
 Because the panes paint themselves, a theme is one definition in `src/theme.rs` feeding three consumers: the Slint `Theme` global (chrome), the ANSI 0-15 palette (terminal, shared with the PTY threads for OSC color queries), and a syntect theme name (editor).
 
-Only the PTY reader threads run in the background; rendering and editing happen on the UI thread with coalesced repaints.
+Only the PTY reader threads and the viewer's rasterizer/decoder workers run in the background; rendering and editing happen on the UI thread with coalesced, throttled repaints.
 
 `vendor/cosmic-text/` is a verbatim copy of cosmic-text 0.19 with one change: its syntect dependency uses the pure-Rust `fancy-regex` engine instead of the oniguruma C library (smaller binary, no C build dependency).
 
