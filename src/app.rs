@@ -195,6 +195,65 @@ pub fn reveal_config() {
         .spawn();
 }
 
+/// Raw `+[NSEvent modifierFlags]`: the current hardware modifier state,
+/// readable by the app itself without any TCC permission (unlike the
+/// CGEventSource APIs, which are Input-Monitoring-gated on modern macOS).
+#[cfg(target_os = "macos")]
+fn ns_modifier_flags() -> usize {
+    use std::ffi::c_void;
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const u8) -> *mut c_void;
+        fn sel_registerName(name: *const u8) -> *mut c_void;
+        fn objc_msgSend(receiver: *mut c_void, sel: *mut c_void) -> usize;
+    }
+    // NSEvent lives in AppKit; winit links it anyway, this makes it explicit.
+    #[link(name = "AppKit", kind = "framework")]
+    extern "C" {}
+    unsafe {
+        let cls = objc_getClass(c"NSEvent".as_ptr().cast());
+        if cls.is_null() {
+            return 0;
+        }
+        objc_msgSend(cls, sel_registerName(c"modifierFlags".as_ptr().cast()))
+    }
+}
+
+/// Whether the wheel-zoom modifier (⌘ or Ctrl) is held right now, asked
+/// straight from AppKit. Slint tracks modifiers from key events, but on macOS
+/// the ⌘ flags-changed event does not reliably reach that bookkeeping while
+/// the pointer is scrolling, so scroll events report stale modifiers.
+#[cfg(target_os = "macos")]
+fn zoom_modifier_down() -> bool {
+    const CMD: usize = 1 << 20; // NSEventModifierFlagCommand
+    const CTRL: usize = 1 << 18; // NSEventModifierFlagControl
+    ns_modifier_flags() & (CMD | CTRL) != 0
+}
+
+/// Current (ctrl, alt, meta, shift) held state of the physical keys, straight
+/// from the OS. Used to correct slint's per-event modifier flags, which lag
+/// behind reality when the event queue is busy.
+pub fn native_modifier_state() -> (bool, bool, bool, bool) {
+    #[cfg(target_os = "macos")]
+    {
+        let raw = ns_modifier_flags();
+        return (
+            raw & (1 << 18) != 0, // NSEventModifierFlagControl
+            raw & (1 << 19) != 0, // NSEventModifierFlagOption
+            raw & (1 << 20) != 0, // NSEventModifierFlagCommand
+            raw & (1 << 17) != 0, // NSEventModifierFlagShift
+        );
+    }
+    #[allow(unreachable_code)]
+    (false, false, false, false)
+}
+
+/// Elsewhere the slint-reported modifier is trustworthy.
+#[cfg(not(target_os = "macos"))]
+fn zoom_modifier_down() -> bool {
+    false
+}
+
 #[derive(Clone)]
 enum RowTarget {
     Header(usize),
@@ -274,6 +333,9 @@ pub struct App {
     term_view: (f32, f32),
     editor_view: (f32, f32),
     wheel_accum: f32,
+    /// Trailing repaint armed while zoom wheel events are throttled.
+    zoom_render_armed: bool,
+    last_zoom_render: std::time::Instant,
     term_mouse_down: bool,
     banner: Banner,
     pending_name: Option<NameAction>,
@@ -340,6 +402,8 @@ impl App {
             term_view: (0.0, 0.0),
             editor_view: (0.0, 0.0),
             wheel_accum: 0.0,
+            zoom_render_armed: false,
+            last_zoom_render: std::time::Instant::now(),
             term_mouse_down: false,
             banner: Banner::None,
             pending_name: None,
@@ -426,6 +490,7 @@ impl App {
         let text_changed = !std::ptr::eq(font_family, self.font_family)
             || (config.font_size - self.config.font_size).abs() > f32::EPSILON;
         let theme_changed = !std::ptr::eq(theme, self.theme);
+        let scrollback_changed = config.scrollback != self.config.scrollback;
 
         self.config = config;
         self.theme = theme;
@@ -437,6 +502,16 @@ impl App {
             push_theme(&ui, &self.config);
         }
         self.push_settings();
+
+        // Running shells adopt the new limit in place; already-trimmed lines
+        // cannot come back, but history keeps growing from here.
+        if scrollback_changed {
+            for session in &self.sessions {
+                for handle in &session.terms {
+                    handle.term.set_scrollback(self.config.scrollback);
+                }
+            }
+        }
 
         if !text_changed && !theme_changed {
             return;
@@ -1117,6 +1192,13 @@ impl App {
     fn open_viewer(&mut self, idx: usize, path: PathBuf, kind: viewer::ViewKind) {
         let scale = self.scale();
         let width_px = (self.editor_view.0 * scale).max(200.0);
+        // Repaint when the PDF worker finishes rasterizing a page.
+        let app_id = self.id;
+        let notify: viewer::Notify = std::sync::Arc::new(move || {
+            let _ = slint::invoke_from_event_loop(move || {
+                with_app_id(app_id, |app| app.render_editor());
+            });
+        });
         match ViewerState::open(
             &mut self.font_system,
             &path,
@@ -1126,6 +1208,7 @@ impl App {
             self.theme,
             self.config.accent_rgb(),
             width_px,
+            notify,
         ) {
             Ok(viewer_state) => {
                 let session = &mut self.sessions[idx];
@@ -1266,6 +1349,9 @@ impl App {
         if self.viewer_zoom_key(text, &mods) {
             return true;
         }
+        if self.viewer_scroll_key(text, &mods) {
+            return true;
+        }
         let Some(session) = self.sessions.get_mut(self.active) else { return false };
         let Some(editor) = session.editor.as_mut() else { return false };
         match editor.handle_key(&mut self.font_system, &mut self.clipboard, text, &mods) {
@@ -1310,6 +1396,29 @@ impl App {
         handled
     }
 
+    /// PageUp/PageDown, Home/End and arrow keys scroll the viewer.
+    fn viewer_scroll_key(&mut self, text: &str, mods: &Mods) -> bool {
+        if mods.ctrl || mods.alt || mods.meta || mods.shift {
+            return false;
+        }
+        let scale = self.scale();
+        let view_h = self.editor_view.1 * scale;
+        let line = self.config.font_size * scale * 3.0;
+        let Some(session) = self.sessions.get_mut(self.active) else { return false };
+        let Some(viewer_state) = session.viewer.as_mut() else { return false };
+        match text.chars().next() {
+            Some(keys::K_PAGE_UP) => viewer_state.scroll_page(view_h, false),
+            Some(keys::K_PAGE_DOWN) => viewer_state.scroll_page(view_h, true),
+            Some(keys::K_HOME) => viewer_state.scroll_home(false),
+            Some(keys::K_END) => viewer_state.scroll_home(true),
+            Some(keys::K_UP) => viewer_state.scroll_by(0.0, line),
+            Some(keys::K_DOWN) => viewer_state.scroll_by(0.0, -line),
+            _ => return false,
+        }
+        self.render_editor();
+        true
+    }
+
     /// Header magnifier buttons: same steps as Cmd+= / Cmd+-.
     pub fn viewer_zoom_in(&mut self) {
         self.viewer_zoom_step(1.25);
@@ -1328,7 +1437,14 @@ impl App {
 
     pub fn editor_mouse(&mut self, kind: i32, x: f32, y: f32) {
         let scale = self.scale();
+        let view_h = self.editor_view.1 * scale;
         let Some(session) = self.sessions.get_mut(self.active) else { return };
+        if let Some(viewer_state) = session.viewer.as_mut() {
+            if viewer_state.handle_mouse(kind, x * scale, y * scale, view_h) {
+                self.render_editor();
+            }
+            return;
+        }
         let Some(editor) = session.editor.as_mut() else { return };
         editor.handle_mouse(&mut self.font_system, kind, (x * scale) as i32, (y * scale) as i32);
         if kind != 1 {
@@ -1337,23 +1453,64 @@ impl App {
     }
 
     /// `zoom` is set while Ctrl/Cmd is held: the wheel then zooms the viewer
-    /// (images and PDF pages) instead of scrolling it.
+    /// (images and PDF pages) instead of scrolling it. Slint's own modifier
+    /// bookkeeping misses ⌘ during scroll on macOS, so ask the OS directly.
     pub fn editor_wheel(&mut self, delta_x: f32, delta_y: f32, zoom: bool) {
+        let zoom = zoom || zoom_modifier_down();
+        // TIGRIDEN_DEBUG_WHEEL=1: trace wheel events to diagnose zoom issues.
+        if std::env::var_os("TIGRIDEN_DEBUG_WHEEL").is_some() {
+            let viewer = self
+                .sessions
+                .get(self.active)
+                .and_then(|s| s.viewer.as_ref())
+                .map(|v| v.zoomable())
+                .map_or("none".to_string(), |z| format!("zoomable={z}"));
+            #[cfg(target_os = "macos")]
+            let raw = ns_modifier_flags();
+            #[cfg(not(target_os = "macos"))]
+            let raw = 0usize;
+            eprintln!(
+                "wheel dx={delta_x:.1} dy={delta_y:.1} zoom-mod={zoom} native-mod={} raw=0x{raw:x} viewer:{viewer}",
+                zoom_modifier_down()
+            );
+        }
         let scale = self.scale();
         let Some(session) = self.sessions.get_mut(self.active) else { return };
         if let Some(viewer_state) = session.viewer.as_mut() {
             if zoom {
                 let factor = (1.0 + delta_y * 0.002 * scale).clamp(0.5, 2.0);
                 viewer_state.zoom_by(&mut self.font_system, factor);
+                self.throttled_viewer_render(std::time::Duration::from_millis(33));
             } else {
                 viewer_state.scroll_by(delta_x * scale, delta_y * scale);
+                self.throttled_viewer_render(std::time::Duration::from_millis(15));
             }
-            self.render_editor();
             return;
         }
         let Some(editor) = session.editor.as_mut() else { return };
         editor.scroll(&mut self.font_system, delta_y * scale);
         self.render_editor();
+    }
+
+    /// Wheel events arrive at up to 120/s; painting every one outruns the
+    /// frame budget and backlogs the event queue, which reads as lag (and
+    /// delays modifier flag changes queued behind the wheel events). Paint at
+    /// most once per `frame`, with a trailing shot for the final state.
+    fn throttled_viewer_render(&mut self, frame: std::time::Duration) {
+        if self.last_zoom_render.elapsed() >= frame {
+            self.last_zoom_render = std::time::Instant::now();
+            self.render_editor();
+        } else if !self.zoom_render_armed {
+            self.zoom_render_armed = true;
+            let app_id = self.id;
+            slint::Timer::single_shot(frame, move || {
+                with_app_id(app_id, |app| {
+                    app.zoom_render_armed = false;
+                    app.last_zoom_render = std::time::Instant::now();
+                    app.render_editor();
+                });
+            });
+        }
     }
 
     pub fn editor_resized(&mut self, w: f32, h: f32) {

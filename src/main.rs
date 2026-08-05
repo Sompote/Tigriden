@@ -27,7 +27,11 @@ fn mods(ctrl: bool, alt: bool, meta: bool, shift: bool) -> Mods {
     // need the physical keys, so swap them back.
     #[cfg(target_os = "macos")]
     let (ctrl, meta) = (meta, ctrl);
-    Mods { ctrl, alt, meta, shift }
+    // Slint's bookkeeping can miss or lag modifier changes (⌘+key combos
+    // arrive with stale flags under load); trust the OS when it says a
+    // modifier is down right now.
+    let (nc, na, nm, ns) = app::native_modifier_state();
+    Mods { ctrl: ctrl || nc, alt: alt || na, meta: meta || nm, shift: shift || ns }
 }
 
 struct WindowOpts {

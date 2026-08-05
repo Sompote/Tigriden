@@ -1,5 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache, Weight, Wrap};
 use image::RgbaImage;
@@ -24,6 +26,9 @@ const MAX_ZOOM: f32 = 8.0;
 /// Rasterization caps: a zoomed rescale must never allocate unbounded pixels.
 const MAX_DRAW_W: f32 = 4096.0;
 const MAX_DRAW_H: f32 = 16384.0;
+/// Scrollbar (physical px): track width and minimum thumb height.
+const SCROLLBAR_W: f32 = 12.0;
+const SCROLLBAR_MIN_THUMB: f32 = 32.0;
 
 /// Clamps a target draw width so the resulting bitmap stays within the caps,
 /// preserving the w:h aspect ratio.
@@ -39,7 +44,10 @@ fn fit_draw(w: f32, h: f32, target_w: f32) -> (f32, f32) {
 
 enum Block {
     Text { buffer: Buffer, indent: f32, bg: Option<[u8; 3]>, height: f32 },
-    Picture { scaled: RgbaImage, height: f32 },
+    /// An image; `size` is the original dimensions (layout comes from the
+    /// header alone) and `scaled` the latest bitmap from the image worker —
+    /// empty until the first one arrives.
+    Picture { scaled: RgbaImage, size: (f32, f32), height: f32 },
     /// One PDF page, rasterized lazily when it scrolls into view.
     Page { index: usize, size: (f32, f32), height: f32 },
     Rule,
@@ -60,8 +68,6 @@ pub struct ViewerState {
     pub kind: ViewKind,
     pub scroll: f32,
     blocks: Vec<Block>,
-    /// Original images kept for re-scaling on resize.
-    sources: Vec<Option<RgbaImage>>,
     width_px: f32,
     content_h: f32,
     /// Widest block at the current zoom (plus margins); > width_px pans.
@@ -70,10 +76,22 @@ pub struct ViewerState {
     scroll_x: f32,
     /// Magnification over the fit-to-width size for images and PDF pages.
     zoom: f32,
-    /// Parsed PDF kept for lazy page rasterization.
-    pdf: Option<hayro::hayro_syntax::Pdf>,
+    /// Background rasterizer that owns the parsed PDF; None for non-PDF
+    /// views and for the text-extraction fallback.
+    worker: Option<PdfWorker>,
     /// Rasterized pages by index; the bitmap width encodes the render width.
     page_cache: HashMap<usize, RgbaImage>,
+    /// Widths requested from the worker but not yet delivered, by page index.
+    pending: HashMap<usize, u32>,
+    /// Background decoder/rescaler owning the original image bitmaps.
+    img_worker: Option<ImgWorker>,
+    /// Sizes requested from the image worker but not yet delivered, by block.
+    pending_imgs: HashMap<usize, (u32, u32)>,
+    /// (block index, path) of images found during build; consumed by `open`
+    /// to spawn the image worker.
+    img_paths: Vec<(usize, PathBuf)>,
+    /// Some while the scrollbar thumb is dragged: grab offset within the thumb.
+    drag: Option<f32>,
     margin: f32,
     spacing: f32,
     font_px: f32,
@@ -81,6 +99,129 @@ pub struct ViewerState {
     /// Effective accent (theme default or the user's override).
     accent: [u8; 3],
     font_family: &'static str,
+}
+
+/// Called from worker threads whenever a bitmap is ready; the app uses it to
+/// schedule a repaint on the UI event loop.
+pub type Notify = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
+
+/// Handle to a per-document rasterizer thread. Dropping it hangs up the
+/// request channel, which shuts the thread down.
+struct PdfWorker {
+    req_tx: Sender<(usize, u32)>,
+    res_rx: Receiver<(usize, u32, RgbaImage)>,
+    /// Pages near the viewport right now; lets the worker skip queued
+    /// requests for pages a fast scroll has already left behind.
+    wanted: Arc<Mutex<HashSet<usize>>>,
+}
+
+/// Parses the PDF on a dedicated thread and returns the page sizes plus a
+/// handle for requesting page bitmaps, or None if hayro cannot parse it.
+///
+/// The thread keeps the parsed document and one hayro `RenderCache` alive for
+/// its whole life: fonts, images and outlines decoded once are reused for
+/// every page and re-render, and the UI thread never blocks on rasterization.
+fn spawn_pdf_worker(bytes: Vec<u8>, notify: Notify) -> Option<(PdfWorker, Vec<(f32, f32)>)> {
+    let (req_tx, req_rx) = mpsc::channel::<(usize, u32)>();
+    let (res_tx, res_rx) = mpsc::channel();
+    let (init_tx, init_rx) = mpsc::channel();
+    let wanted = Arc::new(Mutex::new(HashSet::new()));
+    let wanted_worker = wanted.clone();
+    std::thread::spawn(move || {
+        let Ok(pdf) = hayro::hayro_syntax::Pdf::new(bytes) else {
+            let _ = init_tx.send(None);
+            return;
+        };
+        let sizes: Vec<(f32, f32)> = pdf.pages().iter().map(|p| p.render_dimensions()).collect();
+        if init_tx.send(Some(sizes)).is_err() {
+            return;
+        }
+        let pages = pdf.pages();
+        let cache = hayro::RenderCache::new();
+        while let Ok(first) = req_rx.recv() {
+            let mut order = std::collections::VecDeque::from([first.0]);
+            let mut want = HashMap::from([first]);
+            loop {
+                // Latest width wins: re-drain before every render so a zoom
+                // gesture collapses to the final width per page instead of
+                // rasterizing every intermediate size.
+                for (index, width) in req_rx.try_iter() {
+                    if want.insert(index, width).is_none() {
+                        order.push_back(index);
+                    }
+                }
+                let Some(index) = order.pop_front() else { break };
+                let Some(width) = want.remove(&index) else { continue };
+                if !wanted_worker.lock().is_ok_and(|w| w.contains(&index)) {
+                    continue;
+                }
+                if let Some(img) = rasterize_page(pages, index, width, &cache) {
+                    if res_tx.send((index, width, img)).is_err() {
+                        return;
+                    }
+                    notify();
+                }
+            }
+        }
+    });
+    init_rx
+        .recv()
+        .ok()
+        .flatten()
+        .map(|sizes| (PdfWorker { req_tx, res_rx, wanted }, sizes))
+}
+
+/// Handle to a per-viewer image thread that decodes the originals and serves
+/// scaled copies; dropping it (with the request sender) shuts it down.
+struct ImgWorker {
+    req_tx: Sender<(usize, u32, u32)>,
+    res_rx: Receiver<(usize, RgbaImage)>,
+}
+
+/// Decoding and high-quality rescaling of photos is far too slow for the UI
+/// thread (each zoom tick used to re-run a full Triangle resample). The
+/// worker owns the decoded originals; requests are latest-wins per image so
+/// a zoom gesture collapses to the final size.
+fn spawn_img_worker(images: Vec<(usize, PathBuf)>, notify: Notify) -> ImgWorker {
+    let (req_tx, req_rx) = mpsc::channel::<(usize, u32, u32)>();
+    let (res_tx, res_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut originals: HashMap<usize, RgbaImage> = HashMap::new();
+        for (slot, path) in images {
+            if let Ok(img) = image::open(&path) {
+                originals.insert(slot, img.to_rgba8());
+            }
+        }
+        while let Ok(first) = req_rx.recv() {
+            let mut order = std::collections::VecDeque::from([first.0]);
+            let mut want = HashMap::from([(first.0, (first.1, first.2))]);
+            loop {
+                for (slot, w, h) in req_rx.try_iter() {
+                    if want.insert(slot, (w, h)).is_none() {
+                        order.push_back(slot);
+                    }
+                }
+                let Some(slot) = order.pop_front() else { break };
+                let Some((w, h)) = want.remove(&slot) else { continue };
+                let Some(original) = originals.get(&slot) else { continue };
+                let scaled = if original.width() == w && original.height() == h {
+                    original.clone()
+                } else {
+                    image::imageops::resize(
+                        original,
+                        w.max(1),
+                        h.max(1),
+                        image::imageops::FilterType::Triangle,
+                    )
+                };
+                if res_tx.send((slot, scaled)).is_err() {
+                    return;
+                }
+                notify();
+            }
+        }
+    });
+    ImgWorker { req_tx, res_rx }
 }
 
 fn mono(family: &'static str) -> Attrs<'static> {
@@ -101,20 +242,25 @@ impl ViewerState {
         theme: &'static ThemeDef,
         accent: [u8; 3],
         width_px: f32,
+        notify: Notify,
     ) -> Result<Self, String> {
         let mut viewer = Self {
             path: path.to_path_buf(),
             kind,
             scroll: 0.0,
             blocks: Vec::new(),
-            sources: Vec::new(),
             width_px: width_px.max(64.0),
             content_h: 0.0,
             content_w: 0.0,
             scroll_x: 0.0,
             zoom: 1.0,
-            pdf: None,
+            worker: None,
             page_cache: HashMap::new(),
+            pending: HashMap::new(),
+            img_worker: None,
+            pending_imgs: HashMap::new(),
+            img_paths: Vec::new(),
+            drag: None,
             margin: (font_px * 1.2).round(),
             spacing: (font_px * 0.5).round(),
             font_px,
@@ -126,7 +272,10 @@ impl ViewerState {
             ViewKind::Image => viewer.build_image(path)?,
             ViewKind::Markdown => viewer.build_markdown(font_system, path)?,
             ViewKind::Csv => viewer.build_csv(font_system, path)?,
-            ViewKind::Pdf => viewer.build_pdf(font_system, path)?,
+            ViewKind::Pdf => viewer.build_pdf(font_system, path, notify.clone())?,
+        }
+        if !viewer.img_paths.is_empty() {
+            viewer.img_worker = Some(spawn_img_worker(std::mem::take(&mut viewer.img_paths), notify));
         }
         viewer.reflow(font_system);
         Ok(viewer)
@@ -167,7 +316,6 @@ impl ViewerState {
             None,
         );
         self.blocks.push(Block::Text { buffer, indent, bg, height: 0.0 });
-        self.sources.push(None);
     }
 
     fn push_plain(&mut self, font_system: &mut FontSystem, text: &str, attrs: Attrs<'static>, wrap: Wrap) {
@@ -176,7 +324,6 @@ impl ViewerState {
         buffer.set_wrap(wrap);
         buffer.set_text(text, &attrs, Shaping::Advanced, None);
         self.blocks.push(Block::Text { buffer, indent: 0.0, bg: None, height: 0.0 });
-        self.sources.push(None);
     }
 
     fn push_table(
@@ -213,14 +360,19 @@ impl ViewerState {
             row_heights: Vec::new(),
             height: 0.0,
         });
-        self.sources.push(None);
     }
 
+    /// Registers an image block from its header dimensions alone; the worker
+    /// decodes the pixels later, off the UI thread.
     fn push_image_file(&mut self, path: &Path) -> bool {
-        match image::open(path) {
-            Ok(img) => {
-                self.blocks.push(Block::Picture { scaled: RgbaImage::new(1, 1), height: 0.0 });
-                self.sources.push(Some(img.to_rgba8()));
+        match image::image_dimensions(path) {
+            Ok((w, h)) => {
+                self.blocks.push(Block::Picture {
+                    scaled: RgbaImage::new(0, 0),
+                    size: (w as f32, h as f32),
+                    height: 0.0,
+                });
+                self.img_paths.push((self.blocks.len() - 1, path.to_path_buf()));
                 true
             }
             Err(_) => false,
@@ -234,25 +386,20 @@ impl ViewerState {
         Ok(())
     }
 
-    /// Renders the actual PDF pages (hayro rasterizes them lazily as they
+    /// Renders the actual PDF pages (a worker thread rasterizes them as they
     /// scroll into view). Files hayro cannot parse (e.g. encrypted) fall back
     /// to plain text extraction so something still shows.
-    fn build_pdf(&mut self, font_system: &mut FontSystem, path: &Path) -> Result<(), String> {
+    fn build_pdf(&mut self, font_system: &mut FontSystem, path: &Path, notify: Notify) -> Result<(), String> {
         let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        match hayro::hayro_syntax::Pdf::new(bytes) {
-            Ok(pdf) => {
-                let sizes: Vec<(f32, f32)> = pdf.pages().iter().map(|p| p.render_dimensions()).collect();
-                if sizes.is_empty() {
-                    return self.build_pdf_text(font_system, path);
-                }
+        match spawn_pdf_worker(bytes, notify) {
+            Some((worker, sizes)) if !sizes.is_empty() => {
                 for (index, size) in sizes.into_iter().enumerate() {
                     self.blocks.push(Block::Page { index, size, height: 0.0 });
-                    self.sources.push(None);
                 }
-                self.pdf = Some(pdf);
+                self.worker = Some(worker);
                 Ok(())
             }
-            Err(_) => self.build_pdf_text(font_system, path),
+            _ => self.build_pdf_text(font_system, path),
         }
     }
 
@@ -491,7 +638,6 @@ impl ViewerState {
                             bg: Some(code_bg),
                             height: 0.0,
                         });
-                        self.sources.push(None);
                     }
                 }
                 Event::Start(Tag::Image { dest_url, .. }) => {
@@ -531,7 +677,6 @@ impl ViewerState {
                 Event::Rule => {
                     flush!(self, spans, heading, list_stack, quote_depth);
                     self.blocks.push(Block::Rule);
-                    self.sources.push(None);
                 }
                 _ => {}
             }
@@ -550,7 +695,7 @@ impl ViewerState {
         let zoom = self.zoom;
         let mut total = self.margin;
         let mut max_w = text_w;
-        for (block, source) in self.blocks.iter_mut().zip(self.sources.iter()) {
+        for block in self.blocks.iter_mut() {
             match block {
                 Block::Text { buffer, indent, bg, height } => {
                     buffer.set_size(Some((text_w - *indent).max(48.0)), None);
@@ -562,22 +707,11 @@ impl ViewerState {
                     *height = h + if bg.is_some() { self.font_px } else { 0.0 };
                     total += *height + self.spacing;
                 }
-                Block::Picture { scaled, height } => {
-                    if let Some(original) = source {
-                        let (ow, oh) = (original.width() as f32, original.height() as f32);
-                        let (draw_w, draw_h) = fit_draw(ow, oh, ow.min(text_w) * zoom);
-                        if scaled.width() != draw_w as u32 || scaled.height() != draw_h as u32 {
-                            *scaled = image::imageops::resize(
-                                original,
-                                draw_w as u32,
-                                draw_h as u32,
-                                image::imageops::FilterType::Triangle,
-                            );
-                        }
-                        *height = draw_h;
-                        max_w = max_w.max(draw_w);
-                        total += draw_h + self.spacing;
-                    }
+                Block::Picture { size, height, .. } => {
+                    let (draw_w, draw_h) = fit_draw(size.0, size.1, size.0.min(text_w) * zoom);
+                    *height = draw_h;
+                    max_w = max_w.max(draw_w);
+                    total += draw_h + self.spacing;
                 }
                 Block::Page { size, height, .. } => {
                     let (draw_w, draw_h) = fit_draw(size.0, size.1, text_w * zoom);
@@ -680,10 +814,83 @@ impl ViewerState {
         self.clamp_scroll();
     }
 
+    /// PageUp / PageDown: moves nearly one viewport, keeping a little overlap.
+    pub fn scroll_page(&mut self, view_h: f32, down: bool) {
+        let step = (view_h * 0.9).max(48.0);
+        self.scroll += if down { step } else { -step };
+        self.clamp_scroll();
+    }
+
+    /// Home / End: jumps to the top or the bottom of the document.
+    pub fn scroll_home(&mut self, end: bool) {
+        self.scroll = if end { f32::MAX } else { 0.0 };
+        self.clamp_scroll();
+    }
+
+    /// Scrollbar geometry for a viewport `view_h` tall: (track x, thumb top,
+    /// thumb height), or None when the content fits without scrolling.
+    fn scrollbar(&self, view_h: f32) -> Option<(f32, f32, f32)> {
+        if view_h <= 0.0 || self.content_h - view_h <= 1.0 {
+            return None;
+        }
+        let thumb_h = (view_h * view_h / self.content_h)
+            .max(SCROLLBAR_MIN_THUMB)
+            .min(view_h);
+        let t = (self.scroll / self.max_scroll(view_h)).clamp(0.0, 1.0);
+        Some((self.width_px - SCROLLBAR_W, t * (view_h - thumb_h), thumb_h))
+    }
+
+    /// The scroll position the thumb's bottom stop maps to.
+    fn max_scroll(&self, view_h: f32) -> f32 {
+        (self.content_h - view_h).max(1.0)
+    }
+
+    /// Mouse on the pane (physical px; kind 0=down 1=up 2=move). Consumes
+    /// presses on the scrollbar and drags of its thumb; returns whether the
+    /// event changed anything worth repainting.
+    pub fn handle_mouse(&mut self, kind: i32, x: f32, y: f32, view_h: f32) -> bool {
+        match kind {
+            0 => {
+                let Some((bar_x, thumb_y, thumb_h)) = self.scrollbar(view_h) else {
+                    return false;
+                };
+                if x < bar_x {
+                    return false;
+                }
+                // Grabbing the thumb keeps the cursor's spot on it; a track
+                // click jumps there and continues as a centered drag.
+                let grab = if y >= thumb_y && y < thumb_y + thumb_h {
+                    y - thumb_y
+                } else {
+                    thumb_h / 2.0
+                };
+                self.drag = Some(grab);
+                self.drag_to(y, grab, view_h);
+                true
+            }
+            2 => match self.drag {
+                Some(grab) => {
+                    self.drag_to(y, grab, view_h);
+                    true
+                }
+                None => false,
+            },
+            1 => self.drag.take().is_some(),
+            _ => false,
+        }
+    }
+
+    fn drag_to(&mut self, y: f32, grab: f32, view_h: f32) {
+        let Some((_, _, thumb_h)) = self.scrollbar(view_h) else { return };
+        let denom = (view_h - thumb_h).max(1.0);
+        self.scroll = ((y - grab) / denom * self.max_scroll(view_h)).clamp(0.0, self.max_scroll(view_h));
+        self.clamp_scroll();
+    }
+
     /// Whether zoom applies: images always, PDFs only when pages rendered
     /// (the text-extraction fallback has nothing to magnify).
     pub fn zoomable(&self) -> bool {
-        matches!(self.kind, ViewKind::Image) || self.pdf.is_some()
+        matches!(self.kind, ViewKind::Image) || self.worker.is_some()
     }
 
     /// Multiplies the zoom, keeping the viewport center roughly anchored.
@@ -715,13 +922,22 @@ impl ViewerState {
         self.clamp_scroll();
     }
 
-    /// Rasterizes the PDF pages intersecting the viewport at the current
-    /// width/zoom, and drops far-away cached pages to bound memory.
+    /// Collects finished page bitmaps from the worker, requests the pages at
+    /// (and adjacent to) the viewport at the current width/zoom, and drops
+    /// far-away cached pages to bound memory. Never blocks: a page draws as a
+    /// placeholder until its bitmap arrives and the worker triggers a repaint.
     fn prepare_pages(&mut self, view_h: f32) {
-        let Some(pdf) = self.pdf.as_ref() else { return };
+        let Some(worker) = self.worker.as_ref() else { return };
+        for (index, width, img) in worker.res_rx.try_iter() {
+            if self.pending.get(&index) == Some(&width) {
+                self.pending.remove(&index);
+            }
+            self.page_cache.insert(index, img);
+        }
         let target_w = self.text_width() * self.zoom;
         let mut y = self.margin - self.scroll;
-        let mut visible: Vec<(usize, (f32, f32))> = Vec::new();
+        // (page index, size, intersects viewport) in document order.
+        let mut pages: Vec<(usize, (f32, f32), bool)> = Vec::new();
         for block in &self.blocks {
             let advance = match block {
                 Block::Text { height, .. }
@@ -729,30 +945,83 @@ impl ViewerState {
                 | Block::Table { height, .. } => *height,
                 Block::Rule => self.font_px,
                 Block::Page { index, size, height } => {
-                    if y + *height >= 0.0 && y <= view_h {
-                        visible.push((*index, *size));
+                    pages.push((*index, *size, y + *height >= 0.0 && y <= view_h));
+                    *height
+                }
+            };
+            y += advance + self.spacing;
+        }
+        let (Some(first), Some(last)) = (
+            pages.iter().position(|&(_, _, v)| v),
+            pages.iter().rposition(|&(_, _, v)| v),
+        ) else {
+            return;
+        };
+        // Visible pages first, then one prefetch neighbor on each side so the
+        // next page is usually ready before it scrolls in.
+        let lo = first.saturating_sub(1);
+        let hi = (last + 1).min(pages.len() - 1);
+        let keep: HashSet<usize> = pages[lo..=hi].iter().map(|&(i, _, _)| i).collect();
+        // Publish before requesting so the worker never skips a live request.
+        if let Ok(mut wanted) = worker.wanted.lock() {
+            *wanted = keep.clone();
+        }
+        let order = (first..=last).chain((lo..first).chain(last + 1..=hi));
+        for slot in order {
+            let (index, size, _) = pages[slot];
+            let want = fit_draw(size.0, size.1, target_w).0 as u32;
+            if self.page_cache.get(&index).is_some_and(|img| img.width() == want)
+                || self.pending.get(&index) == Some(&want)
+            {
+                continue;
+            }
+            if worker.req_tx.send((index, want)).is_ok() {
+                self.pending.insert(index, want);
+            }
+        }
+        // Keep only the requested window cached.
+        self.page_cache.retain(|k, _| keep.contains(k));
+        self.pending.retain(|k, _| keep.contains(k));
+    }
+
+    /// Collects finished bitmaps from the image worker and requests scaled
+    /// copies for the visible pictures whose bitmap does not match the
+    /// current draw size. Never blocks; pictures show a placeholder or a
+    /// nearest-scaled preview until the proper bitmap arrives.
+    fn prepare_images(&mut self, view_h: f32) {
+        let Some(worker) = self.img_worker.as_ref() else { return };
+        let mut done: HashMap<usize, RgbaImage> = HashMap::new();
+        for (slot, img) in worker.res_rx.try_iter() {
+            self.pending_imgs.remove(&slot);
+            done.insert(slot, img);
+        }
+        let text_w = self.text_width();
+        let zoom = self.zoom;
+        let mut y = self.margin - self.scroll;
+        for (idx, block) in self.blocks.iter_mut().enumerate() {
+            let advance = match block {
+                Block::Text { height, .. } | Block::Table { height, .. } => *height,
+                Block::Rule => self.font_px,
+                Block::Page { height, .. } => *height,
+                Block::Picture { scaled, size, height } => {
+                    if let Some(img) = done.remove(&idx) {
+                        *scaled = img;
+                    }
+                    let (dw, dh) = fit_draw(size.0, size.1, size.0.min(text_w) * zoom);
+                    let want = (dw as u32, dh as u32);
+                    let visible = y + *height >= 0.0 && y <= view_h;
+                    if visible
+                        && (scaled.width(), scaled.height()) != want
+                        && self.pending_imgs.get(&idx) != Some(&want)
+                        && worker.req_tx.send((idx, want.0, want.1)).is_ok()
+                    {
+                        self.pending_imgs.insert(idx, want);
                     }
                     *height
                 }
             };
             y += advance + self.spacing;
         }
-        let pages = pdf.pages();
-        for &(index, size) in &visible {
-            let want = fit_draw(size.0, size.1, target_w).0 as u32;
-            if self.page_cache.get(&index).is_some_and(|img| img.width() == want) {
-                continue;
-            }
-            if let Some(img) = rasterize_page(pages, index, want) {
-                self.page_cache.insert(index, img);
-            }
-        }
-        // Keep only the visible pages and their direct neighbors cached.
-        let keep: std::collections::HashSet<usize> = visible
-            .iter()
-            .flat_map(|&(i, _)| [i.saturating_sub(1), i, i + 1])
-            .collect();
-        self.page_cache.retain(|k, _| keep.contains(k));
     }
 
     pub fn render(
@@ -763,6 +1032,7 @@ impl ViewerState {
         height_px: u32,
     ) -> SharedPixelBuffer<Rgba8Pixel> {
         self.prepare_pages(height_px as f32);
+        self.prepare_images(height_px as f32);
         let mut frame = SharedPixelBuffer::<Rgba8Pixel>::new(width_px.max(1), height_px.max(1));
         let bg = colors::base_palette(self.theme)[0];
         let (w, h) = (frame.width() as i32, frame.height() as i32);
@@ -776,7 +1046,7 @@ impl ViewerState {
         let fg = self.fg();
         let default_color = Color::rgb(fg[0], fg[1], fg[2]);
         let page_cache = &self.page_cache;
-        for (block, _) in self.blocks.iter_mut().zip(self.sources.iter()) {
+        for block in self.blocks.iter_mut() {
             match block {
                 Block::Text { buffer, indent, bg: block_bg, height } => {
                     if y + *height >= 0.0 && y <= h as f32 {
@@ -798,9 +1068,18 @@ impl ViewerState {
                     }
                     y += *height + self.spacing;
                 }
-                Block::Picture { scaled, height } => {
+                Block::Picture { scaled, size, height } => {
                     if y + *height >= 0.0 && y <= h as f32 {
-                        blit_image(&mut canvas, scaled, (margin - scroll_x) as i32, y as i32);
+                        let x0 = (margin - scroll_x) as i32;
+                        let draw_w = fit_draw(size.0, size.1, size.0.min(text_w) * self.zoom).0 as i32;
+                        if scaled.width() == draw_w as u32 && scaled.height() == *height as u32 {
+                            blit_image(&mut canvas, scaled, x0, y as i32);
+                        } else if scaled.width() > 0 {
+                            // Decode/rescale still in flight: nearest preview.
+                            blit_scaled(&mut canvas, scaled, x0, y as i32, draw_w, *height as i32);
+                        } else {
+                            canvas.fill_rect(x0, y as i32, draw_w, *height as i32, self.theme.ui.panel_hover);
+                        }
                     }
                     y += *height + self.spacing;
                 }
@@ -810,9 +1089,16 @@ impl ViewerState {
                         let dim = colors::base_palette(self.theme)[8];
                         let draw_w = fit_draw(size.0, size.1, text_w * self.zoom).0 as i32;
                         match page_cache.get(index) {
-                            Some(img) => blit_image(&mut canvas, img, x0, y as i32),
-                            // Rasterization failed: keep the page's footprint
-                            // as a blank sheet so the layout doesn't jump.
+                            Some(img) if img.width() == draw_w as u32 => {
+                                blit_opaque(&mut canvas, img, x0, y as i32)
+                            }
+                            // A re-render at the new width is still in
+                            // flight: show the old bitmap rescaled meanwhile.
+                            Some(img) => {
+                                blit_scaled(&mut canvas, img, x0, y as i32, draw_w, *height as i32)
+                            }
+                            // Not rasterized yet: draw a blank sheet so the
+                            // layout doesn't jump.
                             None => canvas.fill_rect(x0, y as i32, draw_w, *height as i32, [255, 255, 255]),
                         }
                         // Hairline frame so white pages read as pages on
@@ -881,16 +1167,30 @@ impl ViewerState {
                 }
             }
         }
+        // Scrollbar along the right edge whenever the content overflows.
+        if let Some((bar_x, thumb_y, thumb_h)) = self.scrollbar(h as f32) {
+            let track = self.theme.ui.panel_hover;
+            let thumb = colors::base_palette(self.theme)[8];
+            canvas.fill_rect(bar_x as i32, 0, SCROLLBAR_W as i32, h, track);
+            canvas.fill_rect(
+                bar_x as i32 + 2,
+                thumb_y as i32,
+                SCROLLBAR_W as i32 - 4,
+                thumb_h as i32,
+                thumb,
+            );
+        }
         frame
     }
 }
 
 /// Renders one PDF page to a bitmap `draw_w` pixels wide. The white opaque
 /// background makes hayro's premultiplied output plain RGBA.
-fn rasterize_page(
-    pages: &[hayro::hayro_syntax::page::Page<'_>],
+fn rasterize_page<'a>(
+    pages: &'a [hayro::hayro_syntax::page::Page<'a>],
     index: usize,
     draw_w: u32,
+    cache: &hayro::RenderCache<'a>,
 ) -> Option<RgbaImage> {
     let page = pages.get(index)?;
     let (page_w, _) = page.render_dimensions();
@@ -904,7 +1204,7 @@ fn rasterize_page(
     };
     let pixmap = hayro::render(
         page,
-        &hayro::RenderCache::new(),
+        cache,
         &hayro::hayro_interpret::InterpreterSettings::default(),
         &settings,
     );
@@ -915,23 +1215,107 @@ fn rasterize_page(
     )
 }
 
-fn blit_image(canvas: &mut Canvas, img: &RgbaImage, x0: i32, y0: i32) {
-    let iw = img.width() as i32;
-    for (row_idx, row) in img.rows().enumerate() {
-        let y = y0 + row_idx as i32;
-        if y < 0 || y >= canvas.height {
-            continue;
+/// Clips an `iw` x `ih` bitmap placed at (`x0`, `y0`) against the canvas;
+/// returns the covered source range as (sx0, sx1, sy0, sy1), empty if none.
+fn clip_blit(canvas: &Canvas, iw: i32, ih: i32, x0: i32, y0: i32) -> (i32, i32, i32, i32) {
+    (
+        (-x0).max(0),
+        (canvas.width - x0).min(iw),
+        (-y0).max(0),
+        (canvas.height - y0).min(ih),
+    )
+}
+
+/// Fast path for opaque bitmaps (PDF pages render onto an opaque white
+/// background): rows are copied without per-pixel bounds checks or alpha math.
+fn blit_opaque(canvas: &mut Canvas, img: &RgbaImage, x0: i32, y0: i32) {
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    let (sx0, sx1, sy0, sy1) = clip_blit(canvas, iw, ih, x0, y0);
+    if sx0 >= sx1 || sy0 >= sy1 {
+        return;
+    }
+    let raw = img.as_raw();
+    let n = (sx1 - sx0) as usize;
+    for sy in sy0..sy1 {
+        let dst0 = ((y0 + sy) * canvas.width + x0 + sx0) as usize;
+        let src0 = ((sy * iw + sx0) as usize) * 4;
+        let dst = &mut canvas.pixels[dst0..dst0 + n];
+        let src = &raw[src0..src0 + n * 4];
+        for (d, s) in dst.iter_mut().zip(src.chunks_exact(4)) {
+            *d = Rgba8Pixel { r: s[0], g: s[1], b: s[2], a: 255 };
         }
-        for (col_idx, px) in row.enumerate() {
-            let x = x0 + col_idx as i32;
-            if x < 0 || x >= iw + x0 || x >= canvas.width {
-                continue;
+    }
+}
+
+fn blit_image(canvas: &mut Canvas, img: &RgbaImage, x0: i32, y0: i32) {
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    let (sx0, sx1, sy0, sy1) = clip_blit(canvas, iw, ih, x0, y0);
+    if sx0 >= sx1 || sy0 >= sy1 {
+        return;
+    }
+    let raw = img.as_raw();
+    let n = (sx1 - sx0) as usize;
+    for sy in sy0..sy1 {
+        let dst0 = ((y0 + sy) * canvas.width + x0 + sx0) as usize;
+        let src0 = ((sy * iw + sx0) as usize) * 4;
+        let dst = &mut canvas.pixels[dst0..dst0 + n];
+        let src = &raw[src0..src0 + n * 4];
+        for (d, s) in dst.iter_mut().zip(src.chunks_exact(4)) {
+            match s[3] {
+                0 => {}
+                255 => *d = Rgba8Pixel { r: s[0], g: s[1], b: s[2], a: 255 },
+                a => {
+                    let (a, inv) = (a as u32, 255 - a as u32);
+                    *d = Rgba8Pixel {
+                        r: ((s[0] as u32 * a + d.r as u32 * inv) / 255) as u8,
+                        g: ((s[1] as u32 * a + d.g as u32 * inv) / 255) as u8,
+                        b: ((s[2] as u32 * a + d.b as u32 * inv) / 255) as u8,
+                        a: 255,
+                    };
+                }
             }
-            let [r, g, b, a] = px.0;
-            if a == 0 {
-                continue;
+        }
+    }
+}
+
+/// Nearest-neighbor draw of `img` into a `dw` x `dh` rectangle. Only used as
+/// a transient while a zoomed page waits for its re-rasterized bitmap.
+fn blit_scaled(canvas: &mut Canvas, img: &RgbaImage, x0: i32, y0: i32, dw: i32, dh: i32) {
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    if dw <= 0 || dh <= 0 || iw <= 0 || ih <= 0 {
+        return;
+    }
+    let (dx0, dx1, dy0, dy1) = clip_blit(canvas, dw, dh, x0, y0);
+    if dx0 >= dx1 || dy0 >= dy1 {
+        return;
+    }
+    let raw = img.as_raw();
+    // 16.16 fixed-point source stepping: no divides in the pixel loop.
+    let step_x = ((iw as u64) << 16) / dw as u64;
+    let step_y = ((ih as u64) << 16) / dh as u64;
+    for dy in dy0..dy1 {
+        let sy = (((dy as u64 * step_y) >> 16) as i32).min(ih - 1);
+        let row = &raw[(sy * iw) as usize * 4..(sy * iw + iw) as usize * 4];
+        let dst0 = ((y0 + dy) * canvas.width + x0 + dx0) as usize;
+        let dst = &mut canvas.pixels[dst0..dst0 + (dx1 - dx0) as usize];
+        let mut sx_fp = dx0 as u64 * step_x;
+        for d in dst.iter_mut() {
+            let sx = ((sx_fp >> 16) as i32).min(iw - 1) as usize;
+            sx_fp += step_x;
+            let s = &row[sx * 4..sx * 4 + 4];
+            match s[3] {
+                0 => {}
+                255 => *d = Rgba8Pixel { r: s[0], g: s[1], b: s[2], a: 255 },
+                a => {
+                    let (a, inv) = (a as u32, 255 - a as u32);
+                    *d = Rgba8Pixel {
+                        r: ((s[0] as u32 * a + d.r as u32 * inv) / 255) as u8,
+                        g: ((s[1] as u32 * a + d.g as u32 * inv) / 255) as u8,
+                        b: ((s[2] as u32 * a + d.b as u32 * inv) / 255) as u8,
+                        a: 255,
+                    };
+                }
             }
-            canvas.blend_pixel(x, y, Color::rgba(r, g, b, a));
         }
     }
 }
@@ -972,6 +1356,48 @@ mod tests {
     }
 
     #[test]
+    fn image_arrives_from_the_worker() {
+        let path = std::env::temp_dir().join("tigriden-viewer-test.png");
+        let mut img = RgbaImage::new(8, 8);
+        for p in img.pixels_mut() {
+            p.0 = [255, 0, 0, 255];
+        }
+        img.save(&path).unwrap();
+
+        let mut font_system = FontSystem::new();
+        let theme = crate::theme::default_theme();
+        let mut viewer = ViewerState::open(
+            &mut font_system,
+            &path,
+            ViewKind::Image,
+            "Menlo",
+            13.0,
+            theme,
+            [0, 0, 0],
+            400.0,
+            std::sync::Arc::new(|| {}),
+        )
+        .expect("viewer opens the image");
+
+        // The bitmap decodes on the worker thread; poll until the red pixels
+        // replace the placeholder.
+        let mut swash_cache = SwashCache::new();
+        let m = viewer.margin as usize;
+        let mut found = false;
+        for _ in 0..200 {
+            let frame = viewer.render(&mut font_system, &mut swash_cache, 400, 300);
+            let px = frame.as_slice()[m * 400 + m];
+            if px.r > 200 && px.g < 60 && px.b < 60 {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(found, "decoded image should arrive from the worker and draw");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn pdf_renders_pages_and_zooms() {
         let path = std::env::temp_dir().join("tigriden-viewer-test.pdf");
         std::fs::write(&path, hello_pdf()).unwrap();
@@ -987,30 +1413,38 @@ mod tests {
             theme,
             [0, 0, 0],
             800.0,
+            std::sync::Arc::new(|| {}),
         )
         .expect("viewer opens the pdf");
-        assert!(viewer.pdf.is_some(), "hayro should parse the PDF, not fall back to text");
+        assert!(viewer.worker.is_some(), "hayro should parse the PDF, not fall back to text");
         assert_eq!(viewer.blocks.len(), 1, "one page, one block");
 
         let mut swash_cache = SwashCache::new();
-        let frame = viewer.render(&mut font_system, &mut swash_cache, 800, 600);
-        let pixels = frame.as_slice();
-
         // The page (2:1 aspect, fit to width) must show as a mostly white
-        // sheet with dark glyph pixels on it.
+        // sheet with dark glyph pixels on it. The bitmap comes from the
+        // worker thread, so poll until it lands.
         let margin = viewer.margin as usize;
         let page_w = (800.0 - 2.0 * viewer.margin) as usize;
         let page_h = page_w / 2;
         let (mut white, mut dark) = (0usize, 0usize);
-        for y in margin..margin + page_h {
-            for x in margin..margin + page_w {
-                let p = pixels[y * 800 + x];
-                if p.r > 240 && p.g > 240 && p.b > 240 {
-                    white += 1;
-                } else if p.r < 96 && p.g < 96 && p.b < 96 {
-                    dark += 1;
+        for _ in 0..200 {
+            let frame = viewer.render(&mut font_system, &mut swash_cache, 800, 600);
+            let pixels = frame.as_slice();
+            (white, dark) = (0, 0);
+            for y in margin..margin + page_h {
+                for x in margin..margin + page_w {
+                    let p = pixels[y * 800 + x];
+                    if p.r > 240 && p.g > 240 && p.b > 240 {
+                        white += 1;
+                    } else if p.r < 96 && p.g < 96 && p.b < 96 {
+                        dark += 1;
+                    }
                 }
             }
+            if dark > 100 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
         assert!(white > page_w * page_h / 2, "page should render as a white sheet, got {white}");
         assert!(dark > 100, "glyphs should render on the page, got {dark} dark pixels");
@@ -1019,6 +1453,19 @@ mod tests {
         let before = viewer.content_w;
         viewer.zoom_by(&mut font_system, 2.0);
         assert!(viewer.content_w > before, "zoom must widen the content");
+
+        // The zoomed page overflows a 600px viewport: the scrollbar appears,
+        // a press on its track jumps the scroll position, and PageDown /
+        // Home-End style jumps move the viewport.
+        assert!(viewer.scrollbar(600.0).is_some(), "overflowing content shows a scrollbar");
+        assert!(viewer.handle_mouse(0, 795.0, 500.0, 600.0), "press on the track is consumed");
+        assert!(viewer.scroll > 0.0, "track click scrolls the document");
+        viewer.handle_mouse(1, 795.0, 500.0, 600.0);
+        viewer.scroll_home(false);
+        assert_eq!(viewer.scroll, 0.0, "Home returns to the top");
+        viewer.scroll_page(600.0, true);
+        assert!(viewer.scroll > 0.0, "PageDown moves down");
+        viewer.scroll_home(false);
         viewer.scroll_by(-10_000.0, 0.0);
         assert!(viewer.scroll_x > 0.0, "zoomed content must pan horizontally");
         viewer.zoom_reset(&mut font_system);

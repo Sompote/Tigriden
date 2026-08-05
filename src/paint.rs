@@ -8,9 +8,7 @@ pub struct Canvas<'a> {
 
 impl<'a> Canvas<'a> {
     pub fn fill(&mut self, color: [u8; 3]) {
-        for px in self.pixels.iter_mut() {
-            *px = Rgba8Pixel { r: color[0], g: color[1], b: color[2], a: 255 };
-        }
+        self.pixels.fill(Rgba8Pixel { r: color[0], g: color[1], b: color[2], a: 255 });
     }
 
     pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: [u8; 3]) {
@@ -18,12 +16,13 @@ impl<'a> Canvas<'a> {
         let y0 = y.max(0);
         let x1 = (x + w).min(self.width);
         let y1 = (y + h).min(self.height);
+        if x0 >= x1 {
+            return;
+        }
+        let px = Rgba8Pixel { r: color[0], g: color[1], b: color[2], a: 255 };
         for row in y0..y1 {
             let base = row as usize * self.width as usize;
-            for col in x0..x1 {
-                self.pixels[base + col as usize] =
-                    Rgba8Pixel { r: color[0], g: color[1], b: color[2], a: 255 };
-            }
+            self.pixels[base + x0 as usize..base + x1 as usize].fill(px);
         }
     }
 

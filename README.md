@@ -1,6 +1,6 @@
 # Tigriden — Terminal for Agentic Coding
 
-![Version](https://img.shields.io/badge/version-0.1.3-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
+![Version](https://img.shields.io/badge/version-0.1.4-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 
 **A tiny desktop IDE built for one job: supervising AI coding agents.**
 
@@ -38,7 +38,7 @@ Agentic coding means running several agents in several folders and checking in o
 
 No Rust needed — grab the prebuilt app from the [latest release](https://github.com/Sompote/Tigriden/releases/latest):
 
-1. Download **`Tigriden-0.1.3-macos-universal.app.zip`** (one download for both Apple Silicon and Intel).
+1. Download **`Tigriden-0.1.4-macos-universal.app.zip`** (one download for both Apple Silicon and Intel).
 2. Unzip and drag **Tigriden.app** into **/Applications**.
 3. First launch only: the app isn't notarized, so **right-click → Open → Open**, or run:
 
@@ -46,7 +46,7 @@ No Rust needed — grab the prebuilt app from the [latest release](https://githu
    xattr -d com.apple.quarantine /Applications/Tigriden.app
    ```
 
-Prefer a bare binary? The release also ships `tigriden-0.1.3-macos-arm64.tar.gz` (Apple Silicon) and `tigriden-0.1.3-macos-x86_64.tar.gz` (Intel) — untar and run `./tigriden`.
+Prefer a bare binary? The release also ships `tigriden-0.1.4-macos-arm64.tar.gz` (Apple Silicon) and `tigriden-0.1.4-macos-x86_64.tar.gz` (Intel) — untar and run `./tigriden`.
 
 <details>
 <summary><b>Build from source</b> (stable Rust required)</summary>
@@ -154,6 +154,7 @@ Only the PTY reader threads run in the background; rendering and editing happen 
 
 ## Changelog
 
+- **0.1.4** — viewer performance and polish: PDFs rasterize and images decode on background threads (scrolling and zooming no longer stall the UI), pages prefetch ahead of the scroll, wheel repaints are throttled; a scrollbar on the right of the viewer (draggable thumb, click-to-jump) plus PageUp/PageDown, Home/End and ↑/↓ keys; ⌘ detection for wheel zoom and shortcuts now reads the modifier state straight from the OS; scrollback limit changes apply to already-running terminals.
 - **0.1.3** — viewer zoom for images and PDFs (Cmd+=/-/0, Ctrl/Cmd+wheel, header magnifier buttons, panning), PDFs rendered as actual pages, Markdown tables drawn as real grids, terminal scrollback keys (Shift+PageUp/PageDown/Home/End/↑/↓).
 - **0.1.2** — Settings UI (⌘,): 6 themes, accent colors, fonts and sizes, scrollback, all applied live to every window.
 - **0.1.1** — file change tracking with per-file/all rollback (git or invisible shadow snapshots), multiple windows with per-window agent teams.

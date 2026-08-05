@@ -185,6 +185,14 @@ impl TermSession {
         let _ = self.input_tx.send(bytes);
     }
 
+    /// Applies a new scrollback limit to the running terminal. Growing takes
+    /// effect immediately for lines from here on; lines the old, smaller
+    /// history has already trimmed are gone.
+    pub fn set_scrollback(&self, lines: usize) {
+        let config = TermConfig { scrolling_history: lines, ..Default::default() };
+        self.term.lock().set_options(config);
+    }
+
     pub fn resize(&mut self, cols: u16, rows: u16, cell_px: (u16, u16)) {
         if cols == self.cols && rows == self.rows {
             return;
