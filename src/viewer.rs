@@ -3,10 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache, Weight, Wrap};
+use cosmic_text::{Attrs, Buffer, Color, Cursor, Family, FontSystem, Metrics, Shaping, Style, SwashCache, Weight, Wrap};
 use image::RgbaImage;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use slint::{Rgba8Pixel, SharedPixelBuffer};
+
+use hayro::vello_cpu::kurbo;
 
 use crate::paint::Canvas;
 use crate::term::colors;
@@ -83,6 +85,16 @@ pub struct ViewerState {
     page_cache: HashMap<usize, RgbaImage>,
     /// Widths requested from the worker but not yet delivered, by page index.
     pending: HashMap<usize, u32>,
+    /// Selectable text by page index. Kept for every page that has scrolled
+    /// into view — the boxes are small next to the bitmaps.
+    page_text: HashMap<usize, PageText>,
+    /// Text layers requested from the worker but not yet delivered.
+    pending_text: HashSet<usize>,
+    /// Selection on a page-rendered PDF as (page index, caret within that
+    /// page's text). Pages and flowed text never share a document, so this is
+    /// independent of `sel_anchor` / `sel_head`.
+    page_sel_anchor: Option<(usize, usize)>,
+    page_sel_head: Option<(usize, usize)>,
     /// Background decoder/rescaler owning the original image bitmaps.
     img_worker: Option<ImgWorker>,
     /// Sizes requested from the image worker but not yet delivered, by block.
@@ -92,6 +104,15 @@ pub struct ViewerState {
     img_paths: Vec<(usize, PathBuf)>,
     /// Some while the scrollbar thumb is dragged: grab offset within the thumb.
     drag: Option<f32>,
+    /// Text selection endpoints as (block index, text cursor): `sel_anchor`
+    /// is where the drag started, `sel_head` follows the pointer.
+    sel_anchor: Option<(usize, Cursor)>,
+    sel_head: Option<(usize, Cursor)>,
+    /// True while the left button is dragging out a text selection.
+    selecting: bool,
+    /// Extracted text of a page-rendered PDF, filled lazily on first copy
+    /// (the page bitmaps carry no selectable glyphs).
+    pdf_text: Option<String>,
     margin: f32,
     spacing: f32,
     font_px: f32,
@@ -105,11 +126,218 @@ pub struct ViewerState {
 /// schedule a repaint on the UI event loop.
 pub type Notify = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
 
+/// One character extracted from a PDF page, boxed in page points with the
+/// origin at the page's top-left corner.
+struct PageChar {
+    text: String,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    /// Baseline y, used only while grouping characters into lines.
+    baseline: f32,
+    /// Reading-order line, which decides where copied text breaks.
+    line: u32,
+}
+
+/// A page's selectable text in reading order: lines top to bottom, characters
+/// left to right within each line. Positions come from the same content
+/// stream the renderer draws, so the boxes line up with the visible glyphs.
+#[derive(Default)]
+struct PageText {
+    chars: Vec<PageChar>,
+}
+
+impl PageText {
+    /// Sorts freshly collected characters into reading order and assigns each
+    /// one a line, so a selection range is a plain slice of the vector.
+    ///
+    /// Order is column-major: a two-column paper reads down its left column
+    /// before its right, rather than zig-zagging across the gutter row by row
+    /// the way a naive baseline sort would.
+    fn from_chars(mut chars: Vec<PageChar>, page_w: f32) -> Self {
+        if chars.is_empty() {
+            return Self::default();
+        }
+        let cmp = |a: f32, b: f32| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);
+        chars.sort_by(|a, b| cmp(a.baseline, b.baseline).then(cmp(a.x, b.x)));
+        // Characters whose baselines sit within half a line height belong to
+        // the same visual row; superscripts and mixed font sizes shift the
+        // baseline slightly without starting a new row.
+        let mut heights: Vec<f32> = chars.iter().map(|c| c.h).collect();
+        heights.sort_by(|a, b| cmp(*a, *b));
+        let tolerance = heights[heights.len() / 2] * 0.5;
+        let (mut row, mut row_baseline) = (0u32, chars[0].baseline);
+        for c in chars.iter_mut() {
+            if (c.baseline - row_baseline).abs() > tolerance {
+                row += 1;
+                row_baseline = c.baseline;
+            }
+            c.line = row;
+        }
+        // Break each row into runs at wide horizontal gaps, so body text and
+        // a figure label that happen to share a baseline stay apart.
+        let mut runs: Vec<(f32, f32)> = Vec::new();
+        let mut run_of: Vec<usize> = Vec::with_capacity(chars.len());
+        for (i, c) in chars.iter().enumerate() {
+            let split = match (i.checked_sub(1).map(|p| &chars[p]), runs.last()) {
+                (Some(prev), Some(run)) => prev.line != c.line || c.x - run.1 > c.h * 0.6,
+                _ => true,
+            };
+            if split {
+                runs.push((c.x, c.x + c.w));
+            } else if let Some(run) = runs.last_mut() {
+                run.1 = run.1.max(c.x + c.w);
+            }
+            run_of.push(runs.len() - 1);
+        }
+        let gutters = column_gutters(&runs, page_w, row as usize + 1);
+        // Sort by column, then row, then position along the row.
+        // Each character picks its own column from where its middle falls, so
+        // a row whose columns nearly touch — too close for the run split to
+        // catch — is still divided at the gutter.
+        let mut keyed: Vec<((u32, u32, f32), PageChar)> = chars
+            .into_iter()
+            .map(|c| {
+                let middle = c.x + c.w / 2.0;
+                let column = gutters.iter().filter(|g| middle >= **g).count() as u32;
+                ((column, c.line, c.x), c)
+            })
+            .collect();
+        keyed.sort_by(|a, b| {
+            a.0 .0.cmp(&b.0 .0).then(a.0 .1.cmp(&b.0 .1)).then(cmp(a.0 .2, b.0 .2))
+        });
+        // Renumber so consecutive lines stay consecutive after the reorder;
+        // copied text breaks wherever this number changes.
+        let mut chars = Vec::with_capacity(keyed.len());
+        let mut line = 0u32;
+        let mut prev: Option<(u32, u32)> = None;
+        for ((column, row, _), mut c) in keyed {
+            if prev.is_some_and(|p| p != (column, row)) {
+                line += 1;
+            }
+            prev = Some((column, row));
+            c.line = line;
+            chars.push(c);
+        }
+        Self { chars }
+    }
+
+    /// Caret position (0..=len) nearest a page-space point. The row is chosen
+    /// first so dragging sideways stays on the line under the pointer.
+    fn caret_at(&self, px: f32, py: f32) -> usize {
+        let mut line = 0u32;
+        let mut best = f32::MAX;
+        for c in &self.chars {
+            let d = if py < c.y {
+                c.y - py
+            } else if py > c.y + c.h {
+                py - c.y - c.h
+            } else {
+                0.0
+            };
+            if d < best {
+                (best, line) = (d, c.line);
+            }
+        }
+        let mut caret = 0;
+        for (i, c) in self.chars.iter().enumerate() {
+            if c.line != line {
+                continue;
+            }
+            if px < c.x + c.w / 2.0 {
+                return i;
+            }
+            caret = i + 1;
+        }
+        caret
+    }
+}
+
+/// Finds the x positions of a page's column gutters: interior vertical bands
+/// wide enough to separate columns that no text run crosses. Returns nothing
+/// for single-column pages and for pages too sparse to judge, which leaves
+/// their characters in plain top-to-bottom order.
+fn column_gutters(runs: &[(f32, f32)], page_w: f32, rows: usize) -> Vec<f32> {
+    const BUCKETS: usize = 200;
+    // Below a handful of rows, white space is just layout, not a gutter.
+    if rows < 8 || page_w <= 0.0 {
+        return Vec::new();
+    }
+    let mut hits = [0u32; BUCKETS];
+    let bucket = |x: f32| ((x / page_w) * BUCKETS as f32).clamp(0.0, BUCKETS as f32);
+    for &(x0, x1) in runs {
+        let (a, b) = (bucket(x0).floor() as usize, (bucket(x1).ceil() as usize).min(BUCKETS));
+        for c in hits.iter_mut().take(b).skip(a) {
+            *c += 1;
+        }
+    }
+    // Runs never overlap within a row, so a bucket's count is the number of
+    // rows reaching it. A gutter has to stay clear down most of the page, but
+    // not all of it: a full-width header or a straddling figure is normal.
+    let noise = (rows as u32 * 15 / 100).max(1);
+    let covered: Vec<bool> = hits.iter().map(|h| *h > noise).collect();
+    // Only gaps between text count; the page margins are not gutters.
+    let (Some(first), Some(last)) =
+        (covered.iter().position(|c| *c), covered.iter().rposition(|c| *c))
+    else {
+        return Vec::new();
+    };
+    // Justified columns run nearly flush to the gutter, so the clear band can
+    // be only a few points wide; having to stay clear down most of the page is
+    // what separates it from ordinary word spacing.
+    let min_width = 2;
+    let mut gutters = Vec::new();
+    let mut gap_start = None;
+    for i in first..=last {
+        if !covered[i] {
+            gap_start.get_or_insert(i);
+        } else if let Some(start) = gap_start.take() {
+            if i - start >= min_width {
+                gutters.push((start + i) as f32 / 2.0 / BUCKETS as f32 * page_w);
+            }
+        }
+    }
+    gutters
+}
+
+/// Work for the PDF thread: rasterize a page at a width, or extract the
+/// selectable text of one.
+enum PdfReq {
+    Render(usize, u32),
+    Text(usize),
+}
+
+/// A finished piece of that work.
+enum PdfRes {
+    Page(usize, u32, RgbaImage),
+    Text(usize, PageText),
+}
+
+/// Files one worker request into the render or text queue. Renders coalesce
+/// per page so the latest width wins and a zoom gesture collapses to its final
+/// size instead of rasterizing every step along the way.
+fn queue_req(
+    req: PdfReq,
+    order: &mut std::collections::VecDeque<usize>,
+    want: &mut HashMap<usize, u32>,
+    texts: &mut std::collections::VecDeque<usize>,
+) {
+    match req {
+        PdfReq::Render(index, width) => {
+            if want.insert(index, width).is_none() {
+                order.push_back(index);
+            }
+        }
+        PdfReq::Text(index) => texts.push_back(index),
+    }
+}
+
 /// Handle to a per-document rasterizer thread. Dropping it hangs up the
 /// request channel, which shuts the thread down.
 struct PdfWorker {
-    req_tx: Sender<(usize, u32)>,
-    res_rx: Receiver<(usize, u32, RgbaImage)>,
+    req_tx: Sender<PdfReq>,
+    res_rx: Receiver<PdfRes>,
     /// Pages near the viewport right now; lets the worker skip queued
     /// requests for pages a fast scroll has already left behind.
     wanted: Arc<Mutex<HashSet<usize>>>,
@@ -122,7 +350,7 @@ struct PdfWorker {
 /// its whole life: fonts, images and outlines decoded once are reused for
 /// every page and re-render, and the UI thread never blocks on rasterization.
 fn spawn_pdf_worker(bytes: Vec<u8>, notify: Notify) -> Option<(PdfWorker, Vec<(f32, f32)>)> {
-    let (req_tx, req_rx) = mpsc::channel::<(usize, u32)>();
+    let (req_tx, req_rx) = mpsc::channel::<PdfReq>();
     let (res_tx, res_rx) = mpsc::channel();
     let (init_tx, init_rx) = mpsc::channel();
     let wanted = Arc::new(Mutex::new(HashSet::new()));
@@ -138,29 +366,37 @@ fn spawn_pdf_worker(bytes: Vec<u8>, notify: Notify) -> Option<(PdfWorker, Vec<(f
         }
         let pages = pdf.pages();
         let cache = hayro::RenderCache::new();
+        let text_cache = hayro::hayro_interpret::InterpreterCache::new();
         while let Ok(first) = req_rx.recv() {
-            let mut order = std::collections::VecDeque::from([first.0]);
-            let mut want = HashMap::from([first]);
+            let mut order = std::collections::VecDeque::new();
+            let mut want: HashMap<usize, u32> = HashMap::new();
+            let mut texts = std::collections::VecDeque::new();
+            queue_req(first, &mut order, &mut want, &mut texts);
             loop {
-                // Latest width wins: re-drain before every render so a zoom
-                // gesture collapses to the final width per page instead of
-                // rasterizing every intermediate size.
-                for (index, width) in req_rx.try_iter() {
-                    if want.insert(index, width).is_none() {
-                        order.push_back(index);
-                    }
+                for req in req_rx.try_iter() {
+                    queue_req(req, &mut order, &mut want, &mut texts);
                 }
-                let Some(index) = order.pop_front() else { break };
-                let Some(width) = want.remove(&index) else { continue };
-                if !wanted_worker.lock().is_ok_and(|w| w.contains(&index)) {
+                // Pixels first: a page the reader is scrolling towards matters
+                // more than a text layer nobody has dragged across yet.
+                if let Some(index) = order.pop_front() {
+                    let Some(width) = want.remove(&index) else { continue };
+                    if !wanted_worker.lock().is_ok_and(|w| w.contains(&index)) {
+                        continue;
+                    }
+                    if let Some(img) = rasterize_page(pages, index, width, &cache) {
+                        if res_tx.send(PdfRes::Page(index, width, img)).is_err() {
+                            return;
+                        }
+                        notify();
+                    }
                     continue;
                 }
-                if let Some(img) = rasterize_page(pages, index, width, &cache) {
-                    if res_tx.send((index, width, img)).is_err() {
-                        return;
-                    }
-                    notify();
+                let Some(index) = texts.pop_front() else { break };
+                let text = extract_page_text(&pdf, index, &text_cache).unwrap_or_default();
+                if res_tx.send(PdfRes::Text(index, text)).is_err() {
+                    return;
                 }
+                notify();
             }
         }
     });
@@ -257,10 +493,18 @@ impl ViewerState {
             worker: None,
             page_cache: HashMap::new(),
             pending: HashMap::new(),
+            page_text: HashMap::new(),
+            pending_text: HashSet::new(),
+            page_sel_anchor: None,
+            page_sel_head: None,
             img_worker: None,
             pending_imgs: HashMap::new(),
             img_paths: Vec::new(),
             drag: None,
+            sel_anchor: None,
+            sel_head: None,
+            selecting: false,
+            pdf_text: None,
             margin: (font_px * 1.2).round(),
             spacing: (font_px * 0.5).round(),
             font_px,
@@ -845,39 +1089,335 @@ impl ViewerState {
         (self.content_h - view_h).max(1.0)
     }
 
-    /// Mouse on the pane (physical px; kind 0=down 1=up 2=move). Consumes
-    /// presses on the scrollbar and drags of its thumb; returns whether the
-    /// event changed anything worth repainting.
+    /// Mouse on the pane (physical px; kind 0=down 1=up 2=move 3=double-
+    /// click). Consumes presses on the scrollbar and drags of its thumb, and
+    /// drives text selection everywhere else; returns whether the event
+    /// changed anything worth repainting.
     pub fn handle_mouse(&mut self, kind: i32, x: f32, y: f32, view_h: f32) -> bool {
         match kind {
             0 => {
-                let Some((bar_x, thumb_y, thumb_h)) = self.scrollbar(view_h) else {
-                    return false;
-                };
-                if x < bar_x {
-                    return false;
+                if let Some((bar_x, thumb_y, thumb_h)) = self.scrollbar(view_h) {
+                    if x >= bar_x {
+                        // Grabbing the thumb keeps the cursor's spot on it; a
+                        // track click jumps there, continuing as a centered drag.
+                        let grab = if y >= thumb_y && y < thumb_y + thumb_h {
+                            y - thumb_y
+                        } else {
+                            thumb_h / 2.0
+                        };
+                        self.drag = Some(grab);
+                        self.drag_to(y, grab, view_h);
+                        return true;
+                    }
                 }
-                // Grabbing the thumb keeps the cursor's spot on it; a track
-                // click jumps there and continues as a centered drag.
-                let grab = if y >= thumb_y && y < thumb_y + thumb_h {
-                    y - thumb_y
-                } else {
-                    thumb_h / 2.0
-                };
-                self.drag = Some(grab);
-                self.drag_to(y, grab, view_h);
-                true
+                // Elsewhere a press drops the old selection and anchors a new one.
+                let had = self.clear_selection();
+                if let Some(pos) = self.hit_text(x, y) {
+                    self.sel_anchor = Some(pos);
+                    self.sel_head = Some(pos);
+                    self.selecting = true;
+                } else if let Some(pos) = self.hit_page(x, y) {
+                    self.page_sel_anchor = Some(pos);
+                    self.page_sel_head = Some(pos);
+                    self.selecting = true;
+                }
+                had
             }
-            2 => match self.drag {
-                Some(grab) => {
+            2 => {
+                if let Some(grab) = self.drag {
                     self.drag_to(y, grab, view_h);
-                    true
+                    return true;
                 }
-                None => false,
-            },
-            1 => self.drag.take().is_some(),
+                if self.selecting {
+                    // Dragging past the pane edges scrolls the document along.
+                    if y < 0.0 {
+                        self.scroll += y * 0.3;
+                    } else if y > view_h {
+                        self.scroll += (y - view_h) * 0.3;
+                    }
+                    self.clamp_scroll();
+                    if self.page_sel_anchor.is_some() {
+                        // Keep the last good caret when the pointer wanders
+                        // over a page whose text has not arrived yet.
+                        if let Some(pos) = self.hit_page(x, y) {
+                            self.page_sel_head = Some(pos);
+                        }
+                    } else {
+                        self.sel_head = self.hit_text(x, y);
+                    }
+                    return true;
+                }
+                false
+            }
+            1 => {
+                let selecting = std::mem::take(&mut self.selecting);
+                self.drag.take().is_some() || selecting
+            }
+            3 => self.select_word_at(x, y) || self.select_page_word_at(x, y),
             _ => false,
         }
+    }
+
+    /// Vertical space a block occupies in the document, spacing included.
+    fn advance(&self, block: &Block) -> f32 {
+        match block {
+            Block::Rule => self.font_px + self.spacing,
+            Block::Text { height, .. }
+            | Block::Picture { height, .. }
+            | Block::Page { height, .. }
+            | Block::Table { height, .. } => *height + self.spacing,
+        }
+    }
+
+    /// Maps viewport coordinates to a text position. Points between or beyond
+    /// text blocks clamp to the nearest one above (documents mix text with
+    /// images and pages), so drags select contiguous ranges. None when the
+    /// view has no text at all (plain images, page-rendered PDFs).
+    fn hit_text(&self, x: f32, y: f32) -> Option<(usize, Cursor)> {
+        let doc_y = y + self.scroll;
+        let mut top = self.margin;
+        let mut best: Option<(usize, Cursor)> = None;
+        for (i, block) in self.blocks.iter().enumerate() {
+            if let Block::Text { buffer, indent, bg, .. } = block {
+                if doc_y < top && best.is_some() {
+                    break;
+                }
+                let pad = if bg.is_some() { self.font_px / 2.0 } else { 0.0 };
+                let cursor = buffer
+                    .hit(x - self.margin - *indent, doc_y - top - pad)
+                    .unwrap_or_else(|| Cursor::new(0, 0));
+                best = Some((i, cursor));
+                if doc_y < top {
+                    break;
+                }
+            }
+            top += self.advance(block);
+        }
+        best
+    }
+
+    /// Maps viewport coordinates to a caret in a rendered PDF page's text,
+    /// as (page index, caret). None until that page's layer has arrived from
+    /// the worker, or for views with no pages at all.
+    fn hit_page(&self, x: f32, y: f32) -> Option<(usize, usize)> {
+        let doc_y = y + self.scroll;
+        let text_w = self.text_width();
+        let mut top = self.margin;
+        // The page containing doc_y, or the last one above it.
+        let mut found: Option<(usize, f32, f32)> = None;
+        for block in &self.blocks {
+            if let Block::Page { index, size, height } = block {
+                let draw_w = fit_draw(size.0, size.1, text_w * self.zoom).0;
+                found = Some((*index, top, draw_w / size.0.max(1.0)));
+                if doc_y < top + *height {
+                    break;
+                }
+            }
+            top += self.advance(block);
+        }
+        let (index, page_top, scale) = found?;
+        let layer = self.page_text.get(&index)?;
+        if layer.chars.is_empty() {
+            return None;
+        }
+        let px = (x + self.scroll_x - self.margin) / scale;
+        let py = (doc_y - page_top) / scale;
+        Some((index, layer.caret_at(px, py)))
+    }
+
+    /// The ordered, non-empty PDF page selection, or None.
+    fn page_sel_range(&self) -> Option<((usize, usize), (usize, usize))> {
+        let (a, b) = (self.page_sel_anchor?, self.page_sel_head?);
+        if a == b {
+            return None;
+        }
+        Some(if a <= b { (a, b) } else { (b, a) })
+    }
+
+    /// The characters of `page` covered by the current selection.
+    fn page_sel_slice(&self, page: usize) -> Option<&[PageChar]> {
+        let ((start_page, start), (end_page, end)) = self.page_sel_range()?;
+        if page < start_page || page > end_page {
+            return None;
+        }
+        let layer = self.page_text.get(&page)?;
+        let lo = if page == start_page { start } else { 0 };
+        let hi = if page == end_page { end } else { layer.chars.len() };
+        layer.chars.get(lo..hi.min(layer.chars.len()))
+    }
+
+    /// The selected text of a page-rendered PDF, with line breaks where the
+    /// reading order moves to a new row.
+    fn page_selected_text(&self) -> Option<String> {
+        let ((start_page, _), (end_page, _)) = self.page_sel_range()?;
+        let mut out = String::new();
+        for page in start_page..=end_page {
+            let Some(chars) = self.page_sel_slice(page) else { continue };
+            if !out.is_empty() && !chars.is_empty() {
+                out.push('\n');
+            }
+            let mut prev: Option<&PageChar> = None;
+            for c in chars {
+                match prev {
+                    Some(p) if p.line != c.line => out.push('\n'),
+                    // PDFs routinely draw words with no space glyph between
+                    // them; a wide enough gap stands in for one.
+                    Some(p) if c.x - (p.x + p.w) > c.h * 0.25 => out.push(' '),
+                    _ => {}
+                }
+                out.push_str(&c.text);
+                prev = Some(c);
+            }
+        }
+        (!out.trim().is_empty()).then_some(out)
+    }
+
+    /// Double-click on a rendered page: selects the word under the pointer.
+    fn select_page_word_at(&mut self, x: f32, y: f32) -> bool {
+        let Some((page, caret)) = self.hit_page(x, y) else { return false };
+        let Some(layer) = self.page_text.get(&page) else { return false };
+        let i = caret.min(layer.chars.len().saturating_sub(1));
+        let word = |c: &PageChar| c.text.chars().all(|ch| ch.is_alphanumeric() || ch == '_');
+        if !word(&layer.chars[i]) {
+            return false;
+        }
+        let line = layer.chars[i].line;
+        let mut lo = i;
+        while lo > 0 && layer.chars[lo - 1].line == line && word(&layer.chars[lo - 1]) {
+            lo -= 1;
+        }
+        let mut hi = i + 1;
+        while hi < layer.chars.len() && layer.chars[hi].line == line && word(&layer.chars[hi]) {
+            hi += 1;
+        }
+        self.page_sel_anchor = Some((page, lo));
+        self.page_sel_head = Some((page, hi));
+        true
+    }
+
+    /// Double-click: selects the word under the pointer.
+    fn select_word_at(&mut self, x: f32, y: f32) -> bool {
+        let Some((block_i, cursor)) = self.hit_text(x, y) else { return false };
+        let Some(Block::Text { buffer, .. }) = self.blocks.get(block_i) else { return false };
+        let Some(line) = buffer.lines.get(cursor.line) else { return false };
+        let text = line.text();
+        let mut start = cursor.index.min(text.len());
+        let mut end = start;
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        while let Some(c) = text[..start].chars().next_back() {
+            if !is_word(c) {
+                break;
+            }
+            start -= c.len_utf8();
+        }
+        while let Some(c) = text[end..].chars().next() {
+            if !is_word(c) {
+                break;
+            }
+            end += c.len_utf8();
+        }
+        if start == end {
+            return false;
+        }
+        self.sel_anchor = Some((block_i, Cursor::new(cursor.line, start)));
+        self.sel_head = Some((block_i, Cursor::new(cursor.line, end)));
+        true
+    }
+
+    /// The ordered, non-empty selection, or None.
+    fn sel_range(&self) -> Option<((usize, Cursor), (usize, Cursor))> {
+        let (a, b) = (self.sel_anchor?, self.sel_head?);
+        let key = |p: &(usize, Cursor)| (p.0, p.1.line, p.1.index);
+        if key(&a) == key(&b) {
+            return None;
+        }
+        Some(if key(&a) <= key(&b) { (a, b) } else { (b, a) })
+    }
+
+    /// Drops the selection; returns whether there was one to drop.
+    pub fn clear_selection(&mut self) -> bool {
+        self.selecting = false;
+        let had = self.sel_range().is_some() || self.page_sel_range().is_some();
+        self.sel_anchor = None;
+        self.sel_head = None;
+        self.page_sel_anchor = None;
+        self.page_sel_head = None;
+        had
+    }
+
+    /// Selects every text block; returns whether the view has any text.
+    pub fn select_all(&mut self) -> bool {
+        let mut first = None;
+        let mut last = None;
+        for (i, block) in self.blocks.iter().enumerate() {
+            if let Block::Text { buffer, .. } = block {
+                if first.is_none() {
+                    first = Some((i, Cursor::new(0, 0)));
+                }
+                let line = buffer.lines.len().saturating_sub(1);
+                let index = buffer.lines.last().map_or(0, |l| l.text().len());
+                last = Some((i, Cursor::new(line, index)));
+            }
+        }
+        self.selecting = false;
+        self.sel_anchor = first;
+        self.sel_head = last;
+        first.is_some()
+    }
+
+    /// The selected text: a drag over flowed text, or over the glyphs of a
+    /// rendered PDF page. None when nothing is selected.
+    pub fn selected_text(&self) -> Option<String> {
+        self.flowed_selected_text().or_else(|| self.page_selected_text())
+    }
+
+    /// The selection across text blocks, separated by blank lines to match
+    /// their visual separation.
+    fn flowed_selected_text(&self) -> Option<String> {
+        let ((sb, sc), (eb, ec)) = self.sel_range()?;
+        let mut parts: Vec<String> = Vec::new();
+        for (i, block) in self.blocks.iter().enumerate().take(eb + 1).skip(sb) {
+            let Block::Text { buffer, .. } = block else { continue };
+            let start = if i == sb { sc } else { Cursor::new(0, 0) };
+            let end = if i == eb { ec } else { Cursor::new(usize::MAX, usize::MAX) };
+            let last_line = buffer.lines.len().saturating_sub(1);
+            let lo = start.line.min(last_line);
+            let hi = end.line.min(last_line);
+            let mut out = String::new();
+            for li in lo..=hi {
+                let text = buffer.lines[li].text();
+                let s = if li == start.line { start.index.min(text.len()) } else { 0 };
+                let e = if li == end.line { end.index.min(text.len()) } else { text.len() };
+                if li > lo {
+                    out.push('\n');
+                }
+                out.push_str(&text[s.min(e)..e]);
+            }
+            parts.push(out);
+        }
+        let joined = parts.join("\n\n");
+        (!joined.trim().is_empty()).then_some(joined)
+    }
+
+    /// Whether Cmd+C / the right-click Copy would produce anything: a live
+    /// selection, or a page-rendered PDF whose text can be extracted whole.
+    pub fn can_copy(&self) -> bool {
+        self.sel_range().is_some()
+            || self.page_sel_range().is_some()
+            || (self.kind == ViewKind::Pdf && self.worker.is_some())
+    }
+
+    /// Clipboard text for a page-rendered PDF, whose bitmaps carry no
+    /// selectable glyphs: the whole document's extracted text, cached after
+    /// the first request. None for other views or when nothing is extractable.
+    pub fn whole_document_text(&mut self) -> Option<String> {
+        if self.kind != ViewKind::Pdf || self.worker.is_none() {
+            return None;
+        }
+        if self.pdf_text.is_none() {
+            self.pdf_text = Some(pdf_extract::extract_text(&self.path).unwrap_or_default());
+        }
+        self.pdf_text.clone().filter(|t| !t.trim().is_empty())
     }
 
     fn drag_to(&mut self, y: f32, grab: f32, view_h: f32) {
@@ -928,11 +1468,19 @@ impl ViewerState {
     /// placeholder until its bitmap arrives and the worker triggers a repaint.
     fn prepare_pages(&mut self, view_h: f32) {
         let Some(worker) = self.worker.as_ref() else { return };
-        for (index, width, img) in worker.res_rx.try_iter() {
-            if self.pending.get(&index) == Some(&width) {
-                self.pending.remove(&index);
+        for res in worker.res_rx.try_iter() {
+            match res {
+                PdfRes::Page(index, width, img) => {
+                    if self.pending.get(&index) == Some(&width) {
+                        self.pending.remove(&index);
+                    }
+                    self.page_cache.insert(index, img);
+                }
+                PdfRes::Text(index, text) => {
+                    self.pending_text.remove(&index);
+                    self.page_text.insert(index, text);
+                }
             }
-            self.page_cache.insert(index, img);
         }
         let target_w = self.text_width() * self.zoom;
         let mut y = self.margin - self.scroll;
@@ -975,8 +1523,19 @@ impl ViewerState {
             {
                 continue;
             }
-            if worker.req_tx.send((index, want)).is_ok() {
+            if worker.req_tx.send(PdfReq::Render(index, want)).is_ok() {
                 self.pending.insert(index, want);
+            }
+        }
+        // Selectable text for the same window, so a drag finds glyph boxes
+        // already in hand. The worker only gets to these once no page is
+        // waiting to be rasterized.
+        for &index in &keep {
+            if self.page_text.contains_key(&index) || self.pending_text.contains(&index) {
+                continue;
+            }
+            if worker.req_tx.send(PdfReq::Text(index)).is_ok() {
+                self.pending_text.insert(index);
             }
         }
         // Keep only the requested window cached.
@@ -1046,7 +1605,11 @@ impl ViewerState {
         let fg = self.fg();
         let default_color = Color::rgb(fg[0], fg[1], fg[2]);
         let page_cache = &self.page_cache;
-        for block in self.blocks.iter_mut() {
+        let page_text = &self.page_text;
+        let sel = self.sel_range();
+        let page_sel = self.page_sel_range();
+        let sel_color = Color::rgba(self.accent[0], self.accent[1], self.accent[2], 80);
+        for (block_i, block) in self.blocks.iter_mut().enumerate() {
             match block {
                 Block::Text { buffer, indent, bg: block_bg, height } => {
                     if y + *height >= 0.0 && y <= h as f32 {
@@ -1062,6 +1625,28 @@ impl ViewerState {
                             );
                         }
                         let oy = y as i32 + pad;
+                        // Selection highlight behind the glyphs.
+                        if let Some(((sb, sc), (eb, ec))) = sel {
+                            if block_i >= sb && block_i <= eb {
+                                let s = if block_i == sb { sc } else { Cursor::new(0, 0) };
+                                let e = if block_i == eb {
+                                    ec
+                                } else {
+                                    Cursor::new(usize::MAX, usize::MAX)
+                                };
+                                for run in buffer.layout_runs() {
+                                    for (hx, hw) in run.highlight(s, e) {
+                                        canvas.blend_rect(
+                                            x0 + hx as i32,
+                                            oy + run.line_top as i32,
+                                            hw.ceil() as i32,
+                                            run.line_height.ceil() as i32,
+                                            sel_color,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         buffer.draw(font_system, swash_cache, default_color, |px, py, pw, ph, color| {
                             canvas.blend_rect(x0 + px, oy + py, pw as i32, ph as i32, color);
                         });
@@ -1100,6 +1685,26 @@ impl ViewerState {
                             // Not rasterized yet: draw a blank sheet so the
                             // layout doesn't jump.
                             None => canvas.fill_rect(x0, y as i32, draw_w, *height as i32, [255, 255, 255]),
+                        }
+                        // Selection over the page's glyphs.
+                        if let Some(((start_page, start), (end_page, end))) = page_sel {
+                            if *index >= start_page && *index <= end_page {
+                                if let Some(layer) = page_text.get(index) {
+                                    let lo = if *index == start_page { start } else { 0 };
+                                    let hi = if *index == end_page { end } else { layer.chars.len() };
+                                    let scale = draw_w as f32 / size.0.max(1.0);
+                                    for c in layer.chars.get(lo..hi.min(layer.chars.len())).unwrap_or(&[])
+                                    {
+                                        canvas.blend_rect(
+                                            x0 + (c.x * scale) as i32,
+                                            y as i32 + (c.y * scale) as i32,
+                                            (c.w * scale).ceil() as i32,
+                                            (c.h * scale).ceil() as i32,
+                                            sel_color,
+                                        );
+                                    }
+                                }
+                            }
                         }
                         // Hairline frame so white pages read as pages on
                         // light backgrounds too.
@@ -1182,6 +1787,116 @@ impl ViewerState {
         }
         frame
     }
+}
+
+/// Collects positioned characters from a page's content stream. Everything
+/// but `draw_glyph` is ignored, so this walks the page far more cheaply than
+/// rasterizing it — no paths, images or blending are ever evaluated.
+struct TextExtractor {
+    chars: Vec<PageChar>,
+}
+
+impl hayro::hayro_interpret::Device<'_> for TextExtractor {
+    fn set_soft_mask(&mut self, _: Option<hayro::hayro_interpret::SoftMask<'_>>) {}
+
+    fn set_blend_mode(&mut self, _: hayro::hayro_interpret::BlendMode) {}
+
+    fn draw_path(
+        &mut self,
+        _: &kurbo::BezPath,
+        _: kurbo::Affine,
+        _: &hayro::hayro_interpret::Paint<'_>,
+        _: &hayro::hayro_interpret::PathDrawMode,
+    ) {
+    }
+
+    fn push_clip_path(&mut self, _: &hayro::hayro_interpret::ClipPath) {}
+
+    fn push_transparency_group(
+        &mut self,
+        _: f32,
+        _: Option<hayro::hayro_interpret::SoftMask<'_>>,
+        _: hayro::hayro_interpret::BlendMode,
+    ) {
+    }
+
+    fn draw_glyph(
+        &mut self,
+        glyph: &hayro::hayro_interpret::font::Glyph<'_>,
+        transform: kurbo::Affine,
+        glyph_transform: kurbo::Affine,
+        _: &hayro::hayro_interpret::Paint<'_>,
+        _: &hayro::hayro_interpret::GlyphDrawMode,
+    ) {
+        use hayro::hayro_interpret::font::Glyph;
+        use hayro::hayro_interpret::hayro_cmap::BfString;
+
+        let Some(unicode) = glyph.as_unicode() else { return };
+        let text = match unicode {
+            BfString::Char(c) => c.to_string(),
+            BfString::String(s) => s,
+        };
+        if text.is_empty() {
+            return;
+        }
+        // `transform` already carries the page's initial transform, so this
+        // lands in the same top-left-origin space the renderer draws into.
+        let to_page = transform * glyph_transform;
+        // Outlines use a 1000-unit em, so the advance and the em top are
+        // measured there and land in page points after the transform.
+        let advance = match glyph {
+            Glyph::Outline(outline) => outline.advance_width().unwrap_or(500.0) as f64,
+            Glyph::Type3(_) => 500.0,
+        };
+        let origin = to_page * kurbo::Point::new(0.0, 0.0);
+        let end = to_page * kurbo::Point::new(advance, 0.0);
+        let em_top = to_page * kurbo::Point::new(0.0, 1000.0);
+        let h = ((origin.y - em_top.y).abs() as f32).max(1.0);
+        let w = (end.x - origin.x).abs() as f32;
+        self.chars.push(PageChar {
+            text,
+            x: origin.x.min(end.x) as f32,
+            // The em box sits mostly above the baseline; keeping a fifth of it
+            // below leaves room for descenders inside the selection box.
+            y: origin.y as f32 - h * 0.8,
+            w: if w > 0.0 { w } else { h * 0.5 },
+            h,
+            baseline: origin.y as f32,
+            line: 0,
+        });
+    }
+
+    fn draw_image(&mut self, _: hayro::hayro_interpret::Image<'_, '_>, _: kurbo::Affine) {}
+
+    fn pop_clip_path(&mut self) {}
+
+    fn pop_transparency_group(&mut self) {}
+}
+
+/// Extracts one page's selectable text by interpreting its content stream
+/// with a glyph-only device.
+fn extract_page_text<'a>(
+    pdf: &'a hayro::hayro_syntax::Pdf,
+    index: usize,
+    cache: &hayro::hayro_interpret::InterpreterCache<'a>,
+) -> Option<PageText> {
+    use hayro::hayro_interpret::TransformExt;
+
+    let page = pdf.pages().get(index)?;
+    let (page_w, page_h) = page.render_dimensions();
+    // The very transform the renderer starts from, at scale 1: it folds in the
+    // crop box and page rotation and flips y, so the boxes land in page points
+    // with a top-left origin — exactly the space the page bitmap is drawn in.
+    let mut context = hayro::hayro_interpret::Context::new(
+        page.initial_transform(true).to_kurbo(),
+        kurbo::Rect::new(0.0, 0.0, page_w as f64, page_h as f64),
+        cache,
+        pdf.xref(),
+        hayro::hayro_interpret::InterpreterSettings::default(),
+    );
+    let mut extractor = TextExtractor { chars: Vec::new() };
+    hayro::hayro_interpret::interpret_page(page, &mut context, &mut extractor);
+    Some(PageText::from_chars(extractor.chars, page_w))
 }
 
 /// Renders one PDF page to a bitmap `draw_w` pixels wide. The white opaque
@@ -1397,6 +2112,113 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A letter-size page with two text columns sharing baselines, the layout
+    /// that trips up a naive top-to-bottom sort.
+    fn two_column_pdf() -> Vec<u8> {
+        let mut stream = String::new();
+        for row in 0..12 {
+            let y = 700 - row * 20;
+            stream.push_str(&format!("BT /F1 10 Tf 50 {y} Td (Left{row}) Tj ET\n"));
+            stream.push_str(&format!("BT /F1 10 Tf 320 {y} Td (Right{row}) Tj ET\n"));
+        }
+        let objects = [
+            "<</Type/Catalog/Pages 2 0 R>>".to_string(),
+            "<</Type/Pages/Kids[3 0 R]/Count 1>>".to_string(),
+            "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>".to_string(),
+            format!("<</Length {}>>stream\n{stream}\nendstream", stream.len() + 1),
+            "<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>".to_string(),
+        ];
+        let mut out = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.push_str(&format!("{} 0 obj\n{body}\nendobj\n", i + 1));
+        }
+        let xref = out.len();
+        out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
+        for off in &offsets {
+            out.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        out.push_str(&format!(
+            "trailer\n<</Size {}/Root 1 0 R>>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        ));
+        out.into_bytes()
+    }
+
+    /// Text must come out column by column. Sorting purely by baseline would
+    /// zig-zag across the gutter and interleave the two columns, which is what
+    /// makes copied text from a paper unusable.
+    #[test]
+    fn two_column_pages_extract_one_column_at_a_time() {
+        let pdf = hayro::hayro_syntax::Pdf::new(two_column_pdf()).expect("parse");
+        let cache = hayro::hayro_interpret::InterpreterCache::new();
+        let text = extract_page_text(&pdf, 0, &cache).expect("page 0");
+
+        let mut lines: Vec<String> = Vec::new();
+        for c in &text.chars {
+            if lines.len() as u32 != c.line + 1 {
+                lines.push(String::new());
+            }
+            lines.last_mut().unwrap().push_str(&c.text);
+        }
+        let expected: Vec<String> = (0..12)
+            .map(|i| format!("Left{i}"))
+            .chain((0..12).map(|i| format!("Right{i}")))
+            .collect();
+        assert_eq!(lines, expected, "left column should read out fully before the right");
+    }
+
+    #[test]
+    fn markdown_selection_copies_text() {
+        let path = std::env::temp_dir().join("tigriden-viewer-sel-test.md");
+        std::fs::write(
+            &path,
+            "# Title\n\nHello viewer selection world.\n\nSecond paragraph here.\n",
+        )
+        .unwrap();
+
+        let mut font_system = FontSystem::new();
+        let theme = crate::theme::default_theme();
+        let mut viewer = ViewerState::open(
+            &mut font_system,
+            &path,
+            ViewKind::Markdown,
+            "Menlo",
+            13.0,
+            theme,
+            [0, 0, 0],
+            400.0,
+            std::sync::Arc::new(|| {}),
+        )
+        .expect("viewer opens the markdown");
+
+        // Select-all captures every block in document order.
+        assert!(viewer.select_all(), "markdown view has selectable text");
+        let all = viewer.selected_text().expect("select-all yields text");
+        assert!(all.contains("Title"));
+        assert!(all.contains("Hello viewer selection world."));
+        assert!(all.contains("Second paragraph here."));
+        assert!(all.find("Title").unwrap() < all.find("Second").unwrap());
+
+        assert!(viewer.clear_selection(), "clear drops the selection");
+        assert!(viewer.selected_text().is_none());
+
+        // A drag from inside the heading to far past the end selects through
+        // the last paragraph; the release ends the drag.
+        viewer.handle_mouse(0, viewer.margin + 1.0, viewer.margin + 1.0, 300.0);
+        assert!(viewer.handle_mouse(2, 10_000.0, 10_000.0, 300.0), "drag extends the selection");
+        viewer.handle_mouse(1, 10_000.0, 10_000.0, 300.0);
+        let dragged = viewer.selected_text().expect("dragged selection yields text");
+        assert!(dragged.contains("Second paragraph here."));
+
+        // Double-click selects the word under the pointer.
+        assert!(viewer.handle_mouse(3, viewer.margin + 2.0, viewer.margin + 2.0, 300.0));
+        assert_eq!(viewer.selected_text().as_deref(), Some("Title"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn pdf_renders_pages_and_zooms() {
         let path = std::env::temp_dir().join("tigriden-viewer-test.pdf");
@@ -1471,6 +2293,57 @@ mod tests {
         viewer.zoom_reset(&mut font_system);
         assert_eq!(viewer.scroll_x, 0.0, "reset returns to fit-to-width");
 
+        // Copy with nothing selected falls back to the whole document.
+        assert!(viewer.selected_text().is_none());
+        let text = viewer.whole_document_text().expect("pdf text extraction");
+        assert!(text.contains("Hello PDF"), "extracted text: {text:?}");
+
+        // The text layer arrives from the same worker as the bitmaps, so poll
+        // for it, then drag across the page and copy just what was dragged.
+        viewer.zoom_reset(&mut font_system);
+        let mut glyphs: Vec<(String, f32, f32, f32, f32)> = Vec::new();
+        for _ in 0..200 {
+            viewer.render(&mut font_system, &mut swash_cache, 800, 600);
+            if let Some(layer) = viewer.page_text.get(&0).filter(|t| !t.chars.is_empty()) {
+                glyphs = layer
+                    .chars
+                    .iter()
+                    .map(|c| (c.text.clone(), c.x, c.y, c.w, c.h))
+                    .collect();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(!glyphs.is_empty(), "page text layer should arrive from the worker");
+        let extracted: String = glyphs.iter().map(|(t, ..)| t.as_str()).collect();
+        assert_eq!(extracted, "Hello PDF", "glyphs extract in reading order");
+        // Every glyph must sit inside the page box, or highlights would be
+        // drawn in the wrong place.
+        let (page_w, page_h) = (200.0, 100.0);
+        for (text, x, y, w, h) in &glyphs {
+            assert!(
+                *x >= 0.0 && x + w <= page_w && *y >= 0.0 && y + h <= page_h,
+                "glyph {text:?} box ({x}, {y}, {w}, {h}) escapes the {page_w}x{page_h} page"
+            );
+        }
+
+        // A drag across the whole line selects it; the text comes back with a
+        // space where the PDF left a gap instead of a space glyph.
+        viewer.handle_mouse(0, 0.0, 0.0, 600.0);
+        viewer.handle_mouse(2, 800.0, 600.0, 600.0);
+        viewer.handle_mouse(1, 800.0, 600.0, 600.0);
+        assert_eq!(viewer.selected_text().as_deref(), Some("Hello PDF"));
+        assert!(viewer.can_copy());
+
+        // Double-click selects the word under the pointer, not the whole line.
+        viewer.clear_selection();
+        let (_, fx, fy, fw, fh) = glyphs[0];
+        let scale = (800.0 - 2.0 * viewer.margin) / page_w;
+        let (cx, cy) =
+            (viewer.margin + (fx + fw / 2.0) * scale, viewer.margin + (fy + fh / 2.0) * scale);
+        assert!(viewer.handle_mouse(3, cx, cy, 600.0), "double-click selects a word");
+        assert_eq!(viewer.selected_text().as_deref(), Some("Hello"));
+
         let _ = std::fs::remove_file(&path);
     }
 }
@@ -1486,3 +2359,4 @@ pub fn classify(path: &Path) -> Option<ViewKind> {
         _ => None,
     }
 }
+

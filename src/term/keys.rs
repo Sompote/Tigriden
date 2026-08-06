@@ -149,12 +149,39 @@ pub fn encode_paste(text: &str, mode: TermMode) -> Vec<u8> {
     }
 }
 
+/// Encodes one wheel notch as a mouse event for applications that asked for
+/// mouse reporting, at the zero-based cell (`col`, `row`).
+///
+/// The wheel is reported as buttons 4 and 5, press only — there is no release
+/// for a notch. SGR form is used when the application negotiated it, since the
+/// legacy form cannot address a cell beyond 222.
+pub fn encode_wheel(up: bool, col: usize, row: usize, mode: TermMode) -> Vec<u8> {
+    let button = if up { 64 } else { 65 };
+    let (cx, cy) = (col + 1, row + 1);
+    if mode.contains(TermMode::SGR_MOUSE) {
+        return format!("\x1b[<{button};{cx};{cy}M").into_bytes();
+    }
+    let clamp = |v: usize| (v.min(223) + 32) as u8;
+    vec![0x1b, b'[', b'M', button + 32, clamp(cx), clamp(cy)]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn plain() -> Mods {
         Mods { ctrl: false, alt: false, meta: false, shift: false }
+    }
+
+    #[test]
+    fn wheel_reports_as_mouse_buttons() {
+        let sgr = TermMode::SGR_MOUSE | TermMode::MOUSE_MOTION;
+        assert_eq!(encode_wheel(true, 0, 0, sgr), b"\x1b[<64;1;1M".to_vec());
+        assert_eq!(encode_wheel(false, 9, 4, sgr), b"\x1b[<65;10;5M".to_vec());
+        // Legacy form offsets every field by 32 and cannot go past 223.
+        let legacy = TermMode::MOUSE_REPORT_CLICK;
+        assert_eq!(encode_wheel(true, 0, 0, legacy), vec![0x1b, b'[', b'M', 96, 33, 33]);
+        assert_eq!(encode_wheel(false, 300, 300, legacy), vec![0x1b, b'[', b'M', 97, 255, 255]);
     }
 
     #[test]

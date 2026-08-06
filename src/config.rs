@@ -41,7 +41,21 @@ pub struct Config {
     pub presets: Vec<Preset>,
     #[serde(default)]
     pub teams: Vec<Team>,
+    /// Which generation of the built-in preset list this config was written
+    /// against. Older files are offered newly shipped agents once (see
+    /// [`Config::adopt_new_presets`]); missing means the oldest generation.
+    #[serde(default)]
+    pub presets_version: u32,
 }
+
+/// Current generation of the built-in preset list. Bump this whenever an agent
+/// is added to [`Config::default`] so existing configs are offered it.
+pub const PRESETS_VERSION: u32 = 1;
+
+/// The built-in preset list of each earlier generation, newest last. A config
+/// still holding one of these verbatim has never been touched, so it can take
+/// the new list; anything else is the user's own and is left alone.
+const PRESET_GENERATIONS: [&[&str]; 1] = [&["claude", "codex", "gemini"]];
 
 pub const MIN_FONT_SIZE: f32 = 8.0;
 pub const MAX_FONT_SIZE: f32 = 28.0;
@@ -72,6 +86,23 @@ impl Config {
         self.scrollback = self.scrollback.clamp(200, 500_000);
     }
 
+    /// Takes on newly shipped agent buttons, but only for a preset list still
+    /// identical to a build's built-in one — a list the user has added to or
+    /// pruned is theirs to manage. Returns whether anything changed, so the
+    /// caller can record the new generation on disk and not ask again.
+    fn adopt_new_presets(&mut self) -> bool {
+        if self.presets_version >= PRESETS_VERSION {
+            return false;
+        }
+        self.presets_version = PRESETS_VERSION;
+        let labels: Vec<&str> = self.presets.iter().map(|p| p.label.as_str()).collect();
+        if !PRESET_GENERATIONS.contains(&labels.as_slice()) {
+            return true;
+        }
+        self.presets = Self::default().presets;
+        true
+    }
+
     /// Accent actually in use: the user's override, else the theme's own.
     pub fn accent_rgb(&self) -> [u8; 3] {
         crate::theme::parse_hex(&self.accent)
@@ -93,8 +124,10 @@ impl Default for Config {
                 Preset { label: "claude".into(), command: "claude".into(), send_enter: true },
                 Preset { label: "codex".into(), command: "codex".into(), send_enter: true },
                 Preset { label: "gemini".into(), command: "gemini".into(), send_enter: true },
+                Preset { label: "opencode".into(), command: "opencode".into(), send_enter: true },
             ],
             teams: Vec::new(),
+            presets_version: PRESETS_VERSION,
         }
     }
 }
@@ -122,6 +155,50 @@ fn state_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("state.toml"))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_presets(labels: &[&str], version: u32) -> Config {
+        Config {
+            presets: labels
+                .iter()
+                .map(|l| Preset {
+                    label: (*l).to_string(),
+                    command: (*l).to_string(),
+                    send_enter: true,
+                })
+                .collect(),
+            presets_version: version,
+            ..Config::default()
+        }
+    }
+
+    fn labels(config: &Config) -> Vec<String> {
+        config.presets.iter().map(|p| p.label.clone()).collect()
+    }
+
+    #[test]
+    fn untouched_preset_lists_take_on_new_agents() {
+        let mut config = with_presets(&["claude", "codex", "gemini"], 0);
+        assert!(config.adopt_new_presets(), "an older generation migrates");
+        assert_eq!(labels(&config), labels(&Config::default()));
+        assert_eq!(config.presets_version, PRESETS_VERSION);
+        // Once recorded, it never migrates again — so an agent the user drops
+        // afterwards stays dropped.
+        config.presets.pop();
+        assert!(!config.adopt_new_presets(), "the current generation is left alone");
+        assert_eq!(config.presets.len(), Config::default().presets.len() - 1);
+    }
+
+    #[test]
+    fn customised_preset_lists_are_left_alone() {
+        let mut config = with_presets(&["claude", "my-agent"], 0);
+        assert!(config.adopt_new_presets(), "the generation is still recorded");
+        assert_eq!(labels(&config), vec!["claude", "my-agent"], "custom presets survive");
+    }
+}
+
 /// Loads the config, writing defaults on first run. A malformed file falls
 /// back to defaults but is left untouched on disk.
 pub fn load_config() -> (Config, bool) {
@@ -130,6 +207,11 @@ pub fn load_config() -> (Config, bool) {
         Ok(text) => match toml::from_str::<Config>(&text) {
             Ok(mut config) => {
                 config.sanitize();
+                // Write the new generation straight back, so an agent the user
+                // then removes is not offered again on the next launch.
+                if config.adopt_new_presets() {
+                    save_config(&config);
+                }
                 (config, false)
             }
             Err(err) => {

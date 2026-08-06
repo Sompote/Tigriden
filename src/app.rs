@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{viewport_to_point, TermMode};
@@ -24,6 +24,13 @@ use crate::{AccentOption, MainWindow, PresetItem, Theme as UiTheme, TreeRow};
 static SYNTAX_SYSTEM: OnceLock<SyntaxSystem> = OnceLock::new();
 static NEXT_TERM_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_APP_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Ceiling on the keys or mouse reports one wheel event may send to a
+/// full-screen app, so a trackpad fling cannot flood the PTY.
+const WHEEL_MAX_STEPS: u32 = 32;
+
+/// Lines a single wheel notch stands for, the usual terminal convention.
+const WHEEL_LINES_PER_NOTCH: usize = 3;
 
 fn syntax_system() -> &'static SyntaxSystem {
     SYNTAX_SYSTEM.get_or_init(SyntaxSystem::new)
@@ -337,6 +344,9 @@ pub struct App {
     zoom_render_armed: bool,
     last_zoom_render: std::time::Instant,
     term_mouse_down: bool,
+    /// Cell the pointer was last over, reported with wheel events to
+    /// applications that read the mouse.
+    term_mouse_cell: (usize, usize),
     banner: Banner,
     pending_name: Option<NameAction>,
     fs_timer_armed: bool,
@@ -405,6 +415,7 @@ impl App {
             zoom_render_armed: false,
             last_zoom_render: std::time::Instant::now(),
             term_mouse_down: false,
+            term_mouse_cell: (0, 0),
             banner: Banner::None,
             pending_name: None,
             fs_timer_armed: false,
@@ -696,6 +707,94 @@ impl App {
                             .and_then(Session::active_term)
                             .and_then(|h| h.term.term.lock().selection_to_string());
                         eprintln!("TEST_SELECT: {copied:?}");
+                    });
+                });
+            }
+            // Exercises the right-click menu actions without a pointer: a
+            // drag-selection followed by Copy, then Select All followed by
+            // Copy, reporting what each put on the clipboard.
+            if std::env::var("TIGRIDEN_TEST_CTXMENU").is_ok() {
+                slint::Timer::single_shot(std::time::Duration::from_millis(3000), move || {
+                    with_app_id(app_id, |app| {
+                        app.term_mouse(0, 5.0, 5.0);
+                        app.term_mouse(2, 300.0, 5.0);
+                        app.term_mouse(1, 300.0, 5.0);
+                        let armed = app.ui().is_some_and(|ui| ui.get_term_can_copy());
+                        app.term_context(0);
+                        let dragged = app.clipboard.as_mut().and_then(|cb| cb.get_text().ok());
+                        app.term_context(2);
+                        app.term_context(0);
+                        let all = app.clipboard.as_mut().and_then(|cb| cb.get_text().ok());
+                        eprintln!(
+                            "TEST_CTXMENU can-copy={armed} copy={dragged:?} select-all-copy-len={:?}",
+                            all.as_ref().map(|t| t.len())
+                        );
+                    });
+                });
+            }
+            // Reports what the wheel does to the active terminal: how much
+            // history exists, where the viewport sits after scrolling up, and
+            // whether an alternate-screen app is being sent arrow keys.
+            if let Ok(dir) = std::env::var("TIGRIDEN_TEST_SCROLLBACK") {
+                let down = dir == "down";
+                slint::Timer::single_shot(std::time::Duration::from_millis(4000), move || {
+                    with_app_id(app_id, |app| {
+                        let (history, before, alt, top) = app.scroll_probe();
+                        if let Some(handle) =
+                            app.sessions.get(app.active).and_then(Session::active_term)
+                        {
+                            eprintln!("TEST_SCROLLBACK mode={:?}", handle.term.term.lock().mode());
+                        }
+                        app.term_wheel(if down { -400.0 } else { 400.0 });
+                        // Alternate-screen scrolling is the app's own work, so
+                        // give the PTY a moment to redraw before looking.
+                        slint::Timer::single_shot(
+                            std::time::Duration::from_millis(600),
+                            move || {
+                                with_app_id(app_id, |app| {
+                                    let (_, after, _, top_after) = app.scroll_probe();
+                                    eprintln!(
+                                        "TEST_SCROLLBACK alt_screen={alt} history={history} \
+                                         offset {before} -> {after} top {top:?} -> {top_after:?}"
+                                    );
+                                });
+                            },
+                        );
+                    });
+                });
+            }
+            // Dispatches a real scroll event through Slint's own hit-testing,
+            // proving wheel input still reaches the terminal from the UI and
+            // is not swallowed by an overlay on the pane.
+            if std::env::var("TIGRIDEN_TEST_WHEEL_UI").is_ok() {
+                slint::Timer::single_shot(std::time::Duration::from_millis(4000), move || {
+                    // Dispatch outside the app borrow: Slint re-enters our
+                    // callbacks while delivering the event.
+                    let mut before = 0;
+                    let mut window = None;
+                    with_app_id(app_id, |app| {
+                        before = app.scroll_probe().1;
+                        window = app.ui();
+                    });
+                    let Some(ui) = window else { return };
+                    let scale = ui.window().scale_factor();
+                    let size = ui.window().size();
+                    let (w, h) = (size.width as f32 / scale, size.height as f32 / scale);
+                    // A point inside the terminal pane, below the split.
+                    let at = slint::LogicalPosition::new(w * 0.5, h * 0.85);
+                    ui.window()
+                        .dispatch_event(slint::platform::WindowEvent::PointerMoved { position: at });
+                    ui.window().dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+                        position: at,
+                        delta_x: 0.0,
+                        delta_y: 400.0,
+                    });
+                    with_app_id(app_id, |app| {
+                        let after = app.scroll_probe().1;
+                        eprintln!(
+                            "TEST_WHEEL_UI at=({:.0},{:.0}) offset {before} -> {after}",
+                            at.x, at.y
+                        );
                     });
                 });
             }
@@ -1349,6 +1448,9 @@ impl App {
         if self.viewer_zoom_key(text, &mods) {
             return true;
         }
+        if self.viewer_clipboard_key(text, &mods) {
+            return true;
+        }
         if self.viewer_scroll_key(text, &mods) {
             return true;
         }
@@ -1396,7 +1498,36 @@ impl App {
         handled
     }
 
-    /// PageUp/PageDown, Home/End and arrow keys scroll the viewer.
+    /// Cmd+C / Cmd+X copy the viewer's text selection (the view is read-only,
+    /// so cut copies too); Cmd+A selects all text. Page-rendered PDFs have no
+    /// selectable glyphs, so copy falls back to the whole extracted text.
+    fn viewer_clipboard_key(&mut self, text: &str, mods: &Mods) -> bool {
+        if !mods.meta || mods.ctrl || mods.alt {
+            return false;
+        }
+        let Some(session) = self.sessions.get_mut(self.active) else { return false };
+        let Some(viewer_state) = session.viewer.as_mut() else { return false };
+        match text.chars().next().map(|c| c.to_ascii_lowercase()) {
+            Some('c') | Some('x') => {
+                let copied =
+                    viewer_state.selected_text().or_else(|| viewer_state.whole_document_text());
+                if let (Some(cb), Some(copied)) = (self.clipboard.as_mut(), copied) {
+                    let _ = cb.set_text(copied);
+                }
+                true
+            }
+            Some('a') => {
+                if viewer_state.select_all() {
+                    self.render_editor();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// PageUp/PageDown, Home/End and arrow keys scroll the viewer; Escape
+    /// drops the text selection.
     fn viewer_scroll_key(&mut self, text: &str, mods: &Mods) -> bool {
         if mods.ctrl || mods.alt || mods.meta || mods.shift {
             return false;
@@ -1413,6 +1544,11 @@ impl App {
             Some(keys::K_END) => viewer_state.scroll_home(true),
             Some(keys::K_UP) => viewer_state.scroll_by(0.0, line),
             Some(keys::K_DOWN) => viewer_state.scroll_by(0.0, -line),
+            Some('\u{001b}') => {
+                if !viewer_state.clear_selection() {
+                    return true;
+                }
+            }
             _ => return false,
         }
         self.render_editor();
@@ -1554,16 +1690,37 @@ impl App {
             #[cfg(feature = "framedump")]
             dump_frame("editor", &buffer);
             ui.set_editor_frame(Image::from_rgba8_premultiplied(buffer));
+            // Rendered views are read-only, so the menu offers no Paste.
+            ui.set_editor_can_copy(viewer_state.can_copy());
+            ui.set_editor_can_paste(false);
             return;
         }
         let Some(editor) = session.editor.as_mut() else {
             ui.set_editor_frame(Image::default());
+            ui.set_editor_can_copy(false);
+            ui.set_editor_can_paste(false);
             return;
         };
+        let (can_copy, can_paste) = (editor.has_selection(), !editor.read_only);
         let buffer = editor.render(&mut self.font_system, &mut self.swash_cache, w, h);
         #[cfg(feature = "framedump")]
         dump_frame("editor", &buffer);
         ui.set_editor_frame(Image::from_rgba8_premultiplied(buffer));
+        ui.set_editor_can_copy(can_copy);
+        ui.set_editor_can_paste(can_paste);
+    }
+
+    /// Right-click menu on the editor/viewer pane: 0 = copy, 1 = paste,
+    /// 2 = select all. Routed through the Cmd-key path so the editor and the
+    /// read-only viewer both behave exactly as they do from the keyboard.
+    pub fn editor_context(&mut self, action: i32) {
+        let key = match action {
+            0 => "c",
+            1 => "v",
+            2 => "a",
+            _ => return,
+        };
+        self.editor_key(key, Mods { ctrl: false, alt: false, meta: true, shift: false });
     }
 
     // ----- terminal -----
@@ -1646,6 +1803,44 @@ impl App {
         }
     }
 
+    /// Right-click menu on the terminal: 0 = copy, 1 = paste, 2 = select all.
+    pub fn term_context(&mut self, action: i32) {
+        match action {
+            0 => {
+                self.term_shortcut("c");
+            }
+            1 => {
+                self.term_shortcut("v");
+            }
+            2 => self.term_select_all(),
+            _ => {}
+        }
+    }
+
+    /// Selects the whole grid, scrollback included.
+    fn term_select_all(&mut self) {
+        let Some(handle) = self.sessions.get_mut(self.active).and_then(Session::active_term_mut)
+        else {
+            return;
+        };
+        {
+            let mut term = handle.term.term.lock();
+            let (top, bottom, last_col) = {
+                let grid = term.grid();
+                (
+                    grid.topmost_line(),
+                    grid.bottommost_line(),
+                    Column(grid.columns().saturating_sub(1)),
+                )
+            };
+            let mut selection =
+                Selection::new(SelectionType::Simple, Point::new(top, Column(0)), Side::Left);
+            selection.update(Point::new(bottom, last_col), Side::Right);
+            term.selection = Some(selection);
+        }
+        self.render_term();
+    }
+
     /// kind: 0 = down, 1 = up, 2 = move, 3 = double-click (logical px).
     pub fn term_mouse(&mut self, kind: i32, x: f32, y: f32) {
         let (cell_w, cell_h) = self.ensure_renderer();
@@ -1660,6 +1855,9 @@ impl App {
         };
         let col = ((px / cell_w.max(1)) as usize).min(handle.term.cols.saturating_sub(1) as usize);
         let row = ((py / cell_h.max(1)) as usize).min(handle.term.rows.saturating_sub(1) as usize);
+        // Remembered for the wheel, which has to report where the pointer is
+        // to applications that read the mouse.
+        self.term_mouse_cell = (col, row);
         {
             let mut term = handle.term.term.lock();
             let point = viewport_to_point(term.grid().display_offset(), Point::new(row, Column(col)));
@@ -1734,14 +1932,77 @@ impl App {
         let cell_h_logical = renderer.cell_h as f32 / self.scale().max(0.01);
         self.wheel_accum += delta / cell_h_logical.max(1.0);
         let lines = self.wheel_accum as i32;
-        if lines != 0 {
-            self.wheel_accum -= lines as f32;
-            if let Some(handle) = self.sessions.get_mut(self.active).and_then(Session::active_term_mut)
-            {
-                handle.term.term.lock().scroll_display(Scroll::Delta(lines));
-                self.render_term();
-            }
+        if lines == 0 {
+            return;
         }
+        self.wheel_accum -= lines as f32;
+        let Some(handle) = self.sessions.get_mut(self.active).and_then(Session::active_term_mut)
+        else {
+            return;
+        };
+        let mode = *handle.term.term.lock().mode();
+        // Full-screen apps (vim, less, the agent TUIs) draw on the alternate
+        // screen, which keeps no scrollback of its own — scrolling its display
+        // moves nothing, so the wheel would feel dead. What the application
+        // wants instead depends on what it negotiated.
+        if mode.contains(TermMode::ALT_SCREEN) {
+            let steps = lines.unsigned_abs().min(WHEEL_MAX_STEPS) as usize;
+            let up = lines > 0;
+            let bytes = if mode.intersects(TermMode::MOUSE_MODE) {
+                // It asked to hear about the mouse, so report the wheel and
+                // let it scroll whichever of its panes is under the pointer.
+                // One notch per few lines, since an application moves several
+                // lines per notch; sending one each would scroll far too fast.
+                let notches = (steps / WHEEL_LINES_PER_NOTCH).max(1);
+                let (col, row) = self.term_mouse_cell;
+                keys::encode_wheel(up, col, row, mode).repeat(notches)
+            } else if mode.contains(TermMode::ALTERNATE_SCROLL) {
+                // Otherwise fall back to the arrow keys, the same answer xterm
+                // gives, so the application scrolls its own view.
+                let arrow = if up { keys::K_UP } else { keys::K_DOWN };
+                let mods = Mods { ctrl: false, alt: false, meta: false, shift: false };
+                match keys::encode(&arrow.to_string(), &mods, mode) {
+                    Some(bytes) => bytes.repeat(steps),
+                    None => return,
+                }
+            } else {
+                return;
+            };
+            handle.term.write(bytes);
+            return;
+        }
+        handle.term.term.lock().scroll_display(Scroll::Delta(lines));
+        self.render_term();
+    }
+
+    /// Test aid: (history lines, display offset, on the alternate screen, text
+    /// of the top visible row) for the active terminal.
+    #[cfg(feature = "framedump")]
+    fn scroll_probe(&self) -> (usize, usize, bool, String) {
+        let Some(handle) = self.sessions.get(self.active).and_then(Session::active_term) else {
+            return (0, 0, false, String::new());
+        };
+        let term = handle.term.term.lock();
+        let grid = term.grid();
+        // Every non-blank visible row, so a probe can look for whatever the
+        // application drew in response to input.
+        let screen: Vec<String> = (0..grid.screen_lines() as i32)
+            .map(|line| {
+                grid[alacritty_terminal::index::Line(line)]
+                    .into_iter()
+                    .map(|cell| cell.c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .filter(|row| !row.trim().is_empty())
+            .collect();
+        (
+            grid.history_size(),
+            grid.display_offset(),
+            term.mode().contains(TermMode::ALT_SCREEN),
+            screen.join(" ⏎ "),
+        )
     }
 
     pub fn term_resized(&mut self, w: f32, h: f32) {
@@ -1793,10 +2054,14 @@ impl App {
             w_px,
             h_px,
         );
+        // Whether the right-click menu's Copy has anything to act on.
+        let has_selection =
+            term.selection.as_ref().is_some_and(|s| s.to_range(&term).is_some());
         drop(term);
         #[cfg(feature = "framedump")]
         dump_frame("term", &buffer);
         ui.set_term_frame(Image::from_rgba8_premultiplied(buffer));
+        ui.set_term_can_copy(has_selection);
     }
 
     pub fn preset_clicked(&mut self, idx: usize) {

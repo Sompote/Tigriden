@@ -139,6 +139,7 @@ fn wire_callbacks(ui: &MainWindow, app_id: u64) {
     ui.on_term_wheel(move |delta| with_app_id(app_id, |app| app.term_wheel(delta)));
     ui.on_term_mouse(move |kind, x, y| with_app_id(app_id, |app| app.term_mouse(kind, x, y)));
     ui.on_term_size_changed(move |w, h| with_app_id(app_id, |app| app.term_resized(w, h)));
+    ui.on_term_context(move |action| with_app_id(app_id, |app| app.term_context(action)));
 
     ui.on_editor_key(move |text, ctrl, alt, meta, shift| {
         let mut handled = false;
@@ -150,6 +151,7 @@ fn wire_callbacks(ui: &MainWindow, app_id: u64) {
         with_app_id(app_id, |app| app.editor_wheel(dx, dy, zoom))
     });
     ui.on_editor_size_changed(move |w, h| with_app_id(app_id, |app| app.editor_resized(w, h)));
+    ui.on_editor_context(move |action| with_app_id(app_id, |app| app.editor_context(action)));
 
     // External file drops arrive as winit events the Slint DropArea never
     // sees; forward them to the active terminal as a typed path.

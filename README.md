@@ -1,6 +1,6 @@
 # Tigriden — Terminal for Agentic Coding
 
-![Version](https://img.shields.io/badge/version-0.1.4-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
+![Version](https://img.shields.io/badge/version-0.1.5-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 
 **A tiny desktop IDE built for one job: supervising AI coding agents.**
 
@@ -20,13 +20,13 @@ Agentic coding means running several agents in several folders and checking in o
 
 - **One-click agents** — preset buttons type the agent command into the terminal for you (fully configurable).
 - **Multiple terminals per folder** — the `+` tab spawns extra shells in the same workspace, so one agent can run while you use a second terminal for git, tests, or another agent.
-- **Real terminal** — VTE-compliant emulation ([alacritty_terminal](https://crates.io/crates/alacritty_terminal) + a real PTY). TUIs like `vim`, `top`, and the Claude Code interface just work, including bracketed paste and truecolor. Select with the mouse and Cmd+C to copy out; Cmd+V pastes text in, and image paste into Claude Code works with Ctrl+V (the agent reads your clipboard directly). *(new in 0.1.3)* Keyboard scrollback: Shift+PageUp/PageDown page through history, Shift+Home/End jump to its ends, Shift+↑/↓ go line by line — the unshifted keys still reach the shell, and full-screen apps are left alone.
+- **Real terminal** — VTE-compliant emulation ([alacritty_terminal](https://crates.io/crates/alacritty_terminal) + a real PTY). TUIs like `vim`, `top`, and the Claude Code interface just work, including bracketed paste and truecolor. Select with the mouse and Cmd+C to copy out; Cmd+V pastes text in, and image paste into Claude Code works with Ctrl+V (the agent reads your clipboard directly). *(new in 0.1.5)* **Right-click for Copy / Paste / Select All**, and the **wheel scrolls inside full-screen apps** as well as through history. *(new in 0.1.3)* Keyboard scrollback: Shift+PageUp/PageDown page through history, Shift+Home/End jump to its ends, Shift+↑/↓ go line by line — the unshifted keys still reach the shell, and full-screen apps are left alone.
 - **Live file tree** — gitignore-aware, refreshes automatically as agents create and delete files. Right-click any entry for New File/Folder, Reveal in Finder, Open in Default App, Copy (Relative) Path, Duplicate, Rename, and Move to Trash.
 - **File change tracking & rollback** *(new in 0.1.1)* — **File ▸ Show Changes Panel** adds a live **Changes (N)** list under each folder showing every file the agent has modified/added/deleted since the baseline, updated automatically within ~1 s of a write. Click a row for a syntax-highlighted diff; right-click ▸ **Discard Changes…** reverts one file, the **↺** button (or **Discard All Changes…**) reverts everything — always behind a confirmation. Two modes, picked automatically: folders with git compare against the last commit; folders **without git get invisible shadow snapshots** (stored in the app's data dir — your folder stays untouched, the agent never sees them). Off by default with zero overhead; toggling on snapshots "now" as the baseline.
 - **Multiple windows & agent teams** *(new in 0.1.1)* — **File ▸ New Window** opens an independent window with its own folders, running in parallel. Define named preset groups (`[[teams]]` in config.toml) and pick one per window to give different windows different agent buttons.
 - **Drag & drop files** — drop any file from Finder onto the window and its (shell-quoted) path is typed into the terminal, so you can attach files to an agent prompt the same way as in a native terminal.
 - **Built-in editor** — syntax highlighting for 40+ languages ([cosmic-text](https://crates.io/crates/cosmic-text) + syntect), edit and Cmd+S save. When an agent edits the open file on disk, it reloads automatically (or asks, if you have unsaved changes).
-- **File viewers** *(upgraded in 0.1.3, fast & async in 0.1.4)* — images (png/jpg/gif/webp/bmp/tiff), Markdown rendered with headings, code blocks, inline pictures **and real tables** (grid lines, shaded header row, wrapped cells), CSV/TSV as an aligned table, and **PDFs shown as actual pages** — with text extraction as the fallback for files that can't be parsed. PDF pages rasterize and images decode on **background worker threads** with the next page prefetched, so scrolling and zooming never stall the UI: you get an instant preview that sharpens the moment the full-quality bitmap lands. Zoom with Cmd+= / Cmd+- / Cmd+0, Ctrl/Cmd+wheel, or the magnifier buttons in the header, and pan in every direction while zoomed in. A **scrollbar** on the right (drag the thumb or click the track) plus PageUp/PageDown, Home/End and ↑/↓ navigate long documents. A header button toggles Markdown/CSV between the rendered view and editable source.
+- **File viewers** *(upgraded in 0.1.3, fast & async in 0.1.4, selectable in 0.1.5)* — images (png/jpg/gif/webp/bmp/tiff), Markdown rendered with headings, code blocks, inline pictures **and real tables** (grid lines, shaded header row, wrapped cells), CSV/TSV as an aligned table, and **PDFs shown as actual pages** — with text extraction as the fallback for files that can't be parsed. PDF pages rasterize and images decode on **background worker threads** with the next page prefetched, so scrolling and zooming never stall the UI: you get an instant preview that sharpens the moment the full-quality bitmap lands. **Select and copy text** anywhere in the viewer — including straight off rendered PDF pages, where a text layer built from the page's own content stream puts the highlight on the glyphs and reads two-column papers one column at a time. Zoom with Cmd+= / Cmd+- / Cmd+0, Ctrl/Cmd+wheel, or the magnifier buttons in the header, and pan in every direction while zoomed in. A **scrollbar** on the right (drag the thumb or click the track) plus PageUp/PageDown, Home/End and ↑/↓ navigate long documents. A header button toggles Markdown/CSV between the rendered view and editable source.
 - **Per-folder sessions** — each workspace keeps its own shell, tree, and open file; switching is instant.
 - **Recent folders** — every folder you add is remembered permanently; reopen from the ⟳ button or **File ▸ Open Recent**, even after removing it from the workbench.
 - **Settings UI** *(new in 0.1.2)* — **File ▸ Settings… (⌘,)** picks the theme (Dark/Light × Classic/Minimal/Vivid), an accent color, the terminal/editor font and size, the interface text size, terminal scrollback (since 0.1.4 applied to already-running terminals too), and whether new windows start with the Changes panel. Every change applies immediately to all open windows — chrome, terminal palette and editor highlighting together — and is saved to config.toml.
@@ -38,7 +38,7 @@ Agentic coding means running several agents in several folders and checking in o
 
 No Rust needed — grab the prebuilt app from the [latest release](https://github.com/Sompote/Tigriden/releases/latest):
 
-1. Download **`Tigriden-0.1.4-macos-universal.app.zip`** (one download for both Apple Silicon and Intel).
+1. Download **`Tigriden-0.1.5-macos-universal.app.zip`** (one download for both Apple Silicon and Intel).
 2. Unzip and drag **Tigriden.app** into **/Applications**.
 3. First launch only: the app isn't notarized, so **right-click → Open → Open**, or run:
 
@@ -46,7 +46,7 @@ No Rust needed — grab the prebuilt app from the [latest release](https://githu
    xattr -d com.apple.quarantine /Applications/Tigriden.app
    ```
 
-Prefer a bare binary? The release also ships `tigriden-0.1.4-macos-arm64.tar.gz` (Apple Silicon) and `tigriden-0.1.4-macos-x86_64.tar.gz` (Intel) — untar and run `./tigriden`.
+Prefer a bare binary? The release also ships `tigriden-0.1.5-macos-arm64.tar.gz` (Apple Silicon) and `tigriden-0.1.5-macos-x86_64.tar.gz` (Intel) — untar and run `./tigriden`.
 
 <details>
 <summary><b>Build from source</b> (stable Rust required)</summary>
@@ -86,9 +86,9 @@ Detection is watcher-driven (no polling): bursts of writes are coalesced for 250
 
 | Context  | Keys |
 |----------|------|
-| Terminal | everything a terminal expects: Ctrl+C/Z/D/R…, arrows, F1–F12, TUIs; drag to select (double-click = word), Cmd+C copies, Cmd+V pastes (bracketed); wheel scrolls history, Shift+PgUp/PgDn pages it, Shift+Home/End jump to the ends, Shift+↑/↓ go line by line |
-| Editor   | typing, arrows / Home / End / PgUp / PgDn (+Shift selects, +Alt jumps words), Cmd+A / C / X / V, Cmd+S saves |
-| Viewer   | wheel scrolls, right-edge scrollbar drags or click-jumps, PgUp/PgDn page, Home/End jump to the ends, ↑/↓ step; on images & PDFs: Cmd+= / Cmd+- zoom, Cmd+0 resets, Ctrl/Cmd+wheel zooms, and a zoomed view pans horizontally |
+| Terminal | everything a terminal expects: Ctrl+C/Z/D/R…, arrows, F1–F12, TUIs; drag to select (double-click = word), Cmd+C copies, Cmd+V pastes (bracketed), **right-click for Copy / Paste / Select All**; wheel scrolls history — and scrolls **inside full-screen apps** (Claude Code, vim, less) too — Shift+PgUp/PgDn pages it, Shift+Home/End jump to the ends, Shift+↑/↓ go line by line |
+| Editor   | typing, arrows / Home / End / PgUp / PgDn (+Shift selects, +Alt jumps words), Cmd+A / C / X / V, Cmd+S saves, right-click for Copy / Paste / Select All |
+| Viewer   | wheel scrolls, right-edge scrollbar drags or click-jumps, PgUp/PgDn page, Home/End jump to the ends, ↑/↓ step; drag to select text — including on PDF pages (double-click = word), Cmd+A selects all, Cmd+C / Cmd+X copy, Esc clears, right-click for the menu; Cmd+C with nothing selected copies a whole PDF; on images & PDFs: Cmd+= / Cmd+- zoom, Cmd+0 resets, Ctrl/Cmd+wheel zooms, and a zoomed view pans horizontally |
 
 ## Configuration
 
@@ -118,6 +118,10 @@ command = "codex"
 label = "gemini"
 command = "gemini"
 
+[[presets]]
+label = "opencode"
+command = "opencode"
+
 # Optional: named preset groups for File ▸ New Window ▸ <team>.
 [[teams]]
 name = "reviewers"
@@ -128,6 +132,8 @@ send_enter = true
 ```
 
 Presets and teams are file-only — the Settings dialog links to config.toml for those. Saving from Settings rewrites the whole file, so comments you add by hand are not preserved.
+
+When a release adds an agent button, a config still holding an older build's stock list picks it up once, recorded as `presets_version`. Add or remove a single preset and the list becomes yours: later releases leave it alone.
 
 Runtime state (restored folders, split position) lives next to it in `state.toml`; shadow snapshots for the Changes panel live in `snapshots/`.
 
@@ -150,10 +156,11 @@ Only the PTY reader threads and the viewer's rasterizer/decoder workers run in t
 
 ### Debug builds
 
-`cargo build --features framedump`, then run with `TIGRIDEN_DUMP=/tmp/frames` to dump both panes as PNGs. `TIGRIDEN_TEST_INPUT='claude\r'`, `TIGRIDEN_TEST_OPEN=path`, `TIGRIDEN_TEST_SETTINGS='style=vivid,font-size-step=2'` and `TIGRIDEN_TEST_CHANGES=1` (reports the Changes panel's tracking mode and contents around a write) script the first session for headless testing.
+`cargo build --features framedump`, then run with `TIGRIDEN_DUMP=/tmp/frames` to dump both panes as PNGs. `TIGRIDEN_TEST_INPUT='claude\r'`, `TIGRIDEN_TEST_OPEN=path`, `TIGRIDEN_TEST_SETTINGS='style=vivid,font-size-step=2'`, `TIGRIDEN_TEST_CHANGES=1` (reports the Changes panel's tracking mode and contents around a write), `TIGRIDEN_TEST_CTXMENU=1` (runs the right-click menu's Copy and Select All against the terminal and reports what reached the clipboard), `TIGRIDEN_TEST_SCROLLBACK=up|down` (wheels the terminal and reports the mode, history size and resulting screen — the way to tell scrollback from alternate-screen scrolling) and `TIGRIDEN_TEST_WHEEL_UI=1` (dispatches a real scroll event through Slint's hit-testing, to prove wheel input still reaches the terminal) script the first session for headless testing.
 
 ## Changelog
 
+- **0.1.5** — copying text, everywhere it was missing. **Select text in the viewer**: drag across Markdown paragraphs, code blocks, CSV tables and the glyphs of rendered PDF pages, double-click for a word, Cmd+A for all, Esc to clear, Cmd+C / Cmd+X to copy. PDF selection builds a real text layer from the same content stream the renderer draws, so highlights sit on the glyphs — on cropped and rotated pages too — and **two-column papers copy one column at a time** instead of zig-zagging across the gutter; Cmd+C with nothing selected still copies the whole document. **Right-click** the terminal, editor or viewer for **Copy / Paste / Select All** — Copy greys out with nothing selected, Paste is hidden on read-only views, and the right-click no longer clears the selection you just made. The **mouse wheel now scrolls inside full-screen apps**: TUIs run on the alternate screen, which keeps no scrollback of its own, so the wheel did nothing at all in Claude Code, vim or less; apps that asked for mouse reporting now get real wheel events at the pointer's cell, and the rest get arrow keys, xterm's alternate-scroll behaviour. Plus an **opencode** preset button, which configs still carrying the stock three take on once.
 - **0.1.4** — viewer performance and polish: PDFs rasterize and images decode on background threads (scrolling and zooming no longer stall the UI), pages prefetch ahead of the scroll, wheel repaints are throttled; a scrollbar on the right of the viewer (draggable thumb, click-to-jump) plus PageUp/PageDown, Home/End and ↑/↓ keys; ⌘ detection for wheel zoom and shortcuts now reads the modifier state straight from the OS; scrollback limit changes apply to already-running terminals.
 - **0.1.3** — viewer zoom for images and PDFs (Cmd+=/-/0, Ctrl/Cmd+wheel, header magnifier buttons, panning), PDFs rendered as actual pages, Markdown tables drawn as real grids, terminal scrollback keys (Shift+PageUp/PageDown/Home/End/↑/↓).
 - **0.1.2** — Settings UI (⌘,): 6 themes, accent colors, fonts and sizes, scrollback, all applied live to every window.

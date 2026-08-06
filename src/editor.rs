@@ -150,6 +150,11 @@ impl EditorState {
         })
     }
 
+    /// Whether a non-empty selection exists (drives the right-click Copy).
+    pub fn has_selection(&self) -> bool {
+        self.editor.copy_selection().is_some_and(|s| !s.is_empty())
+    }
+
     pub fn save(&mut self) -> Result<(), String> {
         if self.read_only {
             return Ok(());
