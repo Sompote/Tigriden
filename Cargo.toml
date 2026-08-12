@@ -1,6 +1,6 @@
 [package]
 name = "tigriden"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Minimal IDE for supervising AI coding agents: per-folder terminals, file trees, and a lightweight editor."
 license = "MIT"

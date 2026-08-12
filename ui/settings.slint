@@ -145,6 +145,7 @@ export component SettingsDialog inherits Rectangle {
     in property <[string]> font-families;
     in property <string> font-family;
     in property <float> font-size;
+    in property <float> term-font-size;
     in property <float> ui-font-size;
     in property <int> scrollback;
     in property <bool> show-changes;
@@ -347,9 +348,10 @@ export component SettingsDialog inherits Rectangle {
                             }
                         }
 
+                        // Editor and viewer.
                         HorizontalLayout {
                             spacing: 8px;
-                            FieldLabel { text: "Text size"; }
+                            FieldLabel { text: "Editor size"; }
                             Chip {
                                 label: "−";
                                 clicked => { root.changed("font-size-step", "-1"); }
@@ -367,6 +369,32 @@ export component SettingsDialog inherits Rectangle {
                             Chip {
                                 label: "+";
                                 clicked => { root.changed("font-size-step", "1"); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+
+                        // Sized on its own: an agent's TUI wants a different
+                        // size from the paper the viewer renders.
+                        HorizontalLayout {
+                            spacing: 8px;
+                            FieldLabel { text: "Terminal size"; }
+                            Chip {
+                                label: "−";
+                                clicked => { root.changed("term-font-size-step", "-1"); }
+                            }
+                            Rectangle {
+                                width: 52px;
+                                Text {
+                                    text: root.term-font-size + " px";
+                                    color: Theme.text;
+                                    font-size: Theme.font-size-small;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: center;
+                                }
+                            }
+                            Chip {
+                                label: "+";
+                                clicked => { root.changed("term-font-size-step", "1"); }
                             }
                             Rectangle { horizontal-stretch: 1; }
                         }

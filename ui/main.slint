@@ -176,6 +176,21 @@ export component MainWindow inherits Window {
     in property <string> banner-primary-label: "";
     in property <string> banner-secondary-label: "";
 
+    // ----- file panel drag & drop -----
+    in property <int> tree-drop-row: -1;
+    in property <bool> tree-drop-active: false;
+    out property <length> tree-list-top: sidebar.list-top;
+    out property <length> tree-list-height: sidebar.list-height;
+    out property <length> tree-list-left: sidebar.list-left;
+    out property <length> tree-list-width: sidebar.list-width;
+    out property <length> tree-scroll-y: sidebar.scroll-y;
+    in-out property <length> tree-viewport-y <=> sidebar.viewport-y;
+    out property <bool> tree-focused: sidebar.tree-focused;
+
+    public function focus-tree() {
+        sidebar.grab-focus();
+    }
+
     // ----- settings -----
     in property <bool> settings-visible: false;
     in property <string> settings-mode: "dark";
@@ -187,6 +202,7 @@ export component MainWindow inherits Window {
     in property <[string]> settings-font-families;
     in property <string> settings-font-family: "";
     in property <float> settings-font-size: 13;
+    in property <float> settings-term-font-size: 13;
     in property <float> settings-ui-font-size: 13;
     in property <int> settings-scrollback: 10000;
     in property <bool> settings-show-changes: false;
@@ -204,12 +220,14 @@ export component MainWindow inherits Window {
     callback new-terminal();
     callback close-terminal(int);
     callback menu-save();
+    callback menu-cut();
     callback menu-copy();
     callback menu-paste();
     callback menu-select-all();
     callback menu-close-terminal();
     callback menu-close-session();
     callback tree-context(int, int);
+    callback tree-key(string, bool, bool, bool, bool) -> bool;
     callback name-dialog-accept(string);
     callback name-dialog-cancel();
     callback settings-open();
@@ -309,6 +327,11 @@ export component MainWindow inherits Window {
         Menu {
             title: "Edit";
             MenuItem {
+                title: "Cut";
+                shortcut: @keys(Control + X);
+                activated => { root.menu-cut(); }
+            }
+            MenuItem {
                 title: "Copy";
                 shortcut: @keys(Control + C);
                 activated => { root.menu-copy(); }
@@ -328,10 +351,15 @@ export component MainWindow inherits Window {
     }
 
     HorizontalLayout {
-        Sidebar {
+        sidebar := Sidebar {
             width: 240px;
             rows: root.tree-rows;
             recent-folders: root.recent-folders;
+            drop-row: root.tree-drop-row;
+            drop-active: root.tree-drop-active;
+            tree-key(text, ctrl, alt, meta, shift) => {
+                root.tree-key(text, ctrl, alt, meta, shift)
+            }
             row-clicked(id) => { root.row-clicked(id); }
             row-toggled(id) => { root.row-toggled(id); }
             close-session(s) => { root.close-session(s); }
@@ -631,6 +659,7 @@ export component MainWindow inherits Window {
         font-families: root.settings-font-families;
         font-family: root.settings-font-family;
         font-size: root.settings-font-size;
+        term-font-size: root.settings-term-font-size;
         ui-font-size: root.settings-ui-font-size;
         scrollback: root.settings-scrollback;
         show-changes: root.settings-show-changes;

@@ -2,9 +2,12 @@ mod app;
 mod config;
 mod editor;
 mod git;
+mod mac;
+mod mathlayout;
 mod paint;
 mod session;
 mod term;
+mod tex;
 mod theme;
 mod tree;
 mod viewer;
@@ -107,12 +110,18 @@ fn wire_callbacks(ui: &MainWindow, app_id: u64) {
     ui.on_close_terminal(move |tab| with_app_id(app_id, |app| app.close_terminal(tab as usize)));
     ui.on_split_changed(move || with_app_id(app_id, |app| app.split_changed()));
     ui.on_menu_save(move || with_app_id(app_id, |app| app.save_editor()));
+    ui.on_menu_cut(move || with_app_id(app_id, |app| app.menu_cut()));
     ui.on_menu_copy(move || with_app_id(app_id, |app| app.menu_copy()));
     ui.on_menu_paste(move || with_app_id(app_id, |app| app.menu_paste()));
     ui.on_menu_select_all(move || with_app_id(app_id, |app| app.menu_select_all()));
     ui.on_menu_close_terminal(move || with_app_id(app_id, |app| app.menu_close_terminal()));
     ui.on_menu_close_session(move || with_app_id(app_id, |app| app.menu_close_session()));
     ui.on_tree_context(move |action, id| with_app_id(app_id, |app| app.tree_context(action, id)));
+    ui.on_tree_key(move |text, ctrl, alt, meta, shift| {
+        let mut handled = false;
+        with_app_id(app_id, |app| handled = app.tree_key(&text, mods(ctrl, alt, meta, shift)));
+        handled
+    });
     ui.on_name_dialog_accept(move |name| {
         with_app_id(app_id, |app| app.name_dialog_accept(name.to_string()))
     });

@@ -9,6 +9,7 @@ use alacritty_terminal::index::{Column, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{viewport_to_point, TermMode};
 use cosmic_text::{FontSystem, SwashCache, SyntaxSystem};
+use slint::winit_030::WinitWindowAccessor;
 use slint::{ComponentHandle, Image, ModelRc, SharedString, VecModel};
 
 use crate::config::{self, Config, PersistedState};
@@ -163,6 +164,19 @@ pub fn settings_changed(key: &str, value: &str) {
             Ok(step) => config.font_size += step,
             Err(_) => return,
         },
+        "term-font-size" => match value.parse::<f32>() {
+            Ok(size) => config.term_font_size = size,
+            Err(_) => return,
+        },
+        "term-font-size-step" => match value.parse::<f32>() {
+            // Clamp before the step so a config still following `font_size`
+            // steps from the size actually on screen, not from zero.
+            Ok(step) => {
+                config.sanitize();
+                config.term_font_size += step;
+            }
+            Err(_) => return,
+        },
         "ui-font-size" => match value.parse::<f32>() {
             Ok(size) => config.ui_font_size = size,
             Err(_) => return,
@@ -202,30 +216,6 @@ pub fn reveal_config() {
         .spawn();
 }
 
-/// Raw `+[NSEvent modifierFlags]`: the current hardware modifier state,
-/// readable by the app itself without any TCC permission (unlike the
-/// CGEventSource APIs, which are Input-Monitoring-gated on modern macOS).
-#[cfg(target_os = "macos")]
-fn ns_modifier_flags() -> usize {
-    use std::ffi::c_void;
-    #[link(name = "objc")]
-    extern "C" {
-        fn objc_getClass(name: *const u8) -> *mut c_void;
-        fn sel_registerName(name: *const u8) -> *mut c_void;
-        fn objc_msgSend(receiver: *mut c_void, sel: *mut c_void) -> usize;
-    }
-    // NSEvent lives in AppKit; winit links it anyway, this makes it explicit.
-    #[link(name = "AppKit", kind = "framework")]
-    extern "C" {}
-    unsafe {
-        let cls = objc_getClass(c"NSEvent".as_ptr().cast());
-        if cls.is_null() {
-            return 0;
-        }
-        objc_msgSend(cls, sel_registerName(c"modifierFlags".as_ptr().cast()))
-    }
-}
-
 /// Whether the wheel-zoom modifier (⌘ or Ctrl) is held right now, asked
 /// straight from AppKit. Slint tracks modifiers from key events, but on macOS
 /// the ⌘ flags-changed event does not reliably reach that bookkeeping while
@@ -234,7 +224,7 @@ fn ns_modifier_flags() -> usize {
 fn zoom_modifier_down() -> bool {
     const CMD: usize = 1 << 20; // NSEventModifierFlagCommand
     const CTRL: usize = 1 << 18; // NSEventModifierFlagControl
-    ns_modifier_flags() & (CMD | CTRL) != 0
+    crate::mac::modifier_flags() & (CMD | CTRL) != 0
 }
 
 /// Current (ctrl, alt, meta, shift) held state of the physical keys, straight
@@ -243,7 +233,7 @@ fn zoom_modifier_down() -> bool {
 pub fn native_modifier_state() -> (bool, bool, bool, bool) {
     #[cfg(target_os = "macos")]
     {
-        let raw = ns_modifier_flags();
+        let raw = crate::mac::modifier_flags();
         return (
             raw & (1 << 18) != 0, // NSEventModifierFlagControl
             raw & (1 << 19) != 0, // NSEventModifierFlagOption
@@ -283,6 +273,7 @@ enum Banner {
     DiskChanged,
     ConfirmDiscard(usize, PathBuf, char),
     ConfirmDiscardAll(usize),
+    ConfirmTrash(usize, PathBuf),
 }
 
 /// What the name-input dialog will do with the entered name.
@@ -349,6 +340,16 @@ pub struct App {
     term_mouse_cell: (usize, usize),
     banner: Banner,
     pending_name: Option<NameAction>,
+    /// File-panel selection (session index + path), the target for keyboard
+    /// file commands.
+    selected: Option<(usize, PathBuf)>,
+    /// Paths staged by Cut, moved rather than copied on the next Paste. Copy
+    /// clears it, so a plain Copy/Paste round trip duplicates.
+    cut_paths: Vec<PathBuf>,
+    /// Row an in-flight Finder drag is hovering, and the poll timer that
+    /// tracks the pointer while it is (winit reports no drag coordinates).
+    drop_row: Option<usize>,
+    drop_timer: Option<slint::Timer>,
     fs_timer_armed: bool,
     resize_timer_armed: bool,
     /// Runtime toggle for the git Changes panel; the initial value comes from
@@ -418,6 +419,10 @@ impl App {
             term_mouse_cell: (0, 0),
             banner: Banner::None,
             pending_name: None,
+            selected: None,
+            cut_paths: Vec::new(),
+            drop_row: None,
+            drop_timer: None,
             fs_timer_armed: false,
             resize_timer_armed: false,
             changes_enabled,
@@ -485,6 +490,7 @@ impl App {
         ui.set_settings_font_families(ModelRc::new(VecModel::from(self.font_families())));
         ui.set_settings_font_family(SharedString::from(self.config.font_family.as_str()));
         ui.set_settings_font_size(self.config.font_size);
+        ui.set_settings_term_font_size(self.config.term_font_size);
         ui.set_settings_ui_font_size(self.config.ui_font_size);
         ui.set_settings_scrollback(self.config.scrollback as i32);
         ui.set_settings_show_changes(self.config.show_changes);
@@ -498,8 +504,12 @@ impl App {
     pub fn apply_config(&mut self, config: Config) {
         let theme = theme::by_id(&config.theme);
         let font_family = intern_font(&config.font_family);
-        let text_changed = !std::ptr::eq(font_family, self.font_family)
-            || (config.font_size - self.config.font_size).abs() > f32::EPSILON;
+        let family_changed = !std::ptr::eq(font_family, self.font_family);
+        // The terminal and the editor/viewer size independently, so each side
+        // only rebuilds for the one that actually moved.
+        let term_px_changed =
+            (config.term_font_size - self.config.term_font_size).abs() > f32::EPSILON;
+        let view_px_changed = (config.font_size - self.config.font_size).abs() > f32::EPSILON;
         let theme_changed = !std::ptr::eq(theme, self.theme);
         let scrollback_changed = config.scrollback != self.config.scrollback;
 
@@ -524,10 +534,10 @@ impl App {
             }
         }
 
-        if !text_changed && !theme_changed {
+        if !family_changed && !term_px_changed && !view_px_changed && !theme_changed {
             return;
         }
-        if text_changed {
+        if family_changed || term_px_changed {
             // Cell metrics moved: rebuild on the next render, then re-grid.
             self.term_renderer = None;
         }
@@ -588,7 +598,7 @@ impl App {
     fn ensure_renderer(&mut self) -> (u32, u32) {
         let scale = self.scale();
         if self.term_renderer.is_none() || (self.renderer_scale - scale).abs() > 0.01 {
-            let px = self.config.font_size * scale;
+            let px = self.config.term_font_size * scale;
             self.term_renderer = Some(TermRenderer::new(self.font_family, px, &mut self.font_system));
             self.renderer_scale = scale;
         }
@@ -1023,6 +1033,7 @@ impl App {
     // ----- tree -----
 
     pub fn row_clicked(&mut self, id: i32) {
+        self.select_row(id);
         match self.row_map.get(id as usize).cloned() {
             Some(RowTarget::File(idx, path)) => self.open_file(idx, path),
             Some(RowTarget::Header(idx)) => self.set_active(idx),
@@ -1036,7 +1047,19 @@ impl App {
         }
     }
 
+    /// Marks a row as the file-panel selection and gives the panel keyboard
+    /// focus, so the file commands have something to act on.
+    fn select_row(&mut self, id: i32) {
+        let Some((idx, path, _)) = self.row_target(id) else { return };
+        self.selected = Some((idx, path));
+        if let Some(ui) = self.ui() {
+            ui.invoke_focus_tree();
+        }
+        self.rebuild_tree();
+    }
+
     pub fn row_toggled(&mut self, id: i32) {
+        self.select_row(id);
         match self.row_map.get(id as usize).cloned() {
             Some(RowTarget::Header(idx)) => {
                 self.sessions[idx].tree_visible = !self.sessions[idx].tree_visible;
@@ -1064,6 +1087,10 @@ impl App {
     fn rebuild_tree(&mut self) {
         let Some(ui) = self.ui() else { return };
         let changes_enabled = self.changes_enabled;
+        let selected = self.selected.clone();
+        let is_selected = |i: usize, path: &Path| {
+            selected.as_ref().is_some_and(|(s, p)| *s == i && p == path)
+        };
         let mut rows: Vec<TreeRow> = Vec::new();
         self.row_map.clear();
         for (i, session) in self.sessions.iter_mut().enumerate() {
@@ -1075,6 +1102,7 @@ impl App {
                 session: i as i32,
                 row_id: self.row_map.len() as i32,
                 active: i == self.active,
+                selected: is_selected(i, &session.root),
             });
             self.row_map.push(RowTarget::Header(i));
             if !session.tree_visible {
@@ -1089,10 +1117,12 @@ impl App {
                     session: i as i32,
                     row_id: self.row_map.len() as i32,
                     active: false,
+                    selected: false,
                 });
                 self.row_map.push(RowTarget::ChangesHeader(i));
                 if session.changes_visible {
                     for change in &session.changes {
+                        let abs = change.abs(&session.root);
                         rows.push(TreeRow {
                             kind: 4,
                             indent: 2,
@@ -1101,6 +1131,7 @@ impl App {
                             session: i as i32,
                             row_id: self.row_map.len() as i32,
                             active: false,
+                            selected: is_selected(i, &abs),
                         });
                         self.row_map.push(RowTarget::Change(
                             i,
@@ -1119,6 +1150,7 @@ impl App {
                     session: i as i32,
                     row_id: self.row_map.len() as i32,
                     active: false,
+                    selected: is_selected(i, &flat.path),
                 });
                 self.row_map.push(if flat.kind == 1 {
                     RowTarget::Dir(i, flat.path)
@@ -1602,7 +1634,7 @@ impl App {
                 .map(|v| v.zoomable())
                 .map_or("none".to_string(), |z| format!("zoomable={z}"));
             #[cfg(target_os = "macos")]
-            let raw = ns_modifier_flags();
+            let raw = crate::mac::modifier_flags();
             #[cfg(not(target_os = "macos"))]
             let raw = 0usize;
             eprintln!(
@@ -2092,20 +2124,154 @@ impl App {
 
     pub fn file_drop_hover(&mut self, hovering: bool) {
         if hovering && !self.sessions.is_empty() {
+            self.track_drop_pointer();
             if let Some(ui) = self.ui() {
-                ui.set_term_overlay(SharedString::from("release to insert the file path"));
+                ui.set_term_overlay(SharedString::from(
+                    "release over the file panel to copy, over the terminal to insert the path",
+                ));
             }
         } else {
+            self.finish_drop();
             self.update_chrome();
         }
     }
 
-    /// Types the dropped file's (escaped) path into the active terminal, the
-    /// way native terminals do — agents receive it as an attached-file path.
+    /// Polls the pointer while a Finder drag is in flight. winit reports the
+    /// dragged paths but no coordinates and no motion events, so the only way
+    /// to know where the drop lands is to ask AppKit where the mouse is.
+    fn track_drop_pointer(&mut self) {
+        self.update_drop_row();
+        if self.drop_timer.is_some() {
+            return;
+        }
+        let app_id = self.id;
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(40),
+            move || with_app_id(app_id, |app| app.update_drop_row()),
+        );
+        self.drop_timer = Some(timer);
+    }
+
+    /// Stops the highlight but keeps the resolved target for a moment: a
+    /// multi-file drop arrives as one `DroppedFile` event per file, and AppKit
+    /// may report the drag as exited just before delivering them, so clearing
+    /// the target eagerly would scatter the files.
+    fn finish_drop(&mut self) {
+        self.drop_timer = None;
+        if let Some(ui) = self.ui() {
+            ui.set_tree_drop_active(false);
+            ui.set_tree_drop_row(-1);
+        }
+        let app_id = self.id;
+        slint::Timer::single_shot(std::time::Duration::from_millis(200), move || {
+            with_app_id(app_id, |app| app.drop_row = None);
+        });
+    }
+
+    /// Maps the pointer onto a file-panel row and highlights it.
+    fn update_drop_row(&mut self) {
+        let row = self.pointer_row();
+        self.drop_row = row;
+        if let Some(ui) = self.ui() {
+            ui.set_tree_drop_active(self.pointer_in_panel());
+            ui.set_tree_drop_row(row.map(|r| r as i32).unwrap_or(-1));
+        }
+    }
+
+    /// Pointer position in Slint's logical window coordinates, or None when it
+    /// is outside this window.
+    fn pointer_in_window(&self) -> Option<(f32, f32)> {
+        let point = crate::mac::pointer_location()?;
+        let ui = self.ui()?;
+        let window = ui.window();
+        let scale = window.scale_factor();
+        let size = window.size().to_logical(scale);
+        // AppKit's screen space has its origin bottom-left of the primary
+        // display; winit's window position is top-left of the same space.
+        let (origin, screen_height) = window.with_winit_window(|w| {
+            let pos = w.inner_position().ok()?.to_logical::<f64>(scale as f64);
+            // The primary display carries the menu bar and anchors AppKit's
+            // global space; its height is what flips the Y axis.
+            let primary = w.primary_monitor()?;
+            let height = primary.size().height as f64 / primary.scale_factor();
+            Some(((pos.x, pos.y), height))
+        })??;
+        let x = point.x - origin.0;
+        let y = (screen_height - point.y) - origin.1;
+        let inside = x >= 0.0 && y >= 0.0 && x < size.width as f64 && y < size.height as f64;
+        inside.then_some((x as f32, y as f32))
+    }
+
+    fn pointer_in_panel(&self) -> bool {
+        let Some((x, y)) = self.pointer_in_window() else { return false };
+        let Some(ui) = self.ui() else { return false };
+        let left = ui.get_tree_list_left();
+        let top = ui.get_tree_list_top();
+        x >= left
+            && x < left + ui.get_tree_list_width()
+            && y >= top
+            && y < top + ui.get_tree_list_height()
+    }
+
+    /// Hit-tests the pointer against the row list. Rows have fixed heights
+    /// (session headers are 1.2×), so the list's scroll offset plus the row
+    /// kinds is enough to find the row without asking Slint.
+    fn pointer_row(&self) -> Option<usize> {
+        let (x, y) = self.pointer_in_window()?;
+        let ui = self.ui()?;
+        let left = ui.get_tree_list_left();
+        let top = ui.get_tree_list_top();
+        if x < left || x >= left + ui.get_tree_list_width() {
+            return None;
+        }
+        if y < top || y >= top + ui.get_tree_list_height() {
+            return None;
+        }
+        let theme = ui.global::<UiTheme>();
+        let row_height = theme.get_row_height();
+        if row_height <= 0.0 {
+            return None;
+        }
+        let mut offset = top - ui.get_tree_scroll_y();
+        for id in 0..self.row_map.len() {
+            let height = self.row_height(id, row_height);
+            if y >= offset && y < offset + height {
+                return Some(id);
+            }
+            offset += height;
+        }
+        None
+    }
+
+    /// A drop on the file panel copies the file in; anywhere else it keeps the
+    /// old behaviour of typing the (escaped) path into the active terminal,
+    /// the way native terminals do.
     pub fn file_dropped(&mut self, path: PathBuf) {
+        let target = self.drop_row.and_then(|id| self.row_target(id as i32)).or_else(|| {
+            // Dropped on the panel but below the last row: the active
+            // session's root.
+            let session = self.sessions.get(self.active)?;
+            self.pointer_in_panel().then(|| (self.active, session.root.clone(), true))
+        });
+        if let Some((idx, row_path, is_dir)) = target {
+            let dir = if is_dir {
+                row_path
+            } else {
+                row_path.parent().map(Path::to_path_buf).unwrap_or(row_path)
+            };
+            self.place_file(idx, &path, &dir, false);
+            self.finish_drop();
+            self.refresh_dir(idx, &dir);
+            self.update_chrome();
+            return;
+        }
+        self.finish_drop();
         let escaped = Self::shell_escape(&path.display().to_string());
         let Some(handle) = self.sessions.get_mut(self.active).and_then(Session::active_term_mut)
         else {
+            self.update_chrome();
             return;
         };
         let mode = *handle.term.term.lock().mode();
@@ -2265,37 +2431,326 @@ impl App {
                 &shown_name,
                 NameAction::Rename(idx, path),
             ),
-            8 => {
-                // Move to ~/.Trash (session roots are protected: close instead).
-                if self.sessions.get(idx).is_some_and(|s| s.root == path) {
-                    self.close_session(idx);
-                    return;
+            8 => self.confirm_trash(idx, path),
+            11 => self.clip_files(idx, path, true),
+            12 => self.clip_files(idx, path, false),
+            13 => self.paste_files(idx, create_dir),
+            _ => {}
+        }
+    }
+
+    // ----- file manager -----
+
+    /// Asks before trashing; session roots are closed instead, since removing
+    /// the folder a window is watching is never what a Delete meant.
+    fn confirm_trash(&mut self, idx: usize, path: PathBuf) {
+        if self.sessions.get(idx).is_some_and(|s| s.root == path) {
+            self.close_session(idx);
+            return;
+        }
+        self.show_banner(Banner::ConfirmTrash(idx, path));
+    }
+
+    fn trash_path(&mut self, idx: usize, path: PathBuf) {
+        let Some(trash) = dirs::home_dir().map(|h| h.join(".Trash")) else { return };
+        let target = Self::unique_path(&trash.join(path.file_name().unwrap_or_default()));
+        if let Err(err) = Self::move_path(&path, &target) {
+            eprintln!("tigriden: trash failed: {err}");
+            return;
+        }
+        self.forget_path(idx, &path);
+        if self.selected.as_ref().is_some_and(|(_, p)| p.starts_with(&path)) {
+            self.selected = None;
+        }
+        let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        self.refresh_dir(idx, &parent);
+        self.update_chrome();
+    }
+
+    /// Drops any editor/viewer showing `path` (or something inside it) after
+    /// it moved away or vanished.
+    fn forget_path(&mut self, idx: usize, path: &Path) {
+        let Some(session) = self.sessions.get_mut(idx) else { return };
+        if session.editor.as_ref().is_some_and(|e| e.path.starts_with(path)) {
+            session.editor = None;
+        }
+        if session.viewer.as_ref().is_some_and(|v| v.path.starts_with(path)) {
+            session.viewer = None;
+        }
+        if session.editor.is_none() && session.viewer.is_none() {
+            if let Some(ui) = self.ui() {
+                ui.set_editor_frame(Image::default());
+            }
+        }
+    }
+
+    /// `rename` across filesystems fails with EXDEV; fall back to copy+delete
+    /// so moving onto another volume (or into ~/.Trash) still works.
+    fn move_path(from: &Path, to: &Path) -> std::io::Result<()> {
+        match std::fs::rename(from, to) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                Self::copy_recursive(from, to)?;
+                if from.is_dir() {
+                    std::fs::remove_dir_all(from)
+                } else {
+                    std::fs::remove_file(from)
                 }
-                let Some(trash) = dirs::home_dir().map(|h| h.join(".Trash")) else { return };
-                let target = Self::unique_path(&trash.join(path.file_name().unwrap_or_default()));
-                if let Err(err) = std::fs::rename(&path, &target) {
-                    eprintln!("tigriden: trash failed: {err}");
-                    return;
+            }
+        }
+    }
+
+    /// Puts `path` on the system pasteboard as a file, so Finder and other
+    /// apps can paste it; `cut` also stages it for a move on our own Paste.
+    fn clip_files(&mut self, idx: usize, path: PathBuf, cut: bool) {
+        let is_root = self.sessions.get(idx).is_some_and(|s| s.root == path);
+        crate::mac::write_files(std::slice::from_ref(&path));
+        // Cutting a session root would move the folder out from under the
+        // window; copy is still fine.
+        self.cut_paths = if cut && !is_root { vec![path] } else { Vec::new() };
+    }
+
+    /// Pastes whatever files the system pasteboard holds into `dir`. Paths
+    /// staged by Cut move; everything else copies, so pasting a Finder copy
+    /// leaves the original alone.
+    fn paste_files(&mut self, idx: usize, dir: PathBuf) {
+        let sources = crate::mac::read_files();
+        if sources.is_empty() {
+            return;
+        }
+        let cut: Vec<PathBuf> = std::mem::take(&mut self.cut_paths);
+        let mut moved_from: Vec<PathBuf> = Vec::new();
+        for source in &sources {
+            let moving = cut.iter().any(|p| p == source);
+            self.place_file(idx, source, &dir, moving);
+            if moving {
+                if let Some(parent) = source.parent() {
+                    moved_from.push(parent.to_path_buf());
                 }
-                if let Some(session) = self.sessions.get_mut(idx) {
-                    if session.editor.as_ref().is_some_and(|e| e.path.starts_with(&path)) {
-                        session.editor = None;
+            }
+        }
+        for parent in moved_from {
+            self.refresh_dir(idx, &parent);
+        }
+        self.refresh_dir(idx, &dir);
+        self.update_chrome();
+    }
+
+    /// Where `source` lands inside `dir`, or None when the move makes no
+    /// sense: a folder dropped into itself (or into its own subtree) would
+    /// recurse forever, and dropping something back where it already is is a
+    /// no-op rather than a self-duplicate.
+    fn drop_target_path(source: &Path, dir: &Path) -> Option<PathBuf> {
+        let name = source.file_name()?;
+        let target = dir.join(name);
+        if source == target || dir.starts_with(source) {
+            return None;
+        }
+        Some(Self::unique_path(&target))
+    }
+
+    /// Copies (or moves) one path into `dir`, never overwriting: a clashing
+    /// name gets the same " 2", " 3", … suffix duplicate uses.
+    fn place_file(&mut self, idx: usize, source: &Path, dir: &Path, moving: bool) {
+        let Some(target) = Self::drop_target_path(source, dir) else { return };
+        let result = if moving {
+            Self::move_path(source, &target)
+        } else {
+            Self::copy_recursive(source, &target)
+        };
+        match result {
+            Ok(()) => {
+                if moving {
+                    self.forget_path(idx, source);
+                }
+                self.selected = Some((idx, target));
+            }
+            Err(err) => eprintln!("tigriden: paste failed: {err}"),
+        }
+    }
+
+    /// Row index of the current selection, so the arrow keys can walk the
+    /// flattened tree the way the rows are drawn.
+    fn selected_row_id(&self) -> Option<i32> {
+        let (idx, path) = self.selected.as_ref()?;
+        (0..self.row_map.len() as i32)
+            .find(|id| self.row_target(*id).is_some_and(|(i, p, _)| i == *idx && p == *path))
+    }
+
+    fn select_by_id(&mut self, id: i32) {
+        if let Some((idx, path, _)) = self.row_target(id) {
+            self.selected = Some((idx, path));
+            self.rebuild_tree();
+            self.scroll_row_into_view(id);
+        }
+    }
+
+    /// Height of one row, mirroring the delegate: session headers are 1.2×.
+    fn row_height(&self, id: usize, base: f32) -> f32 {
+        if matches!(self.row_map.get(id), Some(RowTarget::Header(_))) {
+            base * 1.2
+        } else {
+            base
+        }
+    }
+
+    /// Nudges the list so a keyboard-selected row stays on screen; the
+    /// ListView has no scroll-to-item, but its viewport offset is bindable.
+    fn scroll_row_into_view(&mut self, id: i32) {
+        let Some(ui) = self.ui() else { return };
+        let id = id as usize;
+        if id >= self.row_map.len() {
+            return;
+        }
+        let base = ui.global::<UiTheme>().get_row_height();
+        let top: f32 = (0..id).map(|i| self.row_height(i, base)).sum();
+        let height = self.row_height(id, base);
+        let view = ui.get_tree_list_height();
+        let mut offset = -ui.get_tree_viewport_y();
+        if top < offset {
+            offset = top;
+        } else if top + height > offset + view {
+            offset = top + height - view;
+        } else {
+            return;
+        }
+        ui.set_tree_viewport_y(-offset.max(0.0));
+    }
+
+    pub fn tree_focused(&self) -> bool {
+        self.ui().map(|ui| ui.get_tree_focused()).unwrap_or(false)
+    }
+
+    /// Keyboard commands for the file panel. Returns whether the key was
+    /// consumed; ⌘C/⌘X/⌘V arrive through the menu bar instead, since its
+    /// shortcuts win over focus-scope keys.
+    pub fn tree_key(&mut self, text: &str, mods: Mods) -> bool {
+        let Some(ch) = text.chars().next() else { return false };
+        let selected = self.selected_row_id();
+        match ch {
+            keys::K_UP | keys::K_DOWN => {
+                let last = self.row_map.len() as i32 - 1;
+                if last < 0 {
+                    return true;
+                }
+                let next = match selected {
+                    Some(id) if ch == keys::K_UP => (id - 1).max(0),
+                    Some(id) => (id + 1).min(last),
+                    None if ch == keys::K_UP => last,
+                    None => 0,
+                };
+                self.select_by_id(next);
+                true
+            }
+            keys::K_RIGHT => {
+                match selected.and_then(|id| self.row_map.get(id as usize).cloned()) {
+                    Some(RowTarget::Dir(idx, path)) if !self.sessions[idx].tree.is_expanded(&path) => {
+                        self.sessions[idx].tree.toggle(&path);
+                        self.rebuild_tree();
                     }
-                    if session.viewer.as_ref().is_some_and(|v| v.path.starts_with(&path)) {
-                        session.viewer = None;
+                    Some(RowTarget::Header(idx)) if !self.sessions[idx].tree_visible => {
+                        self.sessions[idx].tree_visible = true;
+                        self.rebuild_tree();
                     }
-                    if session.editor.is_none() && session.viewer.is_none() {
-                        if let Some(ui) = self.ui() {
-                            ui.set_editor_frame(Image::default());
+                    _ => {
+                        if let Some(id) = selected {
+                            let last = self.row_map.len() as i32 - 1;
+                            self.select_by_id((id + 1).min(last));
                         }
                     }
                 }
-                let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
-                self.refresh_dir(idx, &parent);
-                self.update_chrome();
+                true
             }
-            _ => {}
+            keys::K_LEFT => {
+                match selected.and_then(|id| self.row_map.get(id as usize).cloned()) {
+                    Some(RowTarget::Dir(idx, path)) if self.sessions[idx].tree.is_expanded(&path) => {
+                        self.sessions[idx].tree.toggle(&path);
+                        self.rebuild_tree();
+                    }
+                    Some(RowTarget::Header(idx)) if self.sessions[idx].tree_visible => {
+                        self.sessions[idx].tree_visible = false;
+                        self.rebuild_tree();
+                    }
+                    // Otherwise jump to the enclosing folder, Finder-style.
+                    Some(_) => {
+                        if let Some((idx, path)) = self.selected.clone() {
+                            if let Some(parent) = path.parent() {
+                                self.selected = Some((idx, parent.to_path_buf()));
+                                self.rebuild_tree();
+                            }
+                        }
+                    }
+                    None => {}
+                }
+                true
+            }
+            // Delete and Backspace both mean "move to Trash" here; ⌘⌫ is the
+            // macOS spelling of the same thing.
+            '\u{0008}' | '\u{007f}' => {
+                if let Some((idx, path, _)) = selected.and_then(|id| self.row_target(id)) {
+                    self.confirm_trash(idx, path);
+                }
+                true
+            }
+            '\u{000a}' | '\u{000d}' => {
+                if let Some(id) = selected {
+                    self.row_clicked(id);
+                }
+                true
+            }
+            // F2: rename, the shortcut every file tree uses.
+            '\u{F705}' => {
+                if let Some(id) = selected {
+                    self.tree_context(7, id);
+                }
+                true
+            }
+            'd' | 'D' if mods.meta => {
+                if let Some(id) = selected {
+                    self.tree_context(6, id);
+                }
+                true
+            }
+            'r' | 'R' if mods.meta => {
+                if let Some(id) = selected {
+                    self.tree_context(7, id);
+                }
+                true
+            }
+            _ => false,
         }
+    }
+
+    /// Target for a file command: the selected row, falling back to the
+    /// active session's root so Paste works with nothing selected.
+    fn command_target(&self) -> Option<(usize, PathBuf, bool)> {
+        if let Some(id) = self.selected_row_id() {
+            return self.row_target(id);
+        }
+        let session = self.sessions.get(self.active)?;
+        Some((self.active, session.root.clone(), true))
+    }
+
+    pub fn tree_cut(&mut self) {
+        if let Some((idx, path, _)) = self.command_target() {
+            self.clip_files(idx, path, true);
+        }
+    }
+
+    pub fn tree_copy(&mut self) {
+        if let Some((idx, path, _)) = self.command_target() {
+            self.clip_files(idx, path, false);
+        }
+    }
+
+    pub fn tree_paste(&mut self) {
+        let Some((idx, path, is_dir)) = self.command_target() else { return };
+        let dir = if is_dir {
+            path
+        } else {
+            path.parent().map(Path::to_path_buf).unwrap_or(path)
+        };
+        self.paste_files(idx, dir);
     }
 
     pub fn name_dialog_accept(&mut self, name: String) {
@@ -2358,8 +2813,16 @@ impl App {
         self.ui().map(|ui| ui.get_editor_focused()).unwrap_or(false)
     }
 
+    pub fn menu_cut(&mut self) {
+        if self.tree_focused() {
+            self.tree_cut();
+        }
+    }
+
     pub fn menu_copy(&mut self) {
-        if self.editor_focused() {
+        if self.tree_focused() {
+            self.tree_copy();
+        } else if self.editor_focused() {
             self.editor_key("c", Mods { ctrl: false, alt: false, meta: true, shift: false });
         } else {
             self.term_shortcut("c");
@@ -2367,7 +2830,9 @@ impl App {
     }
 
     pub fn menu_paste(&mut self) {
-        if self.editor_focused() {
+        if self.tree_focused() {
+            self.tree_paste();
+        } else if self.editor_focused() {
             self.editor_key("v", Mods { ctrl: false, alt: false, meta: true, shift: false });
         } else {
             self.term_shortcut("v");
@@ -2425,6 +2890,14 @@ impl App {
                     "Discard All",
                     "Cancel",
                 )
+            }
+            Banner::ConfirmTrash(idx, path) => {
+                let name = self
+                    .sessions
+                    .get(*idx)
+                    .map(|s| s.relative_name(path))
+                    .unwrap_or_else(|| path.display().to_string());
+                (format!("Move {name} to the Trash?"), "Move to Trash", "Cancel")
             }
             Banner::None => (String::new(), "", ""),
         };
@@ -2496,6 +2969,7 @@ impl App {
                     });
                 });
             }
+            Banner::ConfirmTrash(idx, path) => self.trash_path(idx, path),
             Banner::None => {}
         }
         self.show_banner(Banner::None);
@@ -2521,7 +2995,9 @@ impl App {
                         std::fs::metadata(&editor.path).and_then(|m| m.modified()).ok();
                 }
             }
-            Banner::ConfirmDiscard(..) | Banner::ConfirmDiscardAll(..) => {} // Cancel
+            Banner::ConfirmDiscard(..)
+            | Banner::ConfirmDiscardAll(..)
+            | Banner::ConfirmTrash(..) => {} // Cancel
             Banner::None => {}
         }
         self.show_banner(Banner::None);
@@ -2559,7 +3035,9 @@ impl App {
                         ));
                         ui.set_editor_dirty(false);
                         ui.set_editor_view_toggle(SharedString::from(match viewer_state.kind {
-                            viewer::ViewKind::Markdown | viewer::ViewKind::Csv => "Source",
+                            viewer::ViewKind::Markdown
+                            | viewer::ViewKind::Csv
+                            | viewer::ViewKind::Tex => "Source",
                             viewer::ViewKind::Image | viewer::ViewKind::Pdf => "",
                         }));
                     }
@@ -2576,7 +3054,8 @@ impl App {
                         ui.set_editor_dirty(editor.dirty);
                         ui.set_editor_view_toggle(SharedString::from(
                             match viewer::classify(&editor.path) {
-                                Some(viewer::ViewKind::Markdown) => "Rendered",
+                                Some(viewer::ViewKind::Markdown)
+                                | Some(viewer::ViewKind::Tex) => "Rendered",
                                 Some(viewer::ViewKind::Csv) => "Table",
                                 _ => "",
                             },
@@ -2639,5 +3118,70 @@ impl App {
             }
         }
         self.sessions.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::App;
+    use std::path::{Path, PathBuf};
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tigriden-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn drop_target_refuses_folder_into_itself() {
+        let root = scratch("self-drop");
+        let folder = root.join("src");
+        std::fs::create_dir_all(folder.join("term")).unwrap();
+        // Into itself, and into its own subtree.
+        assert!(App::drop_target_path(&folder, &folder).is_none());
+        assert!(App::drop_target_path(&folder, &folder.join("term")).is_none());
+        // Back into the folder it already lives in: a no-op, not a copy.
+        assert!(App::drop_target_path(&folder, &root).is_none());
+        // Into a sibling is fine.
+        let sibling = root.join("vendor");
+        std::fs::create_dir_all(&sibling).unwrap();
+        assert_eq!(App::drop_target_path(&folder, &sibling), Some(sibling.join("src")));
+    }
+
+    #[test]
+    fn drop_target_sidesteps_a_name_clash() {
+        let root = scratch("clash");
+        let source = root.join("notes.md");
+        std::fs::write(&source, "x").unwrap();
+        let into = root.join("docs");
+        std::fs::create_dir_all(&into).unwrap();
+        assert_eq!(App::drop_target_path(&source, &into), Some(into.join("notes.md")));
+        std::fs::write(into.join("notes.md"), "y").unwrap();
+        assert_eq!(App::drop_target_path(&source, &into), Some(into.join("notes 2.md")));
+    }
+
+    #[test]
+    fn move_path_relocates_a_whole_tree() {
+        let root = scratch("move");
+        let from = root.join("a");
+        std::fs::create_dir_all(from.join("nested")).unwrap();
+        std::fs::write(from.join("nested/file.txt"), "hello").unwrap();
+        let to = root.join("b");
+        App::move_path(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(std::fs::read_to_string(to.join("nested/file.txt")).unwrap(), "hello");
+    }
+
+    #[test]
+    fn copy_recursive_leaves_the_original_in_place() {
+        let root = scratch("copy");
+        let from = root.join("a");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("file.txt"), "hello").unwrap();
+        let to = root.join("b");
+        App::copy_recursive(&from, &to).unwrap();
+        assert!(Path::new(&from.join("file.txt")).exists());
+        assert_eq!(std::fs::read_to_string(to.join("file.txt")).unwrap(), "hello");
     }
 }

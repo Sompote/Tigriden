@@ -31,8 +31,13 @@ pub struct Config {
     /// Accent override as "#rrggbb"; empty means the theme's own accent.
     pub accent: String,
     pub font_family: String,
-    /// Terminal / editor text size, in logical pixels.
+    /// Editor / viewer text size, in logical pixels.
     pub font_size: f32,
+    /// Terminal text size, in logical pixels. `0` means "follow `font_size`",
+    /// which is what a config written before the two were split says — so an
+    /// upgrade keeps the terminal exactly as it was until the user moves it.
+    #[serde(default)]
+    pub term_font_size: f32,
     /// Chrome text size (sidebar, tabs, dialogs), in logical pixels.
     pub ui_font_size: f32,
     pub scrollback: usize,
@@ -82,6 +87,10 @@ impl Config {
             self.font_family = "Menlo".into();
         }
         self.font_size = self.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        if self.term_font_size <= 0.0 {
+            self.term_font_size = self.font_size;
+        }
+        self.term_font_size = self.term_font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
         self.ui_font_size = self.ui_font_size.clamp(MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE);
         self.scrollback = self.scrollback.clamp(200, 500_000);
     }
@@ -117,6 +126,7 @@ impl Default for Config {
             accent: String::new(),
             font_family: "Menlo".into(),
             font_size: 13.0,
+            term_font_size: 13.0,
             ui_font_size: 13.0,
             scrollback: 10_000,
             show_changes: false,
@@ -176,6 +186,36 @@ mod tests {
 
     fn labels(config: &Config) -> Vec<String> {
         config.presets.iter().map(|p| p.label.clone()).collect()
+    }
+
+    /// A config written before the terminal got its own size carries only
+    /// `font_size`; the terminal has to keep the size it had rather than snap
+    /// back to the built-in default.
+    #[test]
+    fn an_old_config_keeps_one_size_for_both() {
+        let mut config: Config = toml::from_str(
+            "theme = \"classic-dark\"\nfont_family = \"Menlo\"\nfont_size = 17.0\n",
+        )
+        .expect("an old config still parses");
+        config.sanitize();
+        assert_eq!(config.term_font_size, 17.0, "the terminal inherits the one size on file");
+        assert_eq!(config.font_size, 17.0);
+    }
+
+    /// Once the two are set apart they stay apart, each clamped on its own.
+    #[test]
+    fn the_two_sizes_are_independent() {
+        let mut config: Config = toml::from_str(
+            "font_size = 15.0\nterm_font_size = 11.0\n",
+        )
+        .expect("both sizes parse");
+        config.sanitize();
+        assert_eq!((config.font_size, config.term_font_size), (15.0, 11.0));
+
+        config.term_font_size = MAX_FONT_SIZE + 40.0;
+        config.sanitize();
+        assert_eq!(config.term_font_size, MAX_FONT_SIZE, "clamped, not reset to the editor size");
+        assert_eq!(config.font_size, 15.0, "the editor size is untouched");
     }
 
     #[test]

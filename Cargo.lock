@@ -5568,7 +5568,7 @@ dependencies = [
 
 [[package]]
 name = "tigriden"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "alacritty_terminal",
  "arboard",

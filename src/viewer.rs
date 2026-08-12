@@ -3,13 +3,14 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use cosmic_text::{Attrs, Buffer, Color, Cursor, Family, FontSystem, Metrics, Shaping, Style, SwashCache, Weight, Wrap};
+use cosmic_text::{Align, Attrs, Buffer, Color, Cursor, Family, FontSystem, Metrics, Shaping, Style, SwashCache, Weight, Wrap};
 use image::RgbaImage;
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use slint::{Rgba8Pixel, SharedPixelBuffer};
 
 use hayro::vello_cpu::kurbo;
 
+use crate::mathlayout::{self, MathBox, MathItem};
 use crate::paint::Canvas;
 use crate::term::colors;
 use crate::theme::ThemeDef;
@@ -20,6 +21,7 @@ pub enum ViewKind {
     Markdown,
     Csv,
     Pdf,
+    Tex,
 }
 
 /// Zoom bounds for images and PDF pages (factor over the fit-to-width size).
@@ -28,9 +30,29 @@ const MAX_ZOOM: f32 = 8.0;
 /// Rasterization caps: a zoomed rescale must never allocate unbounded pixels.
 const MAX_DRAW_W: f32 = 4096.0;
 const MAX_DRAW_H: f32 = 16384.0;
+/// Colors for the paper sheet a LaTeX document is painted on, chosen to match
+/// how this same viewer shows a real PDF page.
+const PAPER_BG: [u8; 3] = [255, 255, 255];
+const PAPER_INK: [u8; 3] = [26, 26, 29];
+const PAPER_MUTED: [u8; 3] = [92, 92, 100];
+const PAPER_LINK: [u8; 3] = [24, 78, 158];
+const PAPER_RULE: [u8; 3] = [188, 188, 194];
+const PAPER_CODE_BG: [u8; 3] = [243, 243, 240];
+
 /// Scrollbar (physical px): track width and minimum thumb height.
 const SCROLLBAR_W: f32 = 12.0;
 const SCROLLBAR_MIN_THUMB: f32 = 32.0;
+
+/// The width a figure draws at: an explicit `width=…\linewidth` fills that
+/// fraction of the column, otherwise the image keeps its natural size, capped
+/// to the column.
+fn picture_target_w(size: (f32, f32), fill: Option<f32>, text_w: f32, zoom: f32) -> f32 {
+    let base = match fill {
+        Some(f) => text_w * f,
+        None => size.0.min(text_w),
+    };
+    base * zoom
+}
 
 /// Clamps a target draw width so the resulting bitmap stays within the caps,
 /// preserving the w:h aspect ratio.
@@ -44,15 +66,43 @@ fn fit_draw(w: f32, h: f32, target_w: f32) -> (f32, f32) {
     (dw, dh)
 }
 
+/// Splits a display formula from a trailing `\tag{…}`. Markdown has no
+/// `equation` environment, so `$$…\tag{1}$$` is how a numbered equation is
+/// written; pulling the tag out lets it be set flush right exactly as the
+/// LaTeX view numbers `\begin{equation}`.
+fn split_math_tag(body: &str) -> (String, Option<String>) {
+    let Some(at) = body.rfind("\\tag") else { return (body.to_string(), None) };
+    let rest = body[at + 4..].trim_start();
+    let Some(inner) = rest.strip_prefix('{').and_then(|r| r.find('}').map(|e| &r[..e])) else {
+        return (body.to_string(), None);
+    };
+    let number = inner.trim();
+    if number.is_empty() {
+        return (body.to_string(), None);
+    }
+    (body[..at].to_string(), Some(format!("({number})")))
+}
+
 enum Block {
     Text { buffer: Buffer, indent: f32, bg: Option<[u8; 3]>, height: f32 },
     /// An image; `size` is the original dimensions (layout comes from the
     /// header alone) and `scaled` the latest bitmap from the image worker —
     /// empty until the first one arrives.
-    Picture { scaled: RgbaImage, size: (f32, f32), height: f32 },
+    Picture {
+        scaled: RgbaImage,
+        size: (f32, f32),
+        /// Requested width as a fraction of the column, from
+        /// \includegraphics[width=…]; None means natural size.
+        fill: Option<f32>,
+        height: f32,
+    },
     /// One PDF page, rasterized lazily when it scrolls into view.
     Page { index: usize, size: (f32, f32), height: f32 },
     Rule,
+    /// A display equation laid out as boxes, with the number TeX would print
+    /// at the right margin. `text` is never drawn: it holds the flattened
+    /// form so Cmd+A / Cmd+C still capture the equation.
+    Math { bx: MathBox, number: Option<MathBox>, text: Buffer, height: f32 },
     Table {
         /// rows -> cells; the first row is the header.
         rows: Vec<Vec<Buffer>>,
@@ -113,6 +163,9 @@ pub struct ViewerState {
     /// Extracted text of a page-rendered PDF, filled lazily on first copy
     /// (the page bitmaps carry no selectable glyphs).
     pdf_text: Option<String>,
+    /// Set for LaTeX documents, which are painted on a white sheet with dark
+    /// ink the way a PDF of the same source would look.
+    paper: bool,
     margin: f32,
     spacing: f32,
     font_px: f32,
@@ -505,6 +558,7 @@ impl ViewerState {
             sel_head: None,
             selecting: false,
             pdf_text: None,
+            paper: false,
             margin: (font_px * 1.2).round(),
             spacing: (font_px * 0.5).round(),
             font_px,
@@ -517,6 +571,7 @@ impl ViewerState {
             ViewKind::Markdown => viewer.build_markdown(font_system, path)?,
             ViewKind::Csv => viewer.build_csv(font_system, path)?,
             ViewKind::Pdf => viewer.build_pdf(font_system, path, notify.clone())?,
+            ViewKind::Tex => viewer.build_tex(font_system, path)?,
         }
         if !viewer.img_paths.is_empty() {
             viewer.img_worker = Some(spawn_img_worker(std::mem::take(&mut viewer.img_paths), notify));
@@ -526,6 +581,9 @@ impl ViewerState {
     }
 
     fn fg(&self) -> [u8; 3] {
+        if self.paper {
+            return PAPER_INK;
+        }
         colors::base_palette(self.theme)[7]
     }
 
@@ -536,30 +594,6 @@ impl ViewerState {
 
     fn text_width(&self) -> f32 {
         (self.width_px - 2.0 * self.margin).max(48.0)
-    }
-
-    fn push_spans(
-        &mut self,
-        font_system: &mut FontSystem,
-        spans: &[(String, Attrs<'static>)],
-        base_px: f32,
-        indent: f32,
-        bg: Option<[u8; 3]>,
-    ) {
-        if spans.iter().all(|(t, _)| t.trim().is_empty()) {
-            return;
-        }
-        let mut buffer =
-            Buffer::new(font_system, Metrics::new(base_px, (base_px * 1.45).round()));
-        buffer.set_wrap(Wrap::WordOrGlyph);
-        let default = ui_attrs().color(self.text_color());
-        buffer.set_rich_text(
-            spans.iter().map(|(t, a)| (t.as_str(), a.clone())),
-            &default,
-            Shaping::Advanced,
-            None,
-        );
-        self.blocks.push(Block::Text { buffer, indent, bg, height: 0.0 });
     }
 
     fn push_plain(&mut self, font_system: &mut FontSystem, text: &str, attrs: Attrs<'static>, wrap: Wrap) {
@@ -608,12 +642,13 @@ impl ViewerState {
 
     /// Registers an image block from its header dimensions alone; the worker
     /// decodes the pixels later, off the UI thread.
-    fn push_image_file(&mut self, path: &Path) -> bool {
+    fn push_image_file(&mut self, path: &Path, fill: Option<f32>) -> bool {
         match image::image_dimensions(path) {
             Ok((w, h)) => {
                 self.blocks.push(Block::Picture {
                     scaled: RgbaImage::new(0, 0),
                     size: (w as f32, h as f32),
+                    fill,
                     height: 0.0,
                 });
                 self.img_paths.push((self.blocks.len() - 1, path.to_path_buf()));
@@ -624,7 +659,7 @@ impl ViewerState {
     }
 
     fn build_image(&mut self, path: &Path) -> Result<(), String> {
-        if !self.push_image_file(path) {
+        if !self.push_image_file(path, None) {
             return Err(format!("cannot decode image {}", path.display()));
         }
         Ok(())
@@ -731,8 +766,16 @@ impl ViewerState {
         let source = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        let accent = self.accent;
-        let code_bg = self.theme.ui.panel_hover;
+
+        // The same sheet the LaTeX view paints on: a Markdown paper should
+        // read the way its .tex twin does, white page and all.
+        self.paper = true;
+        self.margin = (self.font_px * 2.8).round();
+        self.spacing = (self.font_px * 0.62).round();
+
+        let accent = PAPER_LINK;
+        let code_bg = PAPER_CODE_BG;
+        let serif = mathlayout::serif_family(font_system);
 
         let mut spans: Vec<(String, Attrs<'static>)> = Vec::new();
         let mut bold = 0usize;
@@ -740,6 +783,7 @@ impl ViewerState {
         let mut link = 0usize;
         let mut heading: Option<f32> = None;
         let mut in_code_block = false;
+        let mut code_math = false;
         let mut code_text = String::new();
         let mut list_stack: Vec<Option<u64>> = Vec::new();
         let mut quote_depth = 0usize;
@@ -748,18 +792,22 @@ impl ViewerState {
         let mut table_row: Vec<Vec<(String, Attrs<'static>)>> = Vec::new();
 
         macro_rules! flush {
-            ($self:ident, $spans:ident, $heading:ident, $list_stack:ident, $quote_depth:ident) => {{
+            ($self:ident, $spans:ident, $heading:ident, $list_stack:ident, $quote_depth:ident) => {
+                flush!($self, $spans, $heading, $list_stack, $quote_depth, None)
+            };
+            ($self:ident, $spans:ident, $heading:ident, $list_stack:ident, $quote_depth:ident,
+             $align:expr) => {{
                 let base = $heading.unwrap_or($self.font_px);
                 let indent = ($list_stack.len() as f32 * 1.5 + $quote_depth as f32 * 1.5)
                     * $self.font_px;
                 let taken = std::mem::take(&mut $spans);
-                $self.push_spans(font_system, &taken, base, indent, None);
+                $self.push_aligned(font_system, &taken, base, indent, $align);
             }};
         }
 
         let fg = self.text_color();
         let attrs_for = |bold: usize, italic: usize, link: usize, code: bool, fam: &'static str| {
-            let mut attrs = if code { mono(fam) } else { ui_attrs() };
+            let mut attrs = if code { mono(fam) } else { Attrs::new().family(serif) };
             attrs = attrs.color(fg);
             if bold > 0 {
                 attrs = attrs.weight(Weight::BOLD);
@@ -773,7 +821,16 @@ impl ViewerState {
             attrs
         };
 
-        let parser = Parser::new_ext(&source, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH);
+        // ENABLE_MATH hands us `$…$` / `$$…$$` bodies verbatim. Without it the
+        // CommonMark parser gets there first and eats `\{` as an escape and
+        // `a_i…b_j` as emphasis, so the formula never survives to be typeset.
+        let parser = Parser::new_ext(
+            &source,
+            Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_MATH,
+        );
+        // Math is set in the same serif face the LaTeX view uses, so a formula
+        // reads the same whichever file it came from.
+        let math_family = mathlayout::serif_family(font_system);
         for event in parser {
             match event {
                 Event::Start(Tag::Heading { level, .. }) => {
@@ -793,7 +850,13 @@ impl ViewerState {
                     bold = bold.saturating_sub(1);
                 }
                 Event::Start(Tag::Paragraph) => {}
-                Event::End(TagEnd::Paragraph) => flush!(self, spans, heading, list_stack, quote_depth),
+                Event::End(TagEnd::Paragraph) => {
+                    // Justified columns are what make the page read as typeset;
+                    // list and quote bodies stay ragged, as LaTeX sets them.
+                    let align =
+                        (list_stack.is_empty() && quote_depth == 0).then_some(Align::Justified);
+                    flush!(self, spans, heading, list_stack, quote_depth, align);
+                }
                 Event::Start(Tag::Strong) => bold += 1,
                 Event::End(TagEnd::Strong) => bold = bold.saturating_sub(1),
                 Event::Start(Tag::Emphasis) => italic += 1,
@@ -860,20 +923,26 @@ impl ViewerState {
                 }
                 Event::Start(Tag::TableCell) => spans.clear(),
                 Event::End(TagEnd::TableCell) => table_row.push(std::mem::take(&mut spans)),
-                Event::Start(Tag::CodeBlock(_)) => {
+                Event::Start(Tag::CodeBlock(kind)) => {
                     flush!(self, spans, heading, list_stack, quote_depth);
                     in_code_block = true;
+                    // ```math is GitHub's spelling of a display equation.
+                    code_math = matches!(&kind, CodeBlockKind::Fenced(lang)
+                        if lang.trim().eq_ignore_ascii_case("math"));
                     code_text.clear();
                 }
                 Event::End(TagEnd::CodeBlock) => {
                     in_code_block = false;
                     let attrs = mono(self.font_family).color(fg);
                     let text = code_text.trim_end().to_string();
-                    if !text.is_empty() {
-                        let mut buffer = Buffer::new(
-                            font_system,
-                            Metrics::new(self.font_px, (self.font_px * 1.45).round()),
-                        );
+                    if code_math {
+                        let (body, number) = split_math_tag(&text);
+                        let node = crate::tex::parse_math(&body);
+                        self.push_math(font_system, &node, number.as_deref());
+                    } else if !text.is_empty() {
+                        let px = (self.font_px * 0.92).round();
+                        let mut buffer =
+                            Buffer::new(font_system, Metrics::new(px, (px * 1.4).round()));
                         buffer.set_wrap(Wrap::WordOrGlyph);
                         buffer.set_text(&text, &attrs, Shaping::Advanced, None);
                         self.blocks.push(Block::Text {
@@ -889,7 +958,7 @@ impl ViewerState {
                     let url = dest_url.to_string();
                     if !url.starts_with("http") {
                         let img_path = base_dir.join(&url);
-                        if !self.push_image_file(&img_path) {
+                        if !self.push_image_file(&img_path, None) {
                             spans.push((
                                 format!("[image: {url}]"),
                                 attrs_for(0, 1, 0, false, self.font_family),
@@ -916,6 +985,39 @@ impl ViewerState {
                 Event::Code(code) => {
                     spans.push((code.to_string(), attrs_for(bold, italic, 0, true, self.font_family)));
                 }
+                // Inline math stays in the line of running text, so it gets the
+                // same Unicode fallback (x², xᵢ, α) the LaTeX view uses inline —
+                // with variables slanted and operators upright.
+                Event::InlineMath(body) => {
+                    let node = crate::tex::parse_math(&body);
+                    for (text, is_var) in crate::tex::math_spans(&node) {
+                        let mut attrs =
+                            attrs_for(bold, italic, 0, false, self.font_family).family(math_family);
+                        if is_var {
+                            attrs = attrs.style(Style::Italic);
+                        }
+                        spans.push((text, attrs));
+                    }
+                }
+                // A display equation becomes its own laid-out block — except
+                // inside a table, where a block would break the grid.
+                Event::DisplayMath(body) => {
+                    let (body, number) = split_math_tag(&body);
+                    let node = crate::tex::parse_math(&body);
+                    if table.is_some() {
+                        for (text, is_var) in crate::tex::math_spans(&node) {
+                            let mut attrs = attrs_for(bold, italic, 0, false, self.font_family)
+                                .family(math_family);
+                            if is_var {
+                                attrs = attrs.style(Style::Italic);
+                            }
+                            spans.push((text, attrs));
+                        }
+                    } else {
+                        flush!(self, spans, heading, list_stack, quote_depth);
+                        self.push_math(font_system, &node, number.as_deref());
+                    }
+                }
                 Event::SoftBreak => spans.push((" ".into(), attrs_for(0, 0, 0, false, self.font_family))),
                 Event::HardBreak => spans.push(("\n".into(), attrs_for(0, 0, 0, false, self.font_family))),
                 Event::Rule => {
@@ -928,6 +1030,260 @@ impl ViewerState {
         flush!(self, spans, heading, list_stack, quote_depth);
         if self.blocks.is_empty() {
             let attrs = ui_attrs().color(fg);
+            self.push_plain(font_system, "(empty file)", attrs, Wrap::WordOrGlyph);
+        }
+        Ok(())
+    }
+
+    /// Lays out a display equation as boxes — fraction bars, radicals,
+    /// stretched delimiters and all. Shared by the LaTeX and Markdown views so
+    /// the same formula renders identically whichever file it came from.
+    fn push_math(
+        &mut self,
+        font_system: &mut FontSystem,
+        node: &crate::tex::MathNode,
+        number: Option<&str>,
+    ) {
+        let ink = self.text_color();
+        let px = self.font_px;
+        let bx = mathlayout::layout(font_system, node, px * 1.06, ink).into_top_left();
+        let num = number
+            .map(|n| mathlayout::layout_number(font_system, n, px, ink).into_top_left());
+        // Hidden copy of the formula so Cmd+A still picks it up.
+        let attrs = Attrs::new().family(mathlayout::serif_family(font_system)).color(ink);
+        let mut text = Buffer::new(font_system, Metrics::new(px, (px * 1.4).round()));
+        text.set_text(&crate::tex::math_text(node), &attrs, Shaping::Advanced, None);
+        let height = bx.height().max(num.as_ref().map_or(0.0, MathBox::height));
+        self.blocks.push(Block::Math { bx, number: num, text, height });
+    }
+
+    /// Pushes a paragraph-like block with an explicit alignment.
+    fn push_aligned(
+        &mut self,
+        font_system: &mut FontSystem,
+        spans: &[(String, Attrs<'static>)],
+        base_px: f32,
+        indent: f32,
+        align: Option<Align>,
+    ) {
+        if spans.iter().all(|(t, _)| t.trim().is_empty()) {
+            return;
+        }
+        let mut buffer = Buffer::new(font_system, Metrics::new(base_px, (base_px * 1.5).round()));
+        buffer.set_wrap(Wrap::WordOrGlyph);
+        let default = Attrs::new()
+            .family(mathlayout::serif_family(font_system))
+            .color(self.text_color());
+        buffer.set_rich_text(
+            spans.iter().map(|(t, a)| (t.as_str(), a.clone())),
+            &default,
+            Shaping::Advanced,
+            None,
+        );
+        if align.is_some() {
+            for line in buffer.lines.iter_mut() {
+                line.set_align(align);
+            }
+        }
+        self.blocks.push(Block::Text { buffer, indent, bg: None, height: 0.0 });
+    }
+
+    /// Adds a figure. Bitmaps go through the image worker as usual; a vector
+    /// PDF is rasterized once here, since the worker only decodes rasters.
+    fn push_figure(&mut self, path: &Path, fill: Option<f32>) -> bool {
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
+            // One generous rasterization, scaled down to whatever width the
+            // column ends up being.
+            const FIGURE_W: u32 = 1600;
+            let Some((img, _)) = rasterize_pdf_figure(path, FIGURE_W) else {
+                return false;
+            };
+            // Measure from the raster, not the PDF's point size: papers set
+            // vector figures at \linewidth, and we have the pixels for it.
+            let size = (img.width() as f32, img.height() as f32);
+            self.blocks.push(Block::Picture { scaled: img, size, fill, height: 0.0 });
+            return true;
+        }
+        self.push_image_file(path, fill)
+    }
+
+    /// Formats a LaTeX source file. The tex module parses it into blocks and
+    /// display equations; this sets them on a white sheet in serif type with
+    /// justified columns, so the result reads like the PDF the same source
+    /// would compile to.
+    fn build_tex(&mut self, font_system: &mut FontSystem, path: &Path) -> Result<(), String> {
+        let source = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+
+        // Paper, with the generous margins a page has.
+        self.paper = true;
+        self.margin = (self.font_px * 2.8).round();
+        self.spacing = (self.font_px * 0.62).round();
+
+        let ink = Color::rgb(PAPER_INK[0], PAPER_INK[1], PAPER_INK[2]);
+        let muted = Color::rgb(PAPER_MUTED[0], PAPER_MUTED[1], PAPER_MUTED[2]);
+        let link = Color::rgb(PAPER_LINK[0], PAPER_LINK[1], PAPER_LINK[2]);
+        let fam = self.font_family;
+        let serif = Attrs::new().family(mathlayout::serif_family(font_system));
+
+        let attrs_serif = serif.clone();
+        let to_attrs = move |s: &crate::tex::Span| -> Attrs<'static> {
+            let mut attrs = if s.mono { mono(fam) } else { attrs_serif.clone() };
+            attrs = attrs.color(if s.link { link } else { ink });
+            if s.bold {
+                attrs = attrs.weight(Weight::BOLD);
+            }
+            if s.italic {
+                attrs = attrs.style(Style::Italic);
+            }
+            attrs
+        };
+        let to_spans = |spans: &[crate::tex::Span]| -> Vec<(String, Attrs<'static>)> {
+            spans.iter().map(|s| (s.text.clone(), to_attrs(s))).collect()
+        };
+
+        let body_px = self.font_px;
+        for block in crate::tex::parse(&source) {
+            match block {
+                crate::tex::TexBlock::Heading { level, spans } => {
+                    let styled: Vec<(String, Attrs<'static>)> = spans
+                        .iter()
+                        .map(|s| {
+                            let mut b = s.clone();
+                            b.bold = true;
+                            (b.text.clone(), to_attrs(&b))
+                        })
+                        .collect();
+                    // A \maketitle title is centered; sections are flush left.
+                    let (scale, align) = match level {
+                        0 => (1.85, Some(Align::Center)),
+                        1 => (1.42, None),
+                        2 => (1.2, None),
+                        3 => (1.06, None),
+                        _ => (1.0, None),
+                    };
+                    self.push_aligned(
+                        font_system,
+                        &styled,
+                        (body_px * scale).round(),
+                        0.0,
+                        align,
+                    );
+                }
+                crate::tex::TexBlock::Paragraph(spans) => {
+                    let styled = to_spans(&spans);
+                    // Justified columns are the strongest visual cue that
+                    // this is a typeset document rather than a text dump.
+                    self.push_aligned(
+                        font_system,
+                        &styled,
+                        body_px,
+                        0.0,
+                        Some(Align::Justified),
+                    );
+                }
+                crate::tex::TexBlock::Code(text) => {
+                    let attrs = mono(fam).color(ink);
+                    let px = (body_px * 0.92).round();
+                    let mut buffer =
+                        Buffer::new(font_system, Metrics::new(px, (px * 1.4).round()));
+                    buffer.set_wrap(Wrap::WordOrGlyph);
+                    buffer.set_text(&text, &attrs, Shaping::Advanced, None);
+                    self.blocks.push(Block::Text {
+                        buffer,
+                        indent: 0.0,
+                        bg: Some(PAPER_CODE_BG),
+                        height: 0.0,
+                    });
+                }
+                crate::tex::TexBlock::Math { node, number } => {
+                    self.push_math(font_system, &node, number.as_deref());
+                }
+                crate::tex::TexBlock::ListItem { indent, marker, spans } => {
+                    let mut styled = Vec::with_capacity(spans.len() + 1);
+                    if !marker.is_empty() {
+                        styled.push((marker, serif.clone().color(ink)));
+                    }
+                    styled.extend(to_spans(&spans));
+                    let pad = indent as f32 * 1.6 * body_px;
+                    self.push_aligned(font_system, &styled, body_px, pad, None);
+                }
+                crate::tex::TexBlock::Table(rows) => {
+                    let cells: Vec<Vec<Vec<(String, Attrs<'static>)>>> = rows
+                        .iter()
+                        .enumerate()
+                        .map(|(r, row)| {
+                            row.iter()
+                                .map(|cell| {
+                                    cell.iter()
+                                        .map(|s| {
+                                            // First row bolded as the header.
+                                            let mut b = s.clone();
+                                            b.bold |= r == 0;
+                                            (b.text.clone(), to_attrs(&b))
+                                        })
+                                        .collect()
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    self.push_table(font_system, cells);
+                }
+                crate::tex::TexBlock::Image { path: name, width } => {
+                    // \includegraphics usually omits the extension and lets
+                    // the driver pick; try the formats we can decode.
+                    let mut resolved = None;
+                    let direct = base_dir.join(&name);
+                    if direct.is_file() {
+                        resolved = Some(direct);
+                    } else {
+                        for ext in ["pdf", "png", "jpg", "jpeg"] {
+                            let candidate = base_dir.join(format!("{name}.{ext}"));
+                            if candidate.is_file() {
+                                resolved = Some(candidate);
+                                break;
+                            }
+                        }
+                    }
+                    let shown = resolved.is_some_and(|p| self.push_figure(&p, width));
+                    if !shown {
+                        let attrs = serif.clone().color(muted).style(Style::Italic);
+                        let styled = vec![(format!("[figure: {name}]"), attrs)];
+                        self.push_aligned(
+                            font_system,
+                            &styled,
+                            body_px,
+                            0.0,
+                            Some(Align::Center),
+                        );
+                    }
+                }
+                crate::tex::TexBlock::Caption(spans) => {
+                    let styled: Vec<(String, Attrs<'static>)> = spans
+                        .iter()
+                        .map(|s| {
+                            let mut attrs = if s.mono { mono(fam) } else { serif.clone() };
+                            attrs = attrs.color(muted);
+                            if s.bold {
+                                attrs = attrs.weight(Weight::BOLD);
+                            }
+                            (s.text.clone(), attrs)
+                        })
+                        .collect();
+                    self.push_aligned(
+                        font_system,
+                        &styled,
+                        (body_px * 0.92).round(),
+                        body_px,
+                        Some(Align::Center),
+                    );
+                }
+                crate::tex::TexBlock::Rule => self.blocks.push(Block::Rule),
+            }
+        }
+        if self.blocks.is_empty() {
+            let attrs = serif.color(ink);
             self.push_plain(font_system, "(empty file)", attrs, Wrap::WordOrGlyph);
         }
         Ok(())
@@ -951,8 +1307,9 @@ impl ViewerState {
                     *height = h + if bg.is_some() { self.font_px } else { 0.0 };
                     total += *height + self.spacing;
                 }
-                Block::Picture { size, height, .. } => {
-                    let (draw_w, draw_h) = fit_draw(size.0, size.1, size.0.min(text_w) * zoom);
+                Block::Picture { size, fill, height, .. } => {
+                    let (draw_w, draw_h) =
+                        fit_draw(size.0, size.1, picture_target_w(*size, *fill, text_w, zoom));
                     *height = draw_h;
                     max_w = max_w.max(draw_w);
                     total += draw_h + self.spacing;
@@ -964,6 +1321,12 @@ impl ViewerState {
                     total += draw_h + self.spacing;
                 }
                 Block::Rule => total += self.font_px + self.spacing,
+                // Equations are laid out once, at build time: their size does
+                // not depend on the column width.
+                Block::Math { bx, height, .. } => {
+                    max_w = max_w.max(bx.width);
+                    total += *height + self.spacing;
+                }
                 Block::Table { rows, font_px, col_widths, row_heights, height } => {
                     let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
                     if ncols == 0 {
@@ -1165,6 +1528,7 @@ impl ViewerState {
             Block::Text { height, .. }
             | Block::Picture { height, .. }
             | Block::Page { height, .. }
+            | Block::Math { height, .. }
             | Block::Table { height, .. } => *height + self.spacing,
         }
     }
@@ -1350,7 +1714,7 @@ impl ViewerState {
         let mut first = None;
         let mut last = None;
         for (i, block) in self.blocks.iter().enumerate() {
-            if let Block::Text { buffer, .. } = block {
+            if let Block::Text { buffer, .. } | Block::Math { text: buffer, .. } = block {
                 if first.is_none() {
                     first = Some((i, Cursor::new(0, 0)));
                 }
@@ -1377,7 +1741,9 @@ impl ViewerState {
         let ((sb, sc), (eb, ec)) = self.sel_range()?;
         let mut parts: Vec<String> = Vec::new();
         for (i, block) in self.blocks.iter().enumerate().take(eb + 1).skip(sb) {
-            let Block::Text { buffer, .. } = block else { continue };
+            let (Block::Text { buffer, .. } | Block::Math { text: buffer, .. }) = block else {
+                continue;
+            };
             let start = if i == sb { sc } else { Cursor::new(0, 0) };
             let end = if i == eb { ec } else { Cursor::new(usize::MAX, usize::MAX) };
             let last_line = buffer.lines.len().saturating_sub(1);
@@ -1490,6 +1856,7 @@ impl ViewerState {
             let advance = match block {
                 Block::Text { height, .. }
                 | Block::Picture { height, .. }
+                | Block::Math { height, .. }
                 | Block::Table { height, .. } => *height,
                 Block::Rule => self.font_px,
                 Block::Page { index, size, height } => {
@@ -1559,14 +1926,17 @@ impl ViewerState {
         let mut y = self.margin - self.scroll;
         for (idx, block) in self.blocks.iter_mut().enumerate() {
             let advance = match block {
-                Block::Text { height, .. } | Block::Table { height, .. } => *height,
+                Block::Text { height, .. }
+                | Block::Table { height, .. }
+                | Block::Math { height, .. } => *height,
                 Block::Rule => self.font_px,
                 Block::Page { height, .. } => *height,
-                Block::Picture { scaled, size, height } => {
+                Block::Picture { scaled, size, fill, height } => {
                     if let Some(img) = done.remove(&idx) {
                         *scaled = img;
                     }
-                    let (dw, dh) = fit_draw(size.0, size.1, size.0.min(text_w) * zoom);
+                    let (dw, dh) =
+                        fit_draw(size.0, size.1, picture_target_w(*size, *fill, text_w, zoom));
                     let want = (dw as u32, dh as u32);
                     let visible = y + *height >= 0.0 && y <= view_h;
                     if visible
@@ -1597,6 +1967,20 @@ impl ViewerState {
         let (w, h) = (frame.width() as i32, frame.height() as i32);
         let mut canvas = Canvas { pixels: frame.make_mut_slice(), width: w, height: h };
         canvas.fill(bg);
+        if self.paper {
+            // One continuous sheet: the document sits on paper, with a gutter
+            // of app background either side so it reads as a page.
+            let gutter = (self.margin * 0.35).round();
+            let top = (-self.scroll).min(0.0).max(-1.0);
+            let sheet_h = (self.content_h - self.scroll).min(h as f32) - top;
+            canvas.fill_rect(
+                gutter as i32,
+                top as i32,
+                (w as f32 - 2.0 * gutter) as i32,
+                sheet_h.max(0.0) as i32,
+                PAPER_BG,
+            );
+        }
 
         let mut y = self.margin - self.scroll;
         let margin = self.margin;
@@ -1653,10 +2037,18 @@ impl ViewerState {
                     }
                     y += *height + self.spacing;
                 }
-                Block::Picture { scaled, size, height } => {
+                Block::Picture { scaled, size, fill, height } => {
                     if y + *height >= 0.0 && y <= h as f32 {
-                        let x0 = (margin - scroll_x) as i32;
-                        let draw_w = fit_draw(size.0, size.1, size.0.min(text_w) * self.zoom).0 as i32;
+                        let draw_w = fit_draw(
+                            size.0,
+                            size.1,
+                            picture_target_w(*size, *fill, text_w, self.zoom),
+                        )
+                        .0 as i32;
+                        // A float is centered in its column on paper.
+                        let indent =
+                            if self.paper { ((text_w - draw_w as f32) / 2.0).max(0.0) } else { 0.0 };
+                        let x0 = (margin + indent - scroll_x) as i32;
                         if scaled.width() == draw_w as u32 && scaled.height() == *height as u32 {
                             blit_image(&mut canvas, scaled, x0, y as i32);
                         } else if scaled.width() > 0 {
@@ -1718,14 +2110,63 @@ impl ViewerState {
                 }
                 Block::Rule => {
                     let ry = (y + self.font_px / 2.0) as i32;
-                    let dim = colors::base_palette(self.theme)[8];
+                    let dim = if self.paper { PAPER_RULE } else { colors::base_palette(self.theme)[8] };
                     canvas.fill_rect(margin as i32, ry, text_w as i32, 1, dim);
                     y += self.font_px + self.spacing;
                 }
+                Block::Math { bx, number, height, .. } => {
+                    if y + *height >= 0.0 && y <= h as f32 {
+                        // Display equations are centered in the column, with
+                        // the number set flush right like LaTeX does.
+                        let x0 = margin + ((text_w - bx.width) / 2.0).max(0.0);
+                        for item in &mut bx.items {
+                            match item {
+                                MathItem::Run { buffer, x, y: iy } => {
+                                    let (ox, oy) = ((x0 + *x) as i32, (y + *iy) as i32);
+                                    buffer.draw(
+                                        font_system,
+                                        swash_cache,
+                                        default_color,
+                                        |px, py, pw, ph, color| {
+                                            canvas.blend_rect(px + ox, py + oy, pw as i32, ph as i32, color);
+                                        },
+                                    );
+                                }
+                                MathItem::Rule { x, y: iy, w, h: rh } => {
+                                    canvas.fill_rect(
+                                        (x0 + *x) as i32,
+                                        (y + *iy) as i32,
+                                        w.ceil() as i32,
+                                        rh.ceil().max(1.0) as i32,
+                                        fg,
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(num) = number {
+                            let nx = margin + text_w - num.width;
+                            let ny = y + (*height - num.height()) / 2.0;
+                            for item in &mut num.items {
+                                if let MathItem::Run { buffer, x, y: iy } = item {
+                                    let (ox, oy) = ((nx + *x) as i32, (ny + *iy) as i32);
+                                    buffer.draw(
+                                        font_system,
+                                        swash_cache,
+                                        default_color,
+                                        |px, py, pw, ph, color| {
+                                            canvas.blend_rect(px + ox, py + oy, pw as i32, ph as i32, color);
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    y += *height + self.spacing;
+                }
                 Block::Table { rows, font_px, col_widths, row_heights, height } => {
                     if y + *height >= 0.0 && y <= h as f32 && !col_widths.is_empty() {
-                        let dim = colors::base_palette(self.theme)[8];
-                        let head_bg = self.theme.ui.panel_hover;
+                        let dim = if self.paper { PAPER_RULE } else { colors::base_palette(self.theme)[8] };
+                        let head_bg = if self.paper { PAPER_CODE_BG } else { self.theme.ui.panel_hover };
                         let pad_h = (*font_px * 0.5).round();
                         let pad_v = (*font_px * 0.3).round();
                         let table_w = (col_widths.iter().map(|w| w + 2.0 * pad_h).sum::<f32>()
@@ -1901,6 +2342,19 @@ fn extract_page_text<'a>(
 
 /// Renders one PDF page to a bitmap `draw_w` pixels wide. The white opaque
 /// background makes hayro's premultiplied output plain RGBA.
+/// Rasterizes the first page of a PDF used as a figure. LaTeX papers keep
+/// their plots as vector PDFs, which the image crate cannot decode; hayro is
+/// already here for the PDF viewer, so reuse it.
+fn rasterize_pdf_figure(path: &Path, draw_w: u32) -> Option<(RgbaImage, (f32, f32))> {
+    let bytes = std::fs::read(path).ok()?;
+    let pdf = hayro::hayro_syntax::Pdf::new(bytes).ok()?;
+    let pages = pdf.pages();
+    let size = pages.first()?.render_dimensions();
+    let cache = hayro::RenderCache::new();
+    let img = rasterize_page(pages, 0, draw_w, &cache)?;
+    Some((img, size))
+}
+
 fn rasterize_page<'a>(
     pages: &'a [hayro::hayro_syntax::page::Page<'a>],
     index: usize,
@@ -2170,6 +2624,101 @@ mod tests {
     }
 
     #[test]
+    fn tex_renders_formatted_blocks() {
+        let path = std::env::temp_dir().join("tigriden-viewer-tex-test.tex");
+        std::fs::write(
+            &path,
+            "\\documentclass{article}\n\\title{Sample Paper}\n\\author{Ada}\n\\begin{document}\n\\maketitle\n\\section{Intro}\nEnergy is $E = mc^2$ here.\n\\begin{itemize}\n\\item first point\n\\end{itemize}\n\\begin{equation}\n\\alpha + \\beta\n\\end{equation}\n\\end{document}\n",
+        )
+        .unwrap();
+
+        let mut font_system = FontSystem::new();
+        let theme = crate::theme::default_theme();
+        let mut viewer = ViewerState::open(
+            &mut font_system,
+            &path,
+            ViewKind::Tex,
+            "Menlo",
+            13.0,
+            theme,
+            [0, 0, 0],
+            400.0,
+            std::sync::Arc::new(|| {}),
+        )
+        .expect("viewer opens the tex file");
+
+        assert!(viewer.select_all(), "tex view has selectable text");
+        let all = viewer.selected_text().expect("select-all yields text");
+        assert!(all.contains("Sample Paper"), "title from \\maketitle: {all}");
+        assert!(all.contains("1  Intro"), "numbered section heading: {all}");
+        assert!(all.contains("E = mc²"), "inline math as unicode: {all}");
+        assert!(all.contains("first point"), "list item text: {all}");
+        assert!(all.contains("α + β"), "display math as unicode: {all}");
+        // The preamble itself must not leak into the formatted view.
+        assert!(!all.contains("documentclass"), "preamble hidden: {all}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Markdown math has to reach the same box layout the LaTeX view uses:
+    /// display equations become their own `Block::Math`, `\tag{…}` supplies the
+    /// number, and a `$` in a code span stays a dollar sign.
+    #[test]
+    fn markdown_math_is_typeset_like_latex() {
+        let path = std::env::temp_dir().join("tigriden-viewer-mdmath-test.md");
+        std::fs::write(
+            &path,
+            concat!(
+                "# Metrics\n\n",
+                "The overlap of $b$ and $b^{gt}$ is:\n\n",
+                r"$$\mathrm{IoU}(b, b^{gt}) = \frac{|b \cap b^{gt}|}{|b \cup b^{gt}|} \tag{1}$$",
+                "\n\n",
+                "Run `echo $PATH` to check, and it costs $5 today.\n\n",
+                "```math\n",
+                r"\alpha + \beta",
+                "\n```\n",
+            ),
+        )
+        .unwrap();
+
+        let mut font_system = FontSystem::new();
+        let theme = crate::theme::default_theme();
+        let mut viewer = ViewerState::open(
+            &mut font_system,
+            &path,
+            ViewKind::Markdown,
+            "Menlo",
+            13.0,
+            theme,
+            [0, 0, 0],
+            400.0,
+            std::sync::Arc::new(|| {}),
+        )
+        .expect("viewer opens the markdown");
+
+        let math: Vec<&Block> =
+            viewer.blocks.iter().filter(|b| matches!(b, Block::Math { .. })).collect();
+        assert_eq!(math.len(), 2, "both $$…$$ and ```math become laid-out blocks");
+        // \tag{1} is set flush right as the equation number, not left in the body.
+        let Block::Math { number, .. } = math[0] else { unreachable!() };
+        assert!(number.is_some(), "\\tag{{1}} becomes the equation number");
+
+        assert!(viewer.select_all(), "markdown view has selectable text");
+        let all = viewer.selected_text().expect("select-all yields text");
+        assert!(all.contains("IoU"), "the formula is selectable: {all}");
+        assert!(!all.contains("\\frac"), "the formula is typeset, not dumped: {all}");
+        assert!(!all.contains("\\tag"), "the tag is consumed, not printed: {all}");
+        // A dollar inside a code span, and a lone dollar, are money not math.
+        assert!(all.contains("echo $PATH"), "code span keeps its dollar: {all}");
+        assert!(all.contains("costs $5 today"), "a lone dollar stays literal: {all}");
+        assert!(all.contains("α + β"), "```math block is typeset: {all}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+
+
+    #[test]
     fn markdown_selection_copies_text() {
         let path = std::env::temp_dir().join("tigriden-viewer-sel-test.md");
         std::fs::write(
@@ -2212,7 +2761,10 @@ mod tests {
         let dragged = viewer.selected_text().expect("dragged selection yields text");
         assert!(dragged.contains("Second paragraph here."));
 
-        // Double-click selects the word under the pointer.
+        // Double-click selects the word under the pointer. The drag above ran
+        // off the bottom of the viewport, which scrolled the page, so come back
+        // to the top first — otherwise the click lands on the last paragraph.
+        viewer.scroll = 0.0;
         assert!(viewer.handle_mouse(3, viewer.margin + 2.0, viewer.margin + 2.0, 300.0));
         assert_eq!(viewer.selected_text().as_deref(), Some("Title"));
 
@@ -2356,6 +2908,7 @@ pub fn classify(path: &Path) -> Option<ViewKind> {
         "md" | "markdown" => Some(ViewKind::Markdown),
         "csv" | "tsv" => Some(ViewKind::Csv),
         "pdf" => Some(ViewKind::Pdf),
+        "tex" | "latex" | "ltx" => Some(ViewKind::Tex),
         _ => None,
     }
 }

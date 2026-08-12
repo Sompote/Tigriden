@@ -10,26 +10,52 @@ export struct TreeRow {
     session: int,
     row-id: int,
     active: bool,
+    selected: bool,
 }
 
 component TreeRowDelegate inherits Rectangle {
     in property <TreeRow> data;
+    // Row an external (Finder) drag is currently hovering, -1 when none.
+    in property <int> drop-row: -1;
+    in property <bool> panel-focused: false;
     callback clicked();
     callback toggled();
     callback closed();
     callback context(int);
 
+    property <bool> drop-target: root.drop-row == data.row-id;
+
     height: data.kind == 0 ? Theme.row-height * 1.2 : Theme.row-height;
-    background: touch.has-hover ? Theme.panel-hover
-        : (data.kind == 0 && data.active ? Theme.selection : transparent);
+    background: root.drop-target ? Theme.selection
+        : (data.selected ? Theme.selection
+        : (touch.has-hover ? Theme.panel-hover
+        : (data.kind == 0 && data.active ? Theme.selection : transparent)));
+    // A ring rather than a fill, so the row underneath stays readable while
+    // the drag is in flight.
+    border-width: root.drop-target ? 1px : 0px;
+    border-color: Theme.accent;
+    border-radius: root.drop-target || data.selected ? 3px : 0px;
+
+    // Focused selection gets the accent bar; unfocused keeps the fill only,
+    // matching how Finder dims an inactive list.
+    if data.selected && !root.drop-target: Rectangle {
+        x: 0;
+        width: 2px;
+        background: root.panel-focused ? Theme.accent : Theme.text-dim;
+    }
 
     // action codes: 0 new file, 1 new folder, 2 reveal, 3 open default,
     // 4 copy path, 5 copy relative path, 6 duplicate, 7 rename, 8 trash,
-    // 9 discard changes (changes-panel rows only), 10 discard all (changes header)
+    // 9 discard changes (changes-panel rows only), 10 discard all (changes
+    // header), 11 cut, 12 copy file, 13 paste, 14 new folder from selection
     ctx-menu := ContextMenuArea {
         Menu {
             MenuItem { title: "New File…"; activated => { root.context(0); } }
             MenuItem { title: "New Folder…"; activated => { root.context(1); } }
+            MenuSeparator { }
+            MenuItem { title: "Cut"; activated => { root.context(11); } }
+            MenuItem { title: "Copy"; activated => { root.context(12); } }
+            MenuItem { title: "Paste"; activated => { root.context(13); } }
             MenuSeparator { }
             MenuItem { title: "Reveal in Finder"; activated => { root.context(2); } }
             MenuItem { title: "Open in Default App"; activated => { root.context(3); } }
@@ -123,6 +149,12 @@ component TreeRowDelegate inherits Rectangle {
 export component Sidebar inherits Rectangle {
     in property <[TreeRow]> rows;
     in property <[string]> recent-folders;
+    // Row an external drag is hovering (-1 none); Rust hit-tests it from the
+    // geometry this component publishes below.
+    in property <int> drop-row: -1;
+    // Set while a Finder drag is over the window, so the panel can advertise
+    // itself as a drop destination.
+    in property <bool> drop-active: false;
     callback row-clicked(int);
     callback row-toggled(int);
     callback close-session(int);
@@ -130,6 +162,23 @@ export component Sidebar inherits Rectangle {
     callback add-folder();
     callback recent-clicked(int);
     callback recent-forget(int);
+    callback tree-key(string, bool, bool, bool, bool) -> bool;
+
+    // Window-space geometry of the row list, so Rust can turn a pointer
+    // position into a row during an external drag (winit's drop events carry
+    // no coordinates, and Slint cannot hit-test on demand).
+    out property <length> list-top: list.absolute-position.y;
+    out property <length> list-height: list.height;
+    out property <length> list-left: list.absolute-position.x;
+    out property <length> list-width: list.width;
+    // Two-way so Rust can scroll a keyboard-selected row back into view.
+    in-out property <length> viewport-y <=> list.viewport-y;
+    out property <length> scroll-y: -root.viewport-y;
+    out property <bool> tree-focused: fs.has-focus;
+
+    public function grab-focus() {
+        fs.focus();
+    }
 
     background: Theme.panel;
 
@@ -149,14 +198,38 @@ export component Sidebar inherits Rectangle {
             }
         }
 
-        ListView {
+        fs := FocusScope {
             vertical-stretch: 1;
-            for row in root.rows: TreeRowDelegate {
-                data: row;
-                clicked => { root.row-clicked(row.row-id); }
-                toggled => { root.row-toggled(row.row-id); }
-                closed => { root.close-session(row.session); }
-                context(action) => { root.row-context(action, row.row-id); }
+
+            key-pressed(event) => {
+                if (root.tree-key(event.text, event.modifiers.control, event.modifiers.alt, event.modifiers.meta, event.modifiers.shift)) {
+                    accept
+                } else {
+                    reject
+                }
+            }
+
+            list := ListView {
+                width: 100%;
+                height: 100%;
+                for row in root.rows: TreeRowDelegate {
+                    data: row;
+                    drop-row: root.drop-row;
+                    panel-focused: fs.has-focus;
+                    clicked => { root.row-clicked(row.row-id); }
+                    toggled => { root.row-toggled(row.row-id); }
+                    closed => { root.close-session(row.session); }
+                    context(action) => { root.row-context(action, row.row-id); }
+                }
+            }
+
+            // Whole-panel affordance: dropping outside any row lands in the
+            // active session's root.
+            if root.drop-active: Rectangle {
+                background: transparent;
+                border-width: 1px;
+                border-color: Theme.accent;
+                border-radius: 4px;
             }
         }
 
