@@ -1,38 +1,51 @@
-# Tigriden — Terminal for Agentic Coding
+# Tigriden — Read Your Papers, Let an Agent Revise Them
 
 ![Version](https://img.shields.io/badge/version-0.1.7-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 
-**A tiny desktop IDE built for one job: supervising AI coding agents.**
+**A tiny desktop workbench for researchers and engineers: your `.tex` shown as the page it compiles to, your PDFs and figures next to it, and an AI agent doing the revising — in one window.**
 
-Run `claude`, `codex`, `gemini` — any terminal agent — each in its own folder, side by side. Every workspace gets an embedded terminal, a live file panel you can actually manage files in, and a lightweight code editor so you can watch and steer what your agents build. No run/debug tooling, no chat panel, no LSP: the agents do the heavy lifting, Tigriden gives you eyes and hands.
+Point it at a manuscript folder, click **claude** (or `codex`, `gemini`, any terminal agent), and ask for the revision you want. The agent edits the files; the panel lists every file it touched and reverts any of them with one click; the viewer shows the result **typeset** — two-column IEEE, single-column arXiv, equations, tables and figures — **without running LaTeX at all**.
 
-Written in pure Rust. **~10 MB binary, ~40 MB RAM.**
+Written in pure Rust. No Electron, no webview, no TeX installation. **~10 MB binary, ~40 MB RAM**, and a paper opens the moment you click it.
 
 ![Tigriden supervising an agent: the viewer shows a chart the agent produced while the agent CLI runs in one of three terminal tabs below](assets/screenshot.png)
 
-*Above: a real session — the agent's workspace file tree on the left, the built-in viewer inspecting a chart the agent just generated, and the agent CLI running in one of three terminal tabs below.*
+*Above: a real session — the workspace file tree on the left, the built-in viewer inspecting a figure the agent just generated, and the agent CLI running in one of three terminal tabs below.*
 
 ## Why
 
-Agentic coding means running several agents in several folders and checking in on them. A full IDE is overkill for that; a bare terminal multiplexer gives you no file browser and no editor. Tigriden is the minimal middle: **one session per folder — agent, files, editor, and change tracking together.**
+Revising a paper with an agent normally means three apps: a terminal for the agent, Overleaf or a PDF viewer to see what the text actually looks like, and Finder to move figures around. And every look at the page costs a full LaTeX compile.
 
-## Features
+Tigriden collapses that into one window per project: **agent, files, and a typeset view of the document together.** The `.tex` view is a real page — the paper size, margins and column grid your `\documentclass` asks for — rendered by a built-in typesetter, so it appears instantly and works on a machine with no TeX distribution installed. Compile when you are ready to submit, not to read a paragraph.
 
-- **One-click agents** — preset buttons type the agent command into the terminal for you (fully configurable).
-- **Multiple terminals per folder** — the `+` tab spawns extra shells in the same workspace, so one agent can run while you use a second terminal for git, tests, or another agent.
-- **Real terminal** — VTE-compliant emulation ([alacritty_terminal](https://crates.io/crates/alacritty_terminal) + a real PTY). TUIs like `vim`, `top`, and the Claude Code interface just work, including bracketed paste and truecolor. Select with the mouse and Cmd+C to copy out; Cmd+V pastes text in, and image paste into Claude Code works with Ctrl+V (the agent reads your clipboard directly). *(new in 0.1.5)* **Right-click for Copy / Paste / Select All**, and the **wheel scrolls inside full-screen apps** as well as through history. *(new in 0.1.3)* Keyboard scrollback: Shift+PageUp/PageDown page through history, Shift+Home/End jump to its ends, Shift+↑/↓ go line by line — the unshifted keys still reach the shell, and full-screen apps are left alone.
-- **File panel, not just a tree** *(new in 0.1.6)* — gitignore-aware and refreshes automatically as agents create and delete files, and it manages those files too. **Drag files in from Finder** and they are copied into the folder you drop them on (highlighted as you hover; drop below the last row to land in the workspace root). **Cut / Copy / Paste** are the real system pasteboard, so files move both ways between Tigriden and Finder — Cut then Paste moves, Copy then Paste duplicates, and a name clash gets a " 2" suffix rather than overwriting. **Delete** (or ⌘⌫) moves the selection to the Trash after a confirmation. Arrow keys walk the tree (←/→ collapse and expand, and scroll the selection back into view), Return opens, F2 or ⌘R renames, ⌘D duplicates. Right-click any entry for New File/Folder, Cut/Copy/Paste, Reveal in Finder, Open in Default App, Copy (Relative) Path, Duplicate, Rename, and Move to Trash.
-- **File change tracking & rollback** *(new in 0.1.1)* — **File ▸ Show Changes Panel** adds a live **Changes (N)** list under each folder showing every file the agent has modified/added/deleted since the baseline, updated automatically within ~1 s of a write. Click a row for a syntax-highlighted diff; right-click ▸ **Discard Changes…** reverts one file, the **↺** button (or **Discard All Changes…**) reverts everything — always behind a confirmation. Two modes, picked automatically: folders with git compare against the last commit; folders **without git get invisible shadow snapshots** (stored in the app's data dir — your folder stays untouched, the agent never sees them). Off by default with zero overhead; toggling on snapshots "now" as the baseline.
-- **Multiple windows & agent teams** *(new in 0.1.1)* — **File ▸ New Window** opens an independent window with its own folders, running in parallel. Define named preset groups (`[[teams]]` in config.toml) and pick one per window to give different windows different agent buttons.
-- **Drag & drop files** — drop a file from Finder onto the **terminal** and its (shell-quoted) path is typed in, so you can attach files to an agent prompt the same way as in a native terminal; drop it onto the **file panel** instead and it is copied into that folder.
-- **Built-in editor** — syntax highlighting for 40+ languages ([cosmic-text](https://crates.io/crates/cosmic-text) + syntect), edit and Cmd+S save. When an agent edits the open file on disk, it reloads automatically (or asks, if you have unsaved changes).
-- **File viewers** *(upgraded in 0.1.3, fast & async in 0.1.4, selectable in 0.1.5, Markdown typeset in 0.1.6, LaTeX paginated in 0.1.7)* — images (png/jpg/gif/webp/bmp/tiff), **Markdown set on the same white page as LaTeX** — serif face, justified columns, generous margins — with headings, code blocks, inline pictures, **real tables** (grid lines, shaded header row, wrapped cells) and **typeset math**: `$…$` and `$$…$$` go through the same box layout as a .tex file, so fractions stack, `\sum`/`\int` carry their limits and `\tag{1}` is set flush right as the equation number (`math` code fences work too). CSV/TSV as an aligned table, and **PDFs shown as actual pages** — with text extraction as the fallback for files that can't be parsed. PDF pages rasterize and images decode on **background worker threads** with the next page prefetched, so scrolling and zooming never stall the UI: you get an instant preview that sharpens the moment the full-quality bitmap lands. **Select and copy text** anywhere in the viewer — including straight off rendered PDF pages, where a text layer built from the page's own content stream puts the highlight on the glyphs and reads two-column papers one column at a time. Zoom with Cmd+= / Cmd+- / Cmd+0, Ctrl/Cmd+wheel, or the magnifier buttons in the header, and pan in every direction while zoomed in. A **scrollbar** on the right (drag the thumb or click the track) plus PageUp/PageDown, Home/End and ↑/↓ navigate long documents. **LaTeX files (.tex/.latex/.ltx) are typeset onto real pages, not dumped** — the viewer reads `\documentclass` (and a `geometry` call, when there is one) and lays the document out on the page that class asks for: letter or A4, the class's own margins, and **two columns for the journal classes** (IEEEtran, ACM/SIG, RevTeX, or any `[twocolumn]` document). The sheet fits the pane the way a PDF page does, and the type is sized from it, so the view is the compiled page rather than a wall of editor-sized text — **paginated**, with the page number printed in the bottom margin, paragraphs continuing into the next column the way TeX breaks them, headings kept with the text under them, and starred `figure*`/`table*` floats spanning both columns at the top of a page. A figure or table that will not fit where it stands **floats to the top of the next column** and the text keeps flowing past it, the way LaTeX places `[htbp]` — only a `[H]` float stays pinned. Front matter is set the way `\maketitle` sets it: the title block spans the page, `\thanks` drops out of the byline into the affiliation footnote, `\textsuperscript` markers stay raised, and the abstract and `IEEEkeywords` get their labels. Sections are numbered the way the class numbers them — 1, 1.1, 1.1.1 for an article; I, A, 1) with centered small-caps heads for a journal; none at all under `\setcounter{secnumdepth}{0}` — and the paragraph shape comes from the preamble too: justified with TeX's first-line indent by default, or the `\parindent`/`\parskip` an arXiv preprint sets instead. `\cite` prints the **number its `\bibitem` will carry** ([12], not [smith2019]). `center`/`flushleft`/`\centering` set their alignment, `\LARGE` down to `\scriptsize` size their runs, and both stop at the end of the group or environment that opened them. **Display equations get real box layout**: numerators stacked over fraction bars, radicals with an overline spanning the argument, `\sum`/`\int` carrying their limits above and below, stretched `\left(…\right)` delimiters, matrices and `cases`, TeX's own spacing around relations and operators, and the equation number set flush right — `equation`/`align`/`gather`, `\[…\]` and `$$…$$`, with starred forms left unnumbered; a formula wider than its column is set a size smaller instead of running into the next one. **Inline math is set inline**: subscripts and superscripts are drawn small and off the baseline (V_S, x², km s⁻¹) rather than spelled out, with variables italic while numbers, operators and function names (`min`, `tanh`, `log`) stay upright. **Cross-references resolve to numbers** — a two-pass parse means a forward `\ref` still works, so `\ref` prints the number, `\eqref` parenthesizes it and `\autoref`/`\Cref` name the thing ("Figure 1", "Section 3"); a key defined in a file you didn't open keeps showing rather than vanishing. **Figures render**, including the vector **PDF** plots papers actually ship (rasterized through the same hayro renderer the PDF viewer uses), found through `\graphicspath` (and the usual `figures/` folders), sized by `\includegraphics[width=…\linewidth]` and by the `minipage` they sit in, centered, with the class's own caption labels ("Figure 1:" / "Table 2:" in an article, "Fig. 1." / "TABLE II" in a journal). Tables are set **booktabs style** on paper — rules above the head, under it and at the foot, nothing else. Also handled: itemize/enumerate/description lists, `tabular`/`tabularx`/`longtable`, verbatim/lstlisting on a code panel, `quote` and an article's abstract set inset from both margins, and `\cite`/`\href` as colored links. The preamble stays hidden, and package options (`[leftmargin=…]`, `[htbp]`, natbib's `[][]`) never leak into the page. Cmd+= / Cmd+- / Cmd+0 zoom the page and re-typeset it at the new size. A header button toggles Markdown/CSV/LaTeX between the rendered view and editable source.
-- **Per-folder sessions** — each workspace keeps its own shell, tree, and open file; switching is instant.
-- **Recent folders** — every folder you add is remembered permanently; reopen from the ⟳ button or **File ▸ Open Recent**, even after removing it from the workbench.
-- **Settings UI** *(new in 0.1.2)* — **File ▸ Settings… (⌘,)** picks the theme (Dark/Light × Classic/Minimal/Vivid), an accent color, the shared font, **separate editor and terminal text sizes** *(0.1.6)*, the interface text size, terminal scrollback (since 0.1.4 applied to already-running terminals too), and whether new windows start with the Changes panel. Every change applies immediately to all open windows — chrome, terminal palette and editor highlighting together — and is saved to config.toml.
-- **Native menu bar** — File (Add Folder ⌘O, New Terminal ⌘T, Show/Hide Changes Panel, Open Recent, New Window ▸ team, Save ⌘S, Settings ⌘,, Close Terminal ⌘W, Close Folder ⇧⌘W) and Edit (Copy/Paste/Select All) menus, routed to whichever pane has focus.
-- **Persistent** — folders, active session, and layout are restored on relaunch (fresh shells each time, by design).
-- **Small on purpose** — no webview, no Electron, no C regex libraries. Slint UI with both panes rasterized straight to pixel buffers.
+## For writing and revising
+
+- **LaTeX on the page, not in a text dump** *(0.1.7)* — the viewer reads `\documentclass` (and `geometry`) and sets the file on that page: letter or A4, the class's margins, **two columns for the journal classes** (IEEEtran, ACM/SIG, RevTeX, `[twocolumn]`). It is **paginated** — numbered sheets, paragraphs continuing into the next column, headings kept with their text, `figure*`/`table*` spanning both columns at a page top, and a float that will not fit moving to the top of the next column while the text flows past it.
+- **The parts a paper is made of** — `\maketitle` front matter (spanning title block, `\thanks` as the affiliation footnote, raised `\textsuperscript` markers, Abstract and Index Terms), the class's own section numbering (1.1 or I, A, 1), `\cite` printed as **the number its `\bibitem` will carry**, captions labelled "Figure 1:" or "Fig. 1." as the class does, cross-references resolved to numbers even when they point forward.
+- **Real math** — display equations get box layout: stacked fractions, radicals with an overline, `\sum`/`\int` carrying their limits, stretched `\left(…\right)`, matrices and `cases`, the number flush right. Inline math is set inline, with true raised and lowered scripts (V_S, x², km s⁻¹) instead of spelled-out `_S`.
+- **Figures and tables of real manuscripts** — `\graphicspath` searched, vector **PDF** plots rasterized, pictures scaled by the `minipage` they sit in; `tabular`/`tabularx`/`longtable` set booktabs style. Preamble noise, package options and unknown commands never leak onto the page.
+- **PDFs as actual pages** — the compiled paper, a reference you are citing, a datasheet. **Select and copy text straight off the page**, with two-column papers copying one column at a time instead of zig-zagging across the gutter.
+- **Markdown on the same white page**, with the same typeset math — for notes, READMEs and agent-written summaries.
+- **Everything else you drop in a paper folder** — images (png/jpg/gif/webp/bmp/tiff) and CSV/TSV as an aligned table.
+- **Fast, because nothing compiles** — no `pdflatex` run to see a change; PDF pages rasterize and images decode on background threads with the next page prefetched, so scrolling and zooming never stall. Cmd+= / Cmd+- / Cmd+0 zoom, and the LaTeX page re-typesets at the new size.
+
+## For working with an agent
+
+- **One-click agents** — preset buttons type the agent command into the terminal for you (`claude`, `codex`, `gemini`, `opencode`, or your own).
+- **A real terminal** — VTE-compliant ([alacritty_terminal](https://crates.io/crates/alacritty_terminal) + a real PTY), so `vim`, `top` and the Claude Code TUI just work, including bracketed paste, truecolor and wheel scrolling inside full-screen apps. Drop a figure from Finder on the terminal and its shell-quoted path is typed in, ready to attach to a prompt.
+- **Every file the agent touched, and an undo** *(0.1.1)* — **File ▸ Show Changes Panel** lists modified/added/deleted files within ~1 s of a write, with a syntax-highlighted diff per file. **Discard Changes…** reverts one file, **↺** reverts the whole run. Git folders compare against the last commit; folders without git get invisible shadow snapshots, so a manuscript folder needs no repo to be safe.
+- **Several papers, or several agents, at once** — one session per folder with its own shell, tree and open file; `+` adds more terminals in the same folder (one agent working while you run `latexmk` or `git` in the next tab); **File ▸ New Window** runs independent windows in parallel.
+- **A file panel that manages files** *(0.1.6)* — gitignore-aware and live as the agent works. Drag figures in from Finder, Cut/Copy/Paste through the system pasteboard in both directions, Delete to the Trash behind a confirmation, rename/duplicate from the keyboard.
+- **Built-in editor** — syntax highlighting for 40+ languages, Cmd+S to save. When the agent rewrites the file you have open, it reloads automatically (or asks, if you have unsaved edits). A header button flips Markdown/CSV/LaTeX between the rendered page and the editable source.
+- **Settings, themes, persistence** *(0.1.2)* — **File ▸ Settings… (⌘,)**: six themes, accent color, fonts, **separate editor and terminal text sizes** *(0.1.6)*, scrollback, applied live to every window. A native menu bar (Add Folder ⌘O, New Terminal ⌘T, Open Recent, New Window ▸ team, Save ⌘S, Close ⌘W) routes to whichever pane has focus, and folders, layout and the recent list come back on relaunch.
+- **Small on purpose** — no webview, no Electron, no C regex libraries; a Slint shell with both panes rasterized straight to pixel buffers, which is where the ~10 MB binary and the instant startup come from.
+
+<details>
+<summary><b>Everything the LaTeX view understands</b> (the long list)</summary>
+
+Paper and margins from `\documentclass` options and `geometry`; one or two columns; pagination with page numbers, column breaks inside paragraphs, keep-with-next headings, `[H]`-pinned versus floating figures and tables. `\maketitle` title blocks, `\thanks` footnotes, `\textsuperscript`, `abstract` and `IEEEkeywords` labels (bold run-in for journals, centered over an inset block for articles). Section numbering per class, `\setcounter{secnumdepth}`, `\parindent`/`\parskip` paragraph shape, `center`/`flushleft`/`\centering`, `\LARGE` down to `\scriptsize` — each scoped to its group. `equation`/`align`/`gather`, `\[…\]`, `$$…$$` and starred forms; a display too wide for its column is set a size smaller. Variables italic, operators and `min`/`tanh`/`log` upright. `\ref`/`\eqref`/`\autoref`/`\Cref` resolved by a two-pass parse; `\cite` numbered from `\bibitem`; `\captionsetup{labelformat=empty}` respected. `\includegraphics` with `\graphicspath`, `width=…\linewidth` and `minipage` scaling, including vector PDF figures. `tabular`, `tabularx`, `longtable` and `array` in booktabs style; itemize/enumerate/description; verbatim/lstlisting/minted on a code panel; `quote` and article abstracts inset from both margins; `\href`/`\url` as links. Unknown commands, package options (`[leftmargin=…]`, `[htbp]`, natbib's `[][]`) and the whole preamble stay off the page.
+
+</details>
 
 ## Quick install (macOS)
 
@@ -63,11 +76,24 @@ macOS is the primary target; Linux/Windows are untested but the stack is cross-p
 
 ## Usage
 
+### Revise a paper with an agent
+
+1. **+ Add folder** → pick the manuscript folder (the one with `paper.tex` and `figures/`). A login shell opens there.
+2. **File ▸ Show Changes Panel**, so every file the agent touches is listed and revertible before it types a word.
+3. Click **claude** (or type any agent command) and ask for what you want: *"tighten Section 3 to 400 words"*, *"make the notation consistent with Table 2"*, *"add a limitations paragraph"*.
+4. Click `paper.tex` in the panel — it opens **typeset**, on the page your class produces, so you can read the revision as a reader will see it. No compile, no `latexmk` watch.
+5. Not convinced? Right-click the file in **Changes ▸ Discard Changes…** to put it back, or **↺** to revert the whole run, then ask again.
+6. Ready to submit? Run `latexmk` (or your build) in a second terminal tab with **+**, and open the resulting `paper.pdf` in the same viewer to check the real thing.
+
+Everything else works the same way: drop new figures in from Finder, click a `.csv` the agent generated to read it as a table, open a reference PDF and copy a quotation straight off the page.
+
+### Day to day
+
 1. Click **+ Add folder** and pick a project directory — a login shell opens there.
 2. Click a preset button (e.g. **claude**) to launch the agent, or type any command.
-3. Watch the file tree update as the agent works; click any file to inspect or tweak it.
-4. Click **+** in the terminal tab strip to open more terminals in the same folder (each tab is its own shell; ✕ on hover closes one).
-5. Add more folders to run more agents in parallel; switch by clicking a session in the sidebar. The ✕ on a session header removes the folder from the workbench (its shells are stopped; the folder stays in Recent).
+3. Watch the file panel update as the agent works; click any file to read or edit it.
+4. Click **+** in the terminal tab strip for more shells in the same folder (each tab is its own shell; ✕ on hover closes one).
+5. Add more folders to run more agents in parallel; switch by clicking a session in the sidebar. The ✕ on a session header removes the folder (its shells stop; the folder stays in Recent).
 6. Click **⟳** (bottom of the sidebar) to reopen any previously added folder without the file dialog.
 
 ### Track & roll back what the agent changes
@@ -89,7 +115,7 @@ Detection is watcher-driven (no polling): bursts of writes are coalesced for 250
 | Terminal | everything a terminal expects: Ctrl+C/Z/D/R…, arrows, F1–F12, TUIs; drag to select (double-click = word), Cmd+C copies, Cmd+V pastes (bracketed), **right-click for Copy / Paste / Select All**; wheel scrolls history — and scrolls **inside full-screen apps** (Claude Code, vim, less) too — Shift+PgUp/PgDn pages it, Shift+Home/End jump to the ends, Shift+↑/↓ go line by line |
 | File panel | ↑/↓ walk the rows, ←/→ collapse / expand (or step to the parent), Return opens, F2 or ⌘R renames, ⌘D duplicates, ⌘X / ⌘C / ⌘V cut, copy and paste files through the system pasteboard, Delete or ⌘⌫ moves to the Trash (after a confirmation); right-click for the full menu |
 | Editor   | typing, arrows / Home / End / PgUp / PgDn (+Shift selects, +Alt jumps words), Cmd+A / C / X / V, Cmd+S saves, right-click for Copy / Paste / Select All |
-| Viewer   | wheel scrolls, right-edge scrollbar drags or click-jumps, PgUp/PgDn page, Home/End jump to the ends, ↑/↓ step; drag to select text — including on PDF pages (double-click = word), Cmd+A selects all, Cmd+C / Cmd+X copy, Esc clears, right-click for the menu; Cmd+C with nothing selected copies a whole PDF; on images & PDFs: Cmd+= / Cmd+- zoom, Cmd+0 resets, Ctrl/Cmd+wheel zooms, and a zoomed view pans horizontally |
+| Viewer   | wheel scrolls, right-edge scrollbar drags or click-jumps, PgUp/PgDn page, Home/End jump to the ends, ↑/↓ step; drag to select text — including on PDF pages (double-click = word), Cmd+A selects all, Cmd+C / Cmd+X copy, Esc clears, right-click for the menu; Cmd+C with nothing selected copies a whole PDF; on images, PDFs and the LaTeX page: Cmd+= / Cmd+- zoom, Cmd+0 resets, Ctrl/Cmd+wheel zooms, and a zoomed view pans horizontally |
 
 ## Configuration
 
@@ -176,11 +202,21 @@ Only the PTY reader threads and the viewer's rasterizer/decoder workers run in t
 
 ## Roadmap / known limitations (v1)
 
+The LaTeX view is a fast reader's approximation of the page, not a TeX engine — for the final artifact, compile:
+
+- Line breaking is TeX-like but not TeX: no hyphenation and no paragraph-wide optimum, so line breaks and page breaks differ from the compiled PDF.
+- Side-by-side `minipage` panels stack vertically, each at its declared width.
+- Macros you `\newcommand` are not expanded; `\input`/`\include` files are not pulled in (open them directly).
+- A journal's affiliation footnote is set under the byline rather than at the foot of the first column.
+
+Elsewhere:
+
 - [ ] Editor undo
 - [ ] Mouse reporting to TUIs
 - [ ] IME / dead-key composition
 - [ ] Editor tabs (currently one open file per session)
 - [x] PDF page rendering *(done in 0.1.3)*
+- [x] LaTeX typeset on the class's own page *(done in 0.1.7)*
 - [ ] Linux / Windows testing
 
 ## License
