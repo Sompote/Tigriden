@@ -1136,13 +1136,9 @@ impl ViewerState {
                         if span.italic {
                             attrs = attrs.style(Style::Italic);
                         }
-                        attrs = attrs.metadata(match span.script {
-                            1 => SCRIPT_SUP,
-                            -1 => SCRIPT_SUB,
-                            _ => SCRIPT_NONE,
-                        });
+                        attrs = attrs.metadata(script_tag(span.script));
                         if span.script != 0 {
-                            let px = (self.font_px * 0.72).round().max(5.0);
+                            let px = (self.font_px * script_scale(span.script)).round().max(5.0);
                             attrs = attrs.metrics(Metrics::new(px, (self.font_px * 1.5).round()));
                         }
                         spans.push((span.text, attrs));
@@ -1361,11 +1357,7 @@ impl ViewerState {
             if s.italic {
                 attrs = attrs.style(Style::Italic);
             }
-            attrs = attrs.metadata(match s.script {
-                1 => SCRIPT_SUP,
-                -1 => SCRIPT_SUB,
-                _ => SCRIPT_NONE,
-            });
+            attrs = attrs.metadata(script_tag(s.script));
             attrs
         };
         let leading = self.leading;
@@ -1377,7 +1369,7 @@ impl ViewerState {
                     // Scripts are set small, as TeX does, and shifted off the
                     // baseline by the painter; \large and friends scale the
                     // run outright.
-                    let scale = if s.script != 0 { s.size * 0.72 } else { s.size };
+                    let scale = s.size * script_scale(s.script);
                     if (scale - 1.0).abs() > 0.01 {
                         let sp = (px * scale).max(5.0);
                         attrs = attrs.metrics(Metrics::new(sp, px * s.size.max(1.0) * leading));
@@ -2883,8 +2875,14 @@ impl ViewerState {
                 Block::Math { bx, number, height, .. } => {
                     {
                         // Display equations are centered in the column, with
-                        // the number set flush right like LaTeX does.
-                        let x0 = margin + ((text_w - bx.width) / 2.0).max(0.0);
+                        // the number set flush right like LaTeX does — but a
+                        // formula that fills the column is nudged left rather
+                        // than allowed to run into its own number.
+                        let mut x0 = margin + ((text_w - bx.width) / 2.0).max(0.0);
+                        if let Some(num) = number {
+                            let limit = margin + text_w - num.width - self.font_px * 0.5;
+                            x0 = x0.min((limit - bx.width).max(margin));
+                        }
                         for item in &mut bx.items {
                             match item {
                                 MathItem::Run { buffer, x, y: iy } => {
@@ -3874,10 +3872,38 @@ mod tests {
 }
 /// Metadata tags the LaTeX builder puts on spans so the painter can raise or
 /// lower them off the baseline: a plain text buffer has no notion of scripts,
-/// and inline math is full of them.
+/// and inline math is full of them. The doubled tags carry the second level,
+/// the `model` of `\mathbb{R}^{d_{model}}`.
 const SCRIPT_NONE: usize = 0;
 const SCRIPT_SUB: usize = 1;
 const SCRIPT_SUP: usize = 2;
+const SCRIPT_SUP_SUP: usize = 3;
+const SCRIPT_SUP_SUB: usize = 4;
+const SCRIPT_SUB_SUB: usize = 5;
+const SCRIPT_SUB_SUP: usize = 6;
+
+/// The painter tag for one of [`crate::tex::nested_script`]'s levels.
+fn script_tag(script: i8) -> usize {
+    match script {
+        1 => SCRIPT_SUP,
+        -1 => SCRIPT_SUB,
+        2 => SCRIPT_SUP_SUP,
+        3 => SCRIPT_SUP_SUB,
+        -2 => SCRIPT_SUB_SUB,
+        -3 => SCRIPT_SUB_SUP,
+        _ => SCRIPT_NONE,
+    }
+}
+
+/// How far a script shrinks: one step down for the first level, a second,
+/// smaller step for a script of a script — where TeX stops too.
+fn script_scale(script: i8) -> f32 {
+    match script {
+        0 => 1.0,
+        1 | -1 => 0.72,
+        _ => 0.55,
+    }
+}
 
 /// Draws the part of `buffer` between the buffer-space heights `from` and
 /// `to` at (`x`, `y`), which is how a paragraph continues in the next column.
@@ -3901,9 +3927,15 @@ fn draw_buffer_slice(
         }
         let line_y = run.line_y - from;
         for glyph in run.glyphs {
+            // Offsets are in units of the glyph's own size, which is already
+            // the reduced one, so the second level's numbers look large.
             let shift = match glyph.metadata {
                 SCRIPT_SUB => glyph.font_size * 0.16,
                 SCRIPT_SUP => -glyph.font_size * 0.34,
+                SCRIPT_SUP_SUP => -glyph.font_size * 0.72,
+                SCRIPT_SUP_SUB => -glyph.font_size * 0.19,
+                SCRIPT_SUB_SUB => glyph.font_size * 0.39,
+                SCRIPT_SUB_SUP => -glyph.font_size * 0.06,
                 _ => 0.0,
             };
             let physical = glyph.physical((0.0, line_y + shift), 1.0);

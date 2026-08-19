@@ -765,6 +765,51 @@ const MATH_ENVS: [&str; 10] = [
 const TABLE_ENVS: [&str; 6] =
     ["tabular", "tabular*", "tabularx", "tabulary", "longtable", "array"];
 const LIST_ENVS: [&str; 3] = ["itemize", "enumerate", "description"];
+
+/// Splits an `align`-family body into the rows the `\\` separate, ignoring
+/// the breaks nested inside a group or inside an inner environment such as a
+/// `matrix` or `cases`. Without this the parser stopped at the first break and
+/// every row after it was dropped.
+fn split_math_rows(raw: &str) -> Vec<String> {
+    let chars: Vec<char> = raw.chars().collect();
+    let (mut rows, mut start, mut depth, mut env) = (Vec::new(), 0usize, 0i32, 0i32);
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            '\\' if chars.get(i + 1) == Some(&'\\') && depth <= 0 && env <= 0 => {
+                rows.push(chars[start..i].iter().collect());
+                i += 2;
+                // A row break may carry a spacing argument, e.g. `\\[2pt]`.
+                if chars.get(i) == Some(&'[') {
+                    while i < chars.len() && chars[i] != ']' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                start = i;
+                continue;
+            }
+            '\\' => {
+                let rest: String = chars[i..].iter().take(6).collect();
+                if rest.starts_with("\\begin") {
+                    env += 1;
+                } else if rest.starts_with("\\end") {
+                    env -= 1;
+                }
+                // Skip the escaped character so `\\{` does not count as a group.
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    rows.push(chars[start.min(chars.len())..].iter().collect());
+    rows.retain(|r: &String| !r.trim().is_empty());
+    rows
+}
 /// Environments whose begin/end are ignored and content flows through.
 const SKIP_ENVS: [&str; 11] = [
     "document",
@@ -1166,7 +1211,27 @@ impl Parser {
             self.flush_paragraph();
             let raw = self.read_until_end(env);
             let numbered = !env.ends_with('*') && env != "displaymath";
-            self.push_display_math(&raw, numbered);
+            match env.trim_end_matches('*') {
+                // These stack one equation per row, each with its own number.
+                "align" | "gather" | "eqnarray" | "alignat" | "flalign" => {
+                    for row in split_math_rows(&raw) {
+                        let tagged = numbered
+                            && !row.contains("\\nonumber")
+                            && !row.contains("\\notag");
+                        self.push_display_math(&row, tagged);
+                    }
+                }
+                // multline breaks one equation over several lines and numbers
+                // the last of them.
+                "multline" => {
+                    let rows = split_math_rows(&raw);
+                    let last = rows.len().saturating_sub(1);
+                    for (i, row) in rows.into_iter().enumerate() {
+                        self.push_display_math(&row, numbered && i == last);
+                    }
+                }
+                _ => self.push_display_math(&raw, numbered),
+            }
         } else if TABLE_ENVS.contains(&env) {
             self.flush_paragraph();
             self.skip_opts(); // vertical placement, e.g. [t]
@@ -2038,7 +2103,7 @@ impl MathNode {
 }
 
 /// Named symbols shared by the tree parser and the inline flattener.
-const SYMBOLS: [(&str, &str); 96] = [
+const SYMBOLS: [(&str, &str); 116] = [
     ("alpha", "α"), ("beta", "β"), ("gamma", "γ"), ("delta", "δ"), ("epsilon", "ε"),
     ("varepsilon", "ε"), ("zeta", "ζ"), ("eta", "η"), ("theta", "θ"), ("vartheta", "ϑ"),
     ("iota", "ι"), ("kappa", "κ"), ("lambda", "λ"), ("mu", "μ"), ("nu", "ν"), ("xi", "ξ"),
@@ -2058,6 +2123,10 @@ const SYMBOLS: [(&str, &str); 96] = [
     ("hbar", "ℏ"), ("Re", "ℜ"), ("Im", "ℑ"), ("angle", "∠"), ("perp", "⊥"),
     ("parallel", "∥"), ("wedge", "∧"), ("vee", "∨"), ("neg", "¬"), ("oplus", "⊕"),
     ("otimes", "⊗"), ("star", "⋆"), ("ast", "∗"), ("prime", "′"), ("ldots", "…"),
+    ("top", "⊤"), ("bot", "⊥"), ("mid", "∣"), ("setminus", "∖"), ("cdots", "⋯"),
+    ("dots", "…"), ("vdots", "⋮"), ("odot", "⊙"), ("bullet", "∙"), ("varsigma", "ς"),
+    ("varrho", "ϱ"), ("varpi", "ϖ"), ("aleph", "ℵ"), ("supseteq", "⊇"), ("gg", "≫"),
+    ("ll", "≪"), ("langle", "⟨"), ("rangle", "⟩"), ("lVert", "‖"), ("rVert", "‖"),
 ];
 
 /// Operators that TeX sets upright and names, e.g. \sin, \log, \max.
@@ -2212,7 +2281,21 @@ pub fn parse_math(src: &str) -> MathNode {
         pending_close: None,
         took_row_break: false,
     };
-    let items = p.parse_row(&[]);
+    let mut items = p.parse_row(&[]);
+    // A `\\` inside a construct that is not set as rows of its own — an
+    // amsmath `split`, say — would otherwise truncate the formula there. Keep
+    // reading and set the rest on the same line rather than losing it.
+    while p.pos < p.chars.len() {
+        let at = p.pos;
+        let mut more = p.parse_row(&[]);
+        if p.pos == at {
+            p.pos += 1;
+        }
+        if !more.is_empty() {
+            items.push(MathNode::Space { em: 0.6, literal: false });
+            items.append(&mut more);
+        }
+    }
     MathNode::row(items)
 }
 
@@ -2281,7 +2364,9 @@ impl MathParser {
     }
 
     fn char_atom(&self, c: char) -> MathNode {
-        MathNode::Sym { text: c.to_string(), italic: c.is_ascii_alphabetic() }
+        // TeX sets the binary operator, not the hyphen the keyboard offers.
+        let text = if c == '-' { '\u{2212}' } else { c };
+        MathNode::Sym { text: text.to_string(), italic: c.is_ascii_alphabetic() }
     }
 
     /// Expands one command into a node.
@@ -2325,13 +2410,20 @@ impl MathParser {
                 let arg = self.parse_arg();
                 upright(arg)
             }
-            "mathbf" | "boldsymbol" | "bm" | "mathbb" | "mathcal" | "mathit" => self.parse_arg(),
-            "hat" | "widehat" => self.accent('\u{0302}'),
-            "bar" | "overline" => self.accent('\u{0304}'),
-            "vec" => self.accent('\u{20D7}'),
-            "tilde" | "widetilde" => self.accent('\u{0303}'),
-            "dot" => self.accent('\u{0307}'),
-            "ddot" => self.accent('\u{0308}'),
+            // Blackboard bold and calligraphic letters have their own
+            // characters; an italic R where the source said \mathbb{R} reads
+            // as a variable rather than as the reals.
+            "mathbb" => letterlike(self.parse_arg(), BLACKBOARD),
+            "mathcal" | "mathscr" => letterlike(self.parse_arg(), CALLIGRAPHIC),
+            "mathbf" | "boldsymbol" | "bm" | "mathit" => self.parse_arg(),
+            // Spacing accents, not combining ones: a lone combining mark
+            // shapes to nothing, so \widehat{E} came out as a bare E.
+            "hat" | "widehat" => self.accent('\u{02C6}'),
+            "bar" | "overline" => self.accent('\u{00AF}'),
+            "vec" => self.accent('\u{2192}'),
+            "tilde" | "widetilde" => self.accent('\u{02DC}'),
+            "dot" => self.accent('\u{02D9}'),
+            "ddot" => self.accent('\u{00A8}'),
             "quad" => MathNode::Space { em: 1.0, literal: false },
             "qquad" => MathNode::Space { em: 2.0, literal: false },
             "," | ":" | ";" | "thinspace" => MathNode::Space { em: 0.22, literal: false },
@@ -2509,9 +2601,11 @@ impl MathParser {
                     items.push(MathNode::Space { em: 0.0, literal: true });
                 }
                 '&' => {
-                    // An alignment tab outside a matrix: TeX sets a gap there.
+                    // An alignment tab outside a matrix marks the column the
+                    // rows line up on. Each row is set on its own here, so the
+                    // tab itself contributes nothing: the relation that
+                    // follows it already carries TeX's spacing.
                     self.pos += 1;
-                    items.push(MathNode::Space { em: 0.5, literal: false });
                 }
                 _ => {
                     self.pos += 1;
@@ -2520,6 +2614,37 @@ impl MathParser {
             }
         }
         items
+    }
+}
+
+/// Blackboard-bold and calligraphic letters, for \mathbb and \mathcal. Only
+/// the letters that have a plain character of their own are mapped; the rest
+/// fall back to upright roman, which still reads as a set rather than as a
+/// variable.
+const BLACKBOARD: &[(char, char)] = &[
+    ('C', '\u{2102}'), ('H', '\u{210D}'), ('N', '\u{2115}'), ('P', '\u{2119}'),
+    ('Q', '\u{211A}'), ('R', '\u{211D}'), ('Z', '\u{2124}'),
+];
+const CALLIGRAPHIC: &[(char, char)] = &[
+    ('B', '\u{212C}'), ('E', '\u{2130}'), ('F', '\u{2131}'), ('H', '\u{210B}'),
+    ('I', '\u{2110}'), ('L', '\u{2112}'), ('M', '\u{2133}'), ('R', '\u{211B}'),
+];
+
+/// Substitutes a letterlike alphabet into a node, leaving anything the
+/// alphabet has no character for upright.
+fn letterlike(node: MathNode, table: &[(char, char)]) -> MathNode {
+    match node {
+        MathNode::Sym { text, .. } => MathNode::Sym {
+            text: text
+                .chars()
+                .map(|c| table.iter().find(|(k, _)| *k == c).map_or(c, |(_, v)| *v))
+                .collect(),
+            italic: false,
+        },
+        MathNode::Row(items) => {
+            MathNode::Row(items.into_iter().map(|n| letterlike(n, table)).collect())
+        }
+        other => upright(other),
     }
 }
 
@@ -2559,8 +2684,28 @@ pub fn math_spans(node: &MathNode) -> Vec<MathSpan> {
 pub struct MathSpan {
     pub text: String,
     pub italic: bool,
-    /// 1 superscript, -1 subscript, 0 on the baseline.
+    /// Where the run sits relative to the baseline: see [`nested_script`].
     pub script: i8,
+}
+
+/// The level a script nested inside another script is set at.
+///
+/// Inline math is set as runs of ordinary text that the painter raises and
+/// lowers, so the levels are a small fixed set rather than a depth: 0 on the
+/// baseline, ±1 for a plain superscript or subscript, and four more for the
+/// second level, which is what `\mathbb{R}^{d_{model}}` needs. Deeper than
+/// that a script keeps its parent's level; the alternative was spelling the
+/// nested script out as `d_(model)`, which is what this replaces.
+pub fn nested_script(parent: i8, sup: bool) -> i8 {
+    match (parent, sup) {
+        (0, true) => 1,
+        (0, false) => -1,
+        (1, true) => 2,   // x^{y^z}
+        (1, false) => 3,  // x^{y_z}
+        (-1, true) => -3, // x_{y^z}
+        (-1, false) => -2,
+        (deeper, _) => deeper,
+    }
 }
 
 fn collect_spans(node: &MathNode, out: &mut Vec<MathSpan>, script: i8) {
@@ -2573,29 +2718,11 @@ fn collect_spans(node: &MathNode, out: &mut Vec<MathSpan>, script: i8) {
         // is still a variable, even though the exponent is not.
         MathNode::Script { base, sup, sub } => {
             collect_spans(base, out, script);
-            // Only one level of raising and lowering: a script inside a
-            // script falls back to the flattened Unicode form.
             if let Some(sb) = sub {
-                if script == 0 {
-                    collect_spans(sb, out, -1);
-                } else {
-                    out.push(MathSpan {
-                        text: script_text(&flatten_math(sb), false),
-                        italic: false,
-                        script,
-                    });
-                }
+                collect_spans(sb, out, nested_script(script, false));
             }
             if let Some(sp) = sup {
-                if script == 0 {
-                    collect_spans(sp, out, 1);
-                } else {
-                    out.push(MathSpan {
-                        text: script_text(&flatten_math(sp), true),
-                        italic: false,
-                        script,
-                    });
-                }
+                collect_spans(sp, out, nested_script(script, true));
             }
         }
         MathNode::Accent { base, .. } => collect_spans(base, out, script),
@@ -2873,6 +3000,77 @@ mod tests {
             "fraction should parse into a tree, not a flat string"
         );
         assert_eq!(math_text(math[0].0), "x = a/b");
+    }
+
+    /// Every row of an `align` is its own numbered equation. The parser used
+    /// to stop at the first `\\`, so the rest of the environment — and any
+    /// \label in it — was silently dropped.
+    #[test]
+    fn align_sets_every_row_as_its_own_equation() {
+        let blocks = parse(concat!(
+            "\\begin{align}\n",
+            "a &= 1 \\label{eq:a}\\\\\n",
+            "b &= 2 \\label{eq:b}\\\\\n",
+            "c &= 3 \\nonumber\n",
+            "\\end{align}\n",
+            "See Eq.~\\eqref{eq:b}.\n",
+        ));
+        let math: Vec<_> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                TexBlock::Math { node, number } => Some((math_text(node), number.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(math.len(), 3, "rows after the first were dropped: {math:?}");
+        assert_eq!(math[0].1.as_deref(), Some("(1)"));
+        assert_eq!(math[1].1.as_deref(), Some("(2)"));
+        assert_eq!(math[2].1, None, "\\nonumber row must not be numbered");
+        assert_eq!(math[1].0, "b = 2");
+        let TexBlock::Paragraph { spans, .. } = blocks.last().unwrap() else {
+            panic!("expected a paragraph")
+        };
+        assert!(text_of(spans).contains("(2)"), "label in a later row never bound");
+    }
+
+    /// A row break inside a matrix belongs to the matrix, not to the align.
+    #[test]
+    fn a_row_break_inside_a_nested_environment_is_not_a_row() {
+        let blocks = parse(concat!(
+            "\\begin{align}\n",
+            "M &= \\begin{pmatrix} 1 & 0 \\\\ 0 & 1 \\end{pmatrix}\\\\\n",
+            "N &= 0\n",
+            "\\end{align}\n",
+        ));
+        let rows = blocks.iter().filter(|b| matches!(b, TexBlock::Math { .. })).count();
+        assert_eq!(rows, 2, "the matrix's own break split the align");
+    }
+
+    /// A script inside a script keeps a level of its own. Spelling it out as
+    /// `d_(model)` is what this replaced.
+    #[test]
+    fn a_script_inside_a_script_is_set_as_one() {
+        let node = parse_math("R^{d_{model} \\times 1}");
+        let spans = math_spans(&node);
+        let all: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(!all.contains("_("), "nested script fell back to plain text: {all}");
+        assert!(all.contains("model"), "nested script lost: {all}");
+        let level = |needle: &str| {
+            spans.iter().find(|s| s.text.contains(needle)).map(|s| s.script)
+        };
+        assert_eq!(level("d"), Some(1), "exponent should be a superscript");
+        assert_eq!(level("model"), Some(3), "its index should be a second level");
+    }
+
+    /// \mathbb and \mathcal have characters of their own; an italic R where
+    /// the source said \mathbb{R} reads as a variable, not as the reals.
+    #[test]
+    fn blackboard_and_calligraphic_letters_get_their_own_characters() {
+        assert_eq!(math_text(&parse_math("\\mathbb{R}^{n}")), "ℝⁿ");
+        assert_eq!(math_text(&parse_math("\\mathcal{L}")), "ℒ");
+        // No character of its own: upright, rather than slanted like a variable.
+        let node = parse_math("\\mathbb{S}");
+        assert!(matches!(&node, MathNode::Sym { text, italic: false } if text == "S"));
     }
 
     /// Cross-references resolve to numbers, including forward ones — a paper
