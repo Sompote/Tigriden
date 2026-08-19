@@ -62,6 +62,10 @@ struct PageGeom {
     columns: usize,
     /// Gap between columns of a two-column page.
     gutter: f32,
+    /// Device pixels per TeX point at this page size. Every length on the
+    /// page is derived from it, so zooming scales the page without changing
+    /// what the page looks like.
+    scale: f32,
 }
 
 impl PageGeom {
@@ -113,6 +117,22 @@ fn picture_target_w(size: (f32, f32), fill: Option<f32>, text_w: f32, zoom: f32)
         None => size.0.min(text_w),
     };
     base * zoom
+}
+
+/// Width a picture is drawn at. On a page a figure has a physical size: a
+/// `width=0.8\linewidth` is 80% of the column and a picture with no declared
+/// width is its own pixels read as points on the page, both of which already
+/// scale with the page — so the viewer's zoom must not be applied a second
+/// time, or a figure would grow as the square of it. Off a page, the zoom
+/// magnifies the picture directly.
+fn page_picture_w(page: Option<PageGeom>, zoom: f32, size: (f32, f32), fill: Option<f32>, col_w: f32) -> f32 {
+    match page {
+        Some(g) => match fill {
+            Some(f) => col_w * f,
+            None => (size.0 * g.scale).min(col_w),
+        },
+        None => picture_target_w(size, fill, col_w, zoom),
+    }
 }
 
 /// Clamps a target draw width so the resulting bitmap stays within the caps,
@@ -738,7 +758,7 @@ impl ViewerState {
         for cells in rows {
             let mut row = Vec::with_capacity(cells.len());
             for cell in cells {
-                let mut buffer = Buffer::new(font_system, Metrics::new(px, (px * 1.35).round()));
+                let mut buffer = Buffer::new(font_system, Metrics::new(px, px * 1.35));
                 buffer.set_wrap(Wrap::WordOrGlyph);
                 buffer.set_rich_text(
                     cell.iter().map(|(t, a)| (t.as_str(), a.clone())),
@@ -1202,7 +1222,7 @@ impl ViewerState {
         }
         // Hidden copy of the formula so Cmd+A still picks it up.
         let attrs = Attrs::new().family(mathlayout::serif_family(font_system)).color(ink);
-        let mut text = Buffer::new(font_system, Metrics::new(size, (size * 1.4).round()));
+        let mut text = Buffer::new(font_system, Metrics::new(size, size * 1.4));
         text.set_text(&crate::tex::math_text(node), &attrs, Shaping::Advanced, None);
         let height = bx.height().max(num.as_ref().map_or(0.0, MathBox::height));
         self.blocks.push(Block::Math { bx, number: num, text, height });
@@ -1234,8 +1254,7 @@ impl ViewerState {
         if spans.iter().all(|(t, _)| t.trim().is_empty()) {
             return;
         }
-        let mut buffer =
-            Buffer::new(font_system, Metrics::new(base_px, (base_px * self.leading).round()));
+        let mut buffer = Buffer::new(font_system, Metrics::new(base_px, base_px * self.leading));
         buffer.set_wrap(Wrap::WordOrGlyph);
         let default = Attrs::new()
             .family(mathlayout::serif_family(font_system))
@@ -1304,20 +1323,24 @@ impl ViewerState {
         let scale = fit * self.zoom;
         let sheet_w = (style.page_w * scale).min(MAX_DRAW_W);
         let scale = sheet_w / style.page_w;
+        // Nothing here is rounded: the page must be the same page at every
+        // zoom step, only larger, and rounded lengths drift out of proportion
+        // as the scale changes — which reflows the text and repaginates it.
         let geom = PageGeom {
             w: sheet_w,
-            h: (style.page_h * scale).round(),
-            margin_x: (style.margin_x * scale).round(),
-            margin_y: (style.margin_y * scale).round(),
+            h: style.page_h * scale,
+            margin_x: style.margin_x * scale,
+            margin_y: style.margin_y * scale,
             columns: style.columns,
-            gutter: (style.gutter * scale).round(),
+            gutter: style.gutter * scale,
+            scale,
         };
         let body_px = (style.base_pt * scale).max(5.0);
         self.paper = true;
         self.page_geom = Some(geom);
         self.font_px = body_px;
         self.margin = geom.margin_x;
-        self.spacing = (body_px * 0.4).round();
+        self.spacing = body_px * 0.4;
         // TeX sets solid paragraphs: no space between them, one line of
         // leading, and an indented first line instead.
         self.leading = 1.22;
@@ -1356,9 +1379,8 @@ impl ViewerState {
                     // run outright.
                     let scale = if s.script != 0 { s.size * 0.72 } else { s.size };
                     if (scale - 1.0).abs() > 0.01 {
-                        let sp = (px * scale).round().max(5.0);
-                        let line = (px * s.size.max(1.0) * leading).round();
-                        attrs = attrs.metrics(Metrics::new(sp, line));
+                        let sp = (px * scale).max(5.0);
+                        attrs = attrs.metrics(Metrics::new(sp, px * s.size.max(1.0) * leading));
                     }
                     (s.text.clone(), attrs)
                 })
@@ -1430,7 +1452,7 @@ impl ViewerState {
                         5 => (0.98, Some(Align::Center), true, false, false),
                         _ => (1.0, None, true, false, false),
                     };
-                    let px = (body_px * scale).round();
+                    let px = body_px * scale;
                     let styled: Vec<(String, Attrs<'static>)> = spans
                         .iter()
                         .map(|s| {
@@ -1453,7 +1475,7 @@ impl ViewerState {
                     fresh = true;
                 }
                 crate::tex::TexBlock::Byline { spans, small } => {
-                    let px = if small { (body_px * 0.8).round() } else { body_px };
+                    let px = if small { body_px * 0.8 } else { body_px };
                     let styled = to_spans(&spans, px);
                     let align = if small { Some(Align::Justified) } else { Some(Align::Center) };
                     self.push_aligned(font_system, &styled, px, 0.0, align);
@@ -1461,28 +1483,27 @@ impl ViewerState {
                     fresh = true;
                 }
                 crate::tex::TexBlock::Paragraph { spans, align, inset } => {
-                    let px = (body_px * if inset { 0.94 } else { 1.0 }).round();
+                    let px = body_px * if inset { 0.94 } else { 1.0 };
                     let mut styled = to_spans(&spans, px);
                     let centered = align != crate::tex::TexAlign::Justify;
                     if !fresh && !centered && indent_em >= 1.0 {
                         // An em quad at the indent's size gives TeX's
                         // \parindent without touching the shaper.
                         styled.insert(0, ("\u{2003}".into(), serif.clone().color(ink).metrics(
-                            Metrics::new(indent_em, (body_px * leading).round()),
+                            Metrics::new(indent_em, body_px * leading),
                         )));
                     }
                     // Justified columns are the strongest visual cue that
                     // this is a typeset document rather than a text dump.
                     let pad = if inset { body_px * 2.2 } else { 0.0 };
-                    let base = (px * peak(&spans)).round();
+                    let base = px * peak(&spans);
                     self.push_inset(font_system, &styled, base, pad, pad, align_of(align));
                     fresh = false;
                 }
                 crate::tex::TexBlock::Code(text) => {
                     let attrs = mono(fam).color(ink);
-                    let px = (body_px * 0.88).round();
-                    let mut buffer =
-                        Buffer::new(font_system, Metrics::new(px, (px * 1.35).round()));
+                    let px = body_px * 0.88;
+                    let mut buffer = Buffer::new(font_system, Metrics::new(px, px * 1.35));
                     buffer.set_wrap(Wrap::WordOrGlyph);
                     buffer.set_text(&text, &attrs, Shaping::Advanced, None);
                     self.blocks.push(Block::Text {
@@ -1509,7 +1530,7 @@ impl ViewerState {
                     fresh = true;
                 }
                 crate::tex::TexBlock::Table { rows, float } => {
-                    let px = (body_px * 0.86).round().max(6.0);
+                    let px = (body_px * 0.86).max(6.0);
                     let cells: Vec<Vec<Vec<(String, Attrs<'static>)>>> = rows
                         .iter()
                         .enumerate()
@@ -1570,7 +1591,7 @@ impl ViewerState {
                     fresh = true;
                 }
                 crate::tex::TexBlock::Caption { spans, float } => {
-                    let px = (body_px * 0.86).round();
+                    let px = body_px * 0.86;
                     let styled = to_spans(&spans, px);
                     self.push_aligned(font_system, &styled, px, 0.0, Some(Align::Justified));
                     // A caption belongs with the float it names.
@@ -1603,7 +1624,7 @@ impl ViewerState {
         while self.gaps.len() < self.blocks.len() {
             self.gaps.push(self.spacing);
         }
-        self.gaps[start] = before.max(*carry).round();
+        self.gaps[start] = before.max(*carry);
         *carry = after;
     }
 
@@ -1651,6 +1672,7 @@ impl ViewerState {
         };
         let spanning = std::mem::take(&mut self.spanning);
         let zoom = self.zoom;
+        let page = self.page_geom;
         let mut max_w = col_w;
         for (bi, block) in self.blocks.iter_mut().enumerate() {
             let text_w = if spanning.get(bi).copied().unwrap_or(false) { full_w } else { col_w };
@@ -1666,7 +1688,7 @@ impl ViewerState {
                 }
                 Block::Picture { size, fill, height, .. } => {
                     let (draw_w, draw_h) =
-                        fit_draw(size.0, size.1, picture_target_w(*size, *fill, text_w, zoom));
+                        fit_draw(size.0, size.1, page_picture_w(page, zoom, *size, *fill, text_w));
                     *height = draw_h;
                     max_w = max_w.max(draw_w);
                 }
@@ -1686,8 +1708,8 @@ impl ViewerState {
                     if ncols == 0 {
                         continue;
                     }
-                    let pad_h = (*font_px * 0.5).round();
-                    let pad_v = (*font_px * 0.3).round();
+                    let pad_h = *font_px * 0.5;
+                    let pad_v = *font_px * 0.3;
                     // Natural (unwrapped) width of each column's widest cell.
                     let mut natural = vec![1.0f32; ncols];
                     for row in rows.iter_mut() {
@@ -1731,7 +1753,7 @@ impl ViewerState {
                         widths
                     };
                     for w in cols.iter_mut() {
-                        *w = w.max(8.0).round();
+                        *w = w.max(8.0);
                     }
                     let mut heights = Vec::with_capacity(rows.len());
                     for row in rows.iter_mut() {
@@ -1743,7 +1765,7 @@ impl ViewerState {
                                 row_h = row_h.max(run.line_top + run.line_height);
                             }
                         }
-                        heights.push((row_h + 2.0 * pad_v).round());
+                        heights.push(row_h + 2.0 * pad_v);
                     }
                     *height = heights.iter().sum::<f32>() + (rows.len() + 1) as f32;
                     *col_widths = cols;
@@ -2672,6 +2694,7 @@ impl ViewerState {
             done.insert(slot, img);
         }
         let zoom = self.zoom;
+        let page = self.page_geom;
         let scroll = self.scroll;
         let places = std::mem::take(&mut self.places);
         for frag in &places {
@@ -2682,7 +2705,7 @@ impl ViewerState {
             if let Some(img) = done.remove(&idx) {
                 *scaled = img;
             }
-            let (dw, dh) = fit_draw(size.0, size.1, picture_target_w(*size, *fill, frag.w, zoom));
+            let (dw, dh) = fit_draw(size.0, size.1, page_picture_w(page, zoom, *size, *fill, frag.w));
             let want = (dw as u32, dh as u32);
             let y = frag.y - scroll;
             let visible = y + *height >= 0.0 && y <= view_h;
@@ -2716,6 +2739,7 @@ impl ViewerState {
         }
 
         let scroll_x = self.scroll_x;
+        let page = self.page_geom;
         let fg = self.fg();
         let default_color = Color::rgb(fg[0], fg[1], fg[2]);
         let page_cache = &self.page_cache;
@@ -2784,12 +2808,9 @@ impl ViewerState {
                     );
                 }
                 Block::Picture { scaled, size, fill, height } => {
-                    let draw_w = fit_draw(
-                        size.0,
-                        size.1,
-                        picture_target_w(*size, *fill, text_w, self.zoom),
-                    )
-                    .0 as i32;
+                    let draw_w =
+                        fit_draw(size.0, size.1, page_picture_w(page, self.zoom, *size, *fill, text_w))
+                            .0 as i32;
                     // A float is centered in its column on paper.
                     let indent =
                         if self.paper { ((text_w - draw_w as f32) / 2.0).max(0.0) } else { 0.0 };
@@ -2916,8 +2937,8 @@ impl ViewerState {
                         // else — no grid, no shading.
                         let rule = if paper { PAPER_INK } else { dim };
                         let head_bg = if paper { PAPER_BG } else { self.theme.ui.panel_hover };
-                        let pad_h = (*font_px * 0.5).round();
-                        let pad_v = (*font_px * 0.3).round();
+                        let pad_h = *font_px * 0.5;
+                        let pad_v = *font_px * 0.3;
                         let table_w = (col_widths.iter().map(|w| w + 2.0 * pad_h).sum::<f32>()
                             + (col_widths.len() + 1) as f32) as i32;
                         let thick = if paper { (*font_px / 9.0).round().max(1.0) as i32 } else { 1 };
@@ -3483,6 +3504,73 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Zooming a typeset page magnifies it — it must not re-break the text or
+    /// repaginate the document, and a figure must grow exactly as much as the
+    /// page does (it used to grow as the square of the zoom, because the
+    /// column width already carried it).
+    #[test]
+    fn zooming_a_page_keeps_its_layout() {
+        // A real picture file, so the figure is a laid-out bitmap and not the
+        // "[figure: …]" fallback.
+        let dir = std::env::temp_dir().join("tigriden-viewer-tex-zoom");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut img = RgbaImage::new(400, 300);
+        for p in img.pixels_mut() {
+            p.0 = [200, 200, 220, 255];
+        }
+        img.save(dir.join("plot.png")).unwrap();
+        let path = dir.join("paper.tex");
+        let body = "Filler sentence for the column. ".repeat(200);
+        std::fs::write(
+            &path,
+            format!(
+                "\\documentclass[11pt]{{article}}\n\\begin{{document}}\n\\section{{Intro}}\n{body}\n\
+                 \\begin{{figure}}\n\\includegraphics[width=0.8\\linewidth]{{plot}}\n\
+                 \\caption{{A plot}}\n\\end{{figure}}\n{body}\n\\end{{document}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut font_system = FontSystem::new();
+        let theme = crate::theme::default_theme();
+        let mut viewer = ViewerState::open(
+            &mut font_system,
+            &path,
+            ViewKind::Tex,
+            "Menlo",
+            13.0,
+            theme,
+            [0, 0, 0],
+            900.0,
+            std::sync::Arc::new(|| {}),
+        )
+        .expect("viewer opens the tex file");
+
+        let sheets = viewer.sheets.len();
+        let before: Vec<(usize, f32, f32)> =
+            viewer.places.iter().map(|f| (f.block, f.w, f.h)).collect();
+        assert!(sheets > 1 && before.len() > 3, "need a few pages of filler");
+        assert!(
+            viewer.blocks.iter().any(|b| matches!(b, Block::Picture { .. })),
+            "the figure must be a picture, not the missing-file fallback",
+        );
+
+        viewer.zoom_by(&mut font_system, 2.0);
+        assert!((viewer.zoom - 2.0).abs() < 1e-3, "zoom applied");
+        assert_eq!(viewer.sheets.len(), sheets, "the same document, on the same pages");
+        let after: Vec<(usize, f32, f32)> =
+            viewer.places.iter().map(|f| (f.block, f.w, f.h)).collect();
+        assert_eq!(after.len(), before.len(), "the same fragments, in the same order");
+        for (i, ((b0, w0, h0), (b1, w1, h1))) in before.iter().zip(&after).enumerate() {
+            assert_eq!(b0, b1, "fragment {i} belongs to the same block");
+            let (rw, rh) = (w1 / w0, h1 / h0);
+            assert!((rw - 2.0).abs() < 0.02, "fragment {i} width scaled by {rw}");
+            assert!((rh - 2.0).abs() < 0.05, "fragment {i} height scaled by {rh}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Markdown math has to reach the same box layout the LaTeX view uses:
     /// display equations become their own `Block::Math`, `\tag{…}` supplies the
     /// number, and a `$` in a code span stays a dollar sign.
@@ -3736,6 +3824,7 @@ mod tests {
             .and_then(|v| v.parse().ok())
             .unwrap_or(4);
         let w: u32 = std::env::var("TEX_DUMP_W").ok().and_then(|v| v.parse().ok()).unwrap_or(1700);
+        let zoom: f32 = std::env::var("TEX_DUMP_ZOOM").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
         let h = 2100u32;
         std::fs::create_dir_all(&out).unwrap();
 
@@ -3754,7 +3843,10 @@ mod tests {
             std::sync::Arc::new(|| {}),
         )
         .expect("viewer opens the tex");
-        println!("blocks={} content_h={}", viewer.blocks.len(), viewer.content_h);
+        if (zoom - 1.0).abs() > 0.01 {
+            viewer.zoom_by(&mut font_system, zoom);
+        }
+        println!("blocks={} content_h={} zoom={}", viewer.blocks.len(), viewer.content_h, viewer.zoom);
         let from: usize = std::env::var("TEX_DUMP_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let sheets = viewer.sheets.clone();
         println!("sheets={}", sheets.len());
