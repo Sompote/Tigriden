@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 /// A run of styled text within a paragraph, heading, list item or table cell.
-#[derive(Clone, Default, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Span {
     pub text: String,
     pub bold: bool,
@@ -17,11 +17,55 @@ pub struct Span {
     pub mono: bool,
     /// Accent-colored (\href, \url, \cite, \ref).
     pub link: bool,
+    /// 1 for a superscript, -1 for a subscript, 0 for text on the baseline.
+    /// Inline math and \textsuperscript set it; the viewer draws those runs
+    /// small and off the baseline.
+    pub script: i8,
+    /// Type size as a multiple of the body size: what `\large`, `\small` and
+    /// the rest of TeX's size commands select. 1.0 is `\normalsize`.
+    pub size: f32,
+}
+
+impl Default for Span {
+    fn default() -> Self {
+        Span {
+            text: String::new(),
+            bold: false,
+            italic: false,
+            mono: false,
+            link: false,
+            script: 0,
+            size: 1.0,
+        }
+    }
+}
+
+/// What kind of float a block came out of, which decides how the page
+/// builder may move it.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct FloatInfo {
+    /// Inside a starred float: it spans every column.
+    pub wide: bool,
+    /// A float TeX is free to move to the top of a later page — anything but
+    /// the `[H]` of the float package, which pins it where it is written.
+    pub movable: bool,
+}
+
+/// How a paragraph sets in its column.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum TexAlign {
+    #[default]
+    Justify,
+    Center,
+    Left,
+    Right,
 }
 
 #[derive(PartialEq, Debug)]
 pub enum TexBlock {
-    Paragraph(Vec<Span>),
+    /// A paragraph of running text. `inset` marks the quoted blocks — an
+    /// abstract, a `quote` — that TeX pulls in from both margins.
+    Paragraph { spans: Vec<Span>, align: TexAlign, inset: bool },
     /// level 0 = \part/\chapter, 1 = \section, 2 = \subsection, 3 = deeper.
     Heading { level: u8, spans: Vec<Span> },
     /// Verbatim / lstlisting / minted content, monospace on a panel.
@@ -33,12 +77,15 @@ pub enum TexBlock {
     ListItem { indent: usize, marker: String, spans: Vec<Span> },
     /// rows -> cells -> spans; from tabular. No header semantics in LaTeX,
     /// but \hline after the first row is the common convention.
-    Table(Vec<Vec<Vec<Span>>>),
-    /// \includegraphics: the path as written, plus the requested width as a
+    Table { rows: Vec<Vec<Vec<Span>>>, float: FloatInfo },
+    /// \includegraphics: the path as written, the requested width as a
     /// fraction of the text column (None = the image's natural size).
-    Image { path: String, width: Option<f32> },
-    /// \caption text, shown italic under figures/tables.
-    Caption(Vec<Span>),
+    Image { path: String, width: Option<f32>, float: FloatInfo },
+    /// \caption text, shown under figures/tables.
+    Caption { spans: Vec<Span>, float: FloatInfo },
+    /// A line of the title block: the authors, the date, or — with `small`
+    /// set — the \thanks note that goes with them.
+    Byline { spans: Vec<Span>, small: bool },
     Rule,
 }
 
@@ -69,12 +116,27 @@ struct RefTarget {
     number: String,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct StyleFlags {
     bold: bool,
     italic: bool,
     mono: bool,
     link: bool,
+    script: i8,
+    size: f32,
+}
+
+impl Default for StyleFlags {
+    fn default() -> Self {
+        StyleFlags {
+            bold: false,
+            italic: false,
+            mono: false,
+            link: false,
+            script: 0,
+            size: 1.0,
+        }
+    }
 }
 
 struct ListCtx {
@@ -88,8 +150,13 @@ struct Parser {
     blocks: Vec<TexBlock>,
     spans: Vec<Span>,
     style: StyleFlags,
-    /// One entry per open `{` group, saving the style to restore on `}`.
-    groups: Vec<StyleFlags>,
+    /// One entry per open `{` group: the style and the alignment depth to
+    /// restore on `}`, since `{\centering …}` is scoped to its group.
+    groups: Vec<(StyleFlags, usize)>,
+    /// Alignment depth and text style at each open environment, restored by
+    /// its `\end`: an environment is a group, so a `\scriptsize` or
+    /// `\centering` inside one must not leak past it.
+    env_marks: Vec<(usize, StyleFlags)>,
     lists: Vec<ListCtx>,
     /// Marker for the \item currently being accumulated, if any.
     item: Option<String>,
@@ -104,6 +171,11 @@ struct Parser {
     last_numbered: Option<RefTarget>,
     /// Open floats, so `\caption` knows its own number.
     floats: Vec<RefTarget>,
+    /// One entry per open float environment, describing how it may be set.
+    open_floats: Vec<FloatInfo>,
+    /// Width of each open `minipage`/`subfigure` as a fraction of the text
+    /// column: the figures inside one are that much narrower.
+    boxes: Vec<f32>,
     /// Labels found in this pass (filled on the scanning pass).
     labels: HashMap<String, RefTarget>,
     /// Labels from the scanning pass, used to resolve `\ref` in the real one.
@@ -111,18 +183,334 @@ struct Parser {
     /// Set when everything pushed into the current paragraph so far is a
     /// single formula, so it can be promoted to a display equation.
     solo_math: Option<MathNode>,
-    title: Option<String>,
-    author: Option<String>,
-    date: Option<String>,
+    /// A label the next paragraph runs into, as the journal classes set
+    /// "Abstract—" and "Index Terms—".
+    run_in: Option<Vec<Span>>,
+    /// Alignment in force, one entry per open environment or group that set
+    /// one (`center`, `\centering`, `raggedleft`).
+    aligns: Vec<TexAlign>,
+    /// Depth of the environments TeX sets inset from both margins: an
+    /// `abstract` in an article, a `quote`.
+    inset: usize,
+    meta: Meta,
 }
 
-/// Parses LaTeX source into a flat block list. Never fails: unknown input
-/// passes through as text.
-pub fn parse(source: &str) -> Vec<TexBlock> {
+/// The page the document class asks for, in TeX points: everything the
+/// viewer needs to lay the text out on the same grid the compiler would.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DocStyle {
+    pub page_w: f32,
+    pub page_h: f32,
+    pub margin_x: f32,
+    pub margin_y: f32,
+    /// 1 for a normal document, 2 for the two-column classes and options.
+    pub columns: usize,
+    /// Gap between columns.
+    pub gutter: f32,
+    /// Body type size.
+    pub base_pt: f32,
+    /// Deepest section level that gets a number (`secnumdepth`): 1 numbers
+    /// sections, 0 numbers nothing.
+    pub secnumdepth: i32,
+    /// First-line indent of a paragraph, in points.
+    pub parindent: f32,
+    /// Space between paragraphs, in points.
+    pub parskip: f32,
+    /// Whether captions print a "Figure 1:" label (`labelformat=empty` in a
+    /// `\captionsetup` turns it off).
+    pub caption_labels: bool,
+}
+
+impl Default for DocStyle {
+    fn default() -> Self {
+        // article, 10pt, letterpaper: 345pt of text centered on the page.
+        DocStyle {
+            page_w: 612.0,
+            page_h: 792.0,
+            margin_x: 133.5,
+            margin_y: 108.0,
+            columns: 1,
+            gutter: 10.0,
+            base_pt: 10.0,
+            secnumdepth: 3,
+            parindent: 15.0,
+            parskip: 0.0,
+            caption_labels: true,
+        }
+    }
+}
+
+/// Reads `\documentclass` (and a `geometry` package call, when there is one)
+/// to work out the page the source would compile to. Everything it cannot
+/// recognize keeps the article defaults, which is what most sources are.
+pub fn document_style(source: &str) -> DocStyle {
     let clean = strip_comments(source);
-    let title = find_arg(&clean, "\\title");
-    let author = find_arg(&clean, "\\author");
-    let date = find_arg(&clean, "\\date");
+    let mut style = DocStyle::default();
+    let (opts, class) = match clean.find("\\documentclass") {
+        Some(i) => {
+            let after = &clean[i + "\\documentclass".len()..];
+            let opts = bracket_arg(after).unwrap_or_default();
+            let rest = match after.find('{') {
+                Some(j) => &after[j..],
+                None => "",
+            };
+            (opts, brace_arg(rest).unwrap_or_default())
+        }
+        None => (String::new(), String::new()),
+    };
+    let opts: Vec<String> =
+        opts.split(',').map(|o| o.trim().to_lowercase()).filter(|o| !o.is_empty()).collect();
+    let class = class.trim().to_lowercase();
+    let has = |name: &str| opts.iter().any(|o| o == name);
+
+    // Paper size. A4 is the common non-US case; everything else stays letter.
+    if has("a4paper") || has("a4") {
+        style.page_w = 595.0;
+        style.page_h = 842.0;
+    } else if has("a5paper") {
+        style.page_w = 420.0;
+        style.page_h = 595.0;
+    } else if has("b5paper") {
+        style.page_w = 499.0;
+        style.page_h = 709.0;
+    }
+    for pt in [9.0, 10.0, 11.0, 12.0] {
+        if has(&format!("{pt:.0}pt")) {
+            style.base_pt = pt;
+        }
+    }
+    // Two-column classes and the twocolumn option. IEEE and the ACM/SIG
+    // classes are two-column unless they are told otherwise.
+    let two_by_class = class.starts_with("ieee")
+        || class.starts_with("sig-")
+        || class.starts_with("sigchi")
+        || class == "acmart"
+        || class.starts_with("revtex");
+    if (two_by_class && !has("onecolumn")) || has("twocolumn") {
+        style.columns = 2;
+    }
+    if two_by_class {
+        // The IEEE grid: narrow margins, two 3.5in columns, a 1/6in gutter.
+        style.margin_x = 0.62 * 72.0;
+        style.margin_y = 0.68 * 72.0;
+        style.gutter = 0.17 * 72.0;
+        style.base_pt = if has("9pt") { 9.0 } else { 10.0 };
+    } else if style.columns == 2 {
+        style.margin_x = 72.0;
+        style.margin_y = 90.0;
+        style.gutter = 14.0;
+    } else {
+        // Single-column article: the classic wide-margin measure, which grows
+        // a little with the type size.
+        let text_w = match style.base_pt {
+            p if p >= 12.0 => 390.0,
+            p if p >= 11.0 => 360.0,
+            _ => 345.0,
+        };
+        style.margin_x = ((style.page_w - text_w) / 2.0).max(54.0);
+        style.margin_y = 108.0;
+    }
+
+    // Paragraph shape and numbering depth, as the preamble set them.
+    style.parindent = 1.5 * style.base_pt;
+    if let Some(v) = set_length(&clean, "parindent") {
+        style.parindent = v;
+    }
+    if let Some(v) = set_length(&clean, "parskip") {
+        style.parskip = v;
+    }
+    if let Some(v) = set_counter(&clean, "secnumdepth") {
+        style.secnumdepth = v;
+    }
+    if let Some(i) = clean.find("\\captionsetup") {
+        let arg = brace_arg(&clean[i + "\\captionsetup".len()..]).unwrap_or_default();
+        if arg.contains("labelformat=empty") {
+            style.caption_labels = false;
+        }
+    }
+
+    // An explicit geometry call wins over the class defaults.
+    if let Some(i) = clean.find("{geometry}") {
+        let head = &clean[..i];
+        if let Some(j) = head.rfind("\\usepackage") {
+            apply_geometry(&mut style, &bracket_arg(&head[j + "\\usepackage".len()..]).unwrap_or_default());
+        }
+    }
+    if let Some(i) = clean.find("\\geometry") {
+        let arg = brace_arg(&clean[i + "\\geometry".len()..]).unwrap_or_default();
+        apply_geometry(&mut style, &arg);
+    }
+    style
+}
+
+/// Applies the `geometry` keys the viewer can act on: uniform margins, the
+/// per-side ones, and an explicit text width or height.
+fn apply_geometry(style: &mut DocStyle, opts: &str) {
+    let mut left = None;
+    let mut right = None;
+    for opt in opts.split(',') {
+        let (key, value) = match opt.split_once('=') {
+            Some((k, v)) => (k.trim().to_lowercase(), v.trim()),
+            None => {
+                match opt.trim().to_lowercase().as_str() {
+                    "a4paper" => {
+                        style.page_w = 595.0;
+                        style.page_h = 842.0;
+                    }
+                    "letterpaper" => {
+                        style.page_w = 612.0;
+                        style.page_h = 792.0;
+                    }
+                    "twocolumn" => style.columns = 2,
+                    _ => {}
+                }
+                continue;
+            }
+        };
+        let Some(pt) = length_pt(value) else { continue };
+        match key.as_str() {
+            "margin" => {
+                style.margin_x = pt;
+                style.margin_y = pt;
+            }
+            "hmargin" => style.margin_x = pt,
+            "vmargin" | "tmargin" | "top" | "bmargin" | "bottom" => style.margin_y = pt,
+            "left" | "lmargin" | "inner" => left = Some(pt),
+            "right" | "rmargin" | "outer" => right = Some(pt),
+            "textwidth" => style.margin_x = ((style.page_w - pt) / 2.0).max(18.0),
+            "textheight" => style.margin_y = ((style.page_h - pt) / 2.0).max(18.0),
+            "paperwidth" => style.page_w = pt,
+            "paperheight" => style.page_h = pt,
+            "columnsep" => style.gutter = pt,
+            _ => {}
+        }
+    }
+    if let (Some(l), Some(r)) = (left, right) {
+        style.margin_x = (l + r) / 2.0;
+    } else if let Some(m) = left.or(right) {
+        style.margin_x = m;
+    }
+}
+
+/// The value of a `\setlength{\name}{…}` in the preamble, in points.
+fn set_length(source: &str, name: &str) -> Option<f32> {
+    let needle = format!("\\setlength{{\\{name}}}");
+    let at = source.find(&needle)? + needle.len();
+    let raw = brace_arg(&source[at..])?;
+    // em and ex are relative; a paragraph indent of "1.5em" is common.
+    let raw = raw.trim();
+    if let Some(n) = raw.strip_suffix("em").and_then(|n| n.trim().parse::<f32>().ok()) {
+        return Some(n * 12.0);
+    }
+    if let Some(n) = raw.strip_suffix("ex").and_then(|n| n.trim().parse::<f32>().ok()) {
+        return Some(n * 5.0);
+    }
+    if raw.starts_with('0') && raw.trim_start_matches(['0', '.', ' ']).is_empty() {
+        return Some(0.0);
+    }
+    length_pt(raw)
+}
+
+/// The value of a `\setcounter{name}{…}` in the preamble.
+fn set_counter(source: &str, name: &str) -> Option<i32> {
+    let needle = format!("\\setcounter{{{name}}}");
+    let at = source.find(&needle)? + needle.len();
+    brace_arg(&source[at..])?.trim().parse().ok()
+}
+
+/// The directories a `\graphicspath{{figures/}{plots/}}` declares, in the
+/// order LaTeX would search them.
+pub fn graphics_paths(source: &str) -> Vec<String> {
+    let clean = strip_comments(source);
+    // Balanced, since the argument is a group of groups.
+    let Some(arg) = find_raw_arg(&clean, "\\graphicspath") else { return Vec::new() };
+    // The argument is a list of brace groups: {{figures/}{plots/}}.
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut cur = String::new();
+    for c in arg.chars() {
+        match c {
+            '{' => {
+                depth += 1;
+                if depth == 1 {
+                    cur.clear();
+                }
+            }
+            '}' => {
+                if depth == 1 && !cur.trim().is_empty() {
+                    out.push(cur.trim().to_string());
+                }
+                depth = depth.saturating_sub(1);
+            }
+            _ if depth >= 1 => cur.push(c),
+            _ => {}
+        }
+    }
+    if out.is_empty() && !arg.trim().is_empty() {
+        out.push(arg.trim().to_string());
+    }
+    out
+}
+
+/// A TeX length in points, for the units that show up in class options.
+fn length_pt(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let split = value.find(|c: char| c.is_alphabetic())?;
+    let n: f32 = value[..split].trim().parse().ok()?;
+    let unit = value[split..].trim();
+    Some(match unit {
+        "in" => n * 72.0,
+        "cm" => n * 28.3465,
+        "mm" => n * 2.83465,
+        "pt" | "bp" => n,
+        "pc" => n * 12.0,
+        _ => return None,
+    })
+}
+
+/// The contents of a leading `[...]`, if the text starts with one.
+fn bracket_arg(after: &str) -> Option<String> {
+    let after = after.trim_start();
+    let rest = after.strip_prefix('[')?;
+    let end = rest.find(']')?;
+    Some(rest[..end].to_string())
+}
+
+/// The contents of a leading `{...}`, if the text starts with one.
+fn brace_arg(after: &str) -> Option<String> {
+    let after = after.trim_start();
+    let rest = after.strip_prefix('{')?;
+    let end = rest.find('}')?;
+    Some(rest[..end].to_string())
+}
+
+/// Parses LaTeX source into a flat block list with the default (article)
+/// page style. Never fails: unknown input passes through as text.
+#[cfg(test)]
+pub fn parse(source: &str) -> Vec<TexBlock> {
+    parse_with(source, &DocStyle::default())
+}
+
+/// Parses with the document's own style, which decides how sections are
+/// numbered: the two-column journal classes use roman numerals and letters
+/// where the article classes count 1, 1.1, 1.1.1.
+pub fn parse_with(source: &str, style: &DocStyle) -> Vec<TexBlock> {
+    let clean = strip_comments(source);
+    // \thanks inside \author is the affiliation footnote, not part of the
+    // byline; pull it out before the names are flattened.
+    let raw_author = find_raw_arg(&clean, "\\author").unwrap_or_default();
+    let (author_src, notes) = split_thanks(&raw_author);
+    // Kept raw: the title block is parsed as inline content, so an
+    // affiliation marker set with \textsuperscript stays a superscript.
+    let non_empty = |s: String| (!s.trim().is_empty()).then_some(s);
+    let meta = Meta {
+        title: find_raw_arg(&clean, "\\title").and_then(non_empty),
+        author: non_empty(author_src),
+        date: find_raw_arg(&clean, "\\date").and_then(non_empty),
+        notes,
+        style: *style,
+        cites: bib_numbers(&clean),
+    };
     // Format the body only; the preamble is setup noise.
     let body = match clean.find("\\begin{document}") {
         Some(i) => {
@@ -136,14 +524,138 @@ pub fn parse(source: &str) -> Vec<TexBlock> {
     };
     // A first pass collects every \label and the number it belongs to, so a
     // \ref pointing forward — the common case — still resolves on the second.
-    let mut scan = Parser::new(body, None, None, None, HashMap::new());
+    let mut scan = Parser::new(body, Meta { style: *style, ..Meta::default() }, HashMap::new());
     scan.run();
     let resolved = std::mem::take(&mut scan.labels);
 
-    let mut p = Parser::new(body, title, author, date, resolved);
+    let mut p = Parser::new(body, meta, resolved);
     p.run();
     p.flush_paragraph();
     p.blocks
+}
+
+/// The front matter a `\maketitle` prints, plus the document-wide facts the
+/// body parse needs.
+#[derive(Clone, Default)]
+struct Meta {
+    title: Option<String>,
+    author: Option<String>,
+    date: Option<String>,
+    /// \thanks notes lifted out of the author list.
+    notes: Vec<String>,
+    style: DocStyle,
+    /// Citation key -> the number \bibitem gives it.
+    cites: HashMap<String, usize>,
+}
+
+/// Numbers the `\bibitem` keys in the order they are declared, so `\cite`
+/// prints the number a reader sees in the reference list rather than the key.
+fn bib_numbers(source: &str) -> HashMap<String, usize> {
+    let mut out = HashMap::new();
+    let mut rest = source;
+    while let Some(i) = rest.find("\\bibitem") {
+        rest = &rest[i + "\\bibitem".len()..];
+        // An optional [label] comes before the key.
+        let mut head = rest.trim_start();
+        if let Some(stripped) = head.strip_prefix('[') {
+            match stripped.find(']') {
+                Some(j) => head = stripped[j + 1..].trim_start(),
+                None => continue,
+            }
+        }
+        if let Some(key) = brace_arg(head) {
+            let next = out.len() + 1;
+            out.entry(key.trim().to_string()).or_insert(next);
+        }
+    }
+    out
+}
+
+/// Splits `\thanks{...}` groups out of a raw argument, returning the text
+/// without them and the notes themselves.
+fn split_thanks(raw: &str) -> (String, Vec<String>) {
+    let mut out = String::with_capacity(raw.len());
+    let mut notes = Vec::new();
+    let chars: Vec<char> = raw.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let tail: String = chars[i..].iter().take(9).collect();
+        if tail.starts_with("\\thanks") || tail.starts_with("\\footnote") {
+            let skip = if tail.starts_with("\\thanks") { 7 } else { 9 };
+            let mut j = i + skip;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if chars.get(j) == Some(&'{') {
+                let mut depth = 0usize;
+                let mut note = String::new();
+                while j < chars.len() {
+                    match chars[j] {
+                        '{' => {
+                            depth += 1;
+                            if depth > 1 {
+                                note.push('{');
+                            }
+                        }
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                j += 1;
+                                break;
+                            }
+                            note.push('}');
+                        }
+                        c => note.push(c),
+                    }
+                    j += 1;
+                }
+                notes.push(note);
+                i = j;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    (out, notes)
+}
+
+/// The raw (unflattened) `{...}` argument of the first `\name{`.
+fn find_raw_arg(source: &str, name: &str) -> Option<String> {
+    let mut search = 0;
+    loop {
+        let i = source[search..].find(name)? + search;
+        let after = &source[i + name.len()..];
+        if !after.starts_with('{') {
+            search = i + name.len();
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut arg = String::new();
+        for c in after.chars() {
+            match c {
+                '{' => {
+                    if depth > 0 {
+                        arg.push(c);
+                    }
+                    depth += 1;
+                }
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(arg);
+                    }
+                    arg.push(c);
+                }
+                _ => {
+                    if depth > 0 {
+                        arg.push(c);
+                    }
+                }
+            }
+        }
+        return None;
+    }
 }
 
 /// Cuts every line at its first unescaped `%`.
@@ -227,9 +739,22 @@ fn parse_inline(fragment: &str) -> Vec<Span> {
 
 /// Inline parse that can still resolve cross-references.
 fn parse_inline_with(fragment: &str, resolved: &HashMap<String, RefTarget>) -> Vec<Span> {
-    let mut p = Parser::new(fragment, None, None, None, resolved.clone());
+    let mut p = Parser::new(fragment, Meta::default(), resolved.clone());
     p.run();
-    p.spans
+    // A fragment can contain something that ends a paragraph — a table cell
+    // set with `\RaggedRight`, a stray `\par` — so take back whatever was
+    // flushed into blocks rather than losing it.
+    let mut out: Vec<Span> = Vec::new();
+    for block in &p.blocks {
+        match block {
+            TexBlock::Paragraph { spans, .. }
+            | TexBlock::ListItem { spans, .. }
+            | TexBlock::Heading { spans, .. } => out.extend(spans.iter().cloned()),
+            _ => {}
+        }
+    }
+    out.append(&mut p.spans);
+    out
 }
 
 const CODE_ENVS: [&str; 5] = ["verbatim", "verbatim*", "lstlisting", "minted", "Verbatim"];
@@ -237,20 +762,26 @@ const MATH_ENVS: [&str; 10] = [
     "equation", "equation*", "align", "align*", "gather", "gather*", "displaymath", "eqnarray",
     "eqnarray*", "multline",
 ];
-const TABLE_ENVS: [&str; 4] = ["tabular", "tabular*", "longtable", "array"];
+const TABLE_ENVS: [&str; 6] =
+    ["tabular", "tabular*", "tabularx", "tabulary", "longtable", "array"];
 const LIST_ENVS: [&str; 3] = ["itemize", "enumerate", "description"];
 /// Environments whose begin/end are ignored and content flows through.
-const SKIP_ENVS: [&str; 9] =
-    ["document", "center", "figure", "figure*", "table", "table*", "flushleft", "flushright", "quote"];
+const SKIP_ENVS: [&str; 11] = [
+    "document",
+    "center",
+    "figure",
+    "figure*",
+    "table",
+    "table*",
+    "flushleft",
+    "flushright",
+    "quote",
+    "quotation",
+    "adjustwidth",
+];
 
 impl Parser {
-    fn new(
-        body: &str,
-        title: Option<String>,
-        author: Option<String>,
-        date: Option<String>,
-        resolved: HashMap<String, RefTarget>,
-    ) -> Self {
+    fn new(body: &str, meta: Meta, resolved: HashMap<String, RefTarget>) -> Self {
         Parser {
             chars: body.chars().collect(),
             pos: 0,
@@ -266,12 +797,16 @@ impl Parser {
             tab_counter: 0,
             last_numbered: None,
             floats: Vec::new(),
+            open_floats: Vec::new(),
+            boxes: Vec::new(),
             labels: HashMap::new(),
             resolved,
             solo_math: None,
-            title,
-            author,
-            date,
+            run_in: None,
+            aligns: Vec::new(),
+            env_marks: Vec::new(),
+            inset: 0,
+            meta,
         }
     }
 
@@ -296,7 +831,12 @@ impl Parser {
         }
         let s = self.style;
         if let Some(last) = self.spans.last_mut() {
-            if last.bold == s.bold && last.italic == s.italic && last.mono == s.mono && last.link == s.link
+            if last.bold == s.bold
+                && last.italic == s.italic
+                && last.mono == s.mono
+                && last.link == s.link
+                && last.script == s.script
+                && last.size == s.size
             {
                 last.text.push_str(text);
                 return;
@@ -308,6 +848,8 @@ impl Parser {
             italic: s.italic,
             mono: s.mono,
             link: s.link,
+            script: s.script,
+            size: s.size,
         });
     }
 
@@ -333,6 +875,10 @@ impl Parser {
                 return;
             }
         }
+        if let Some(mut label) = self.run_in.take() {
+            label.append(&mut spans);
+            spans = label;
+        }
         if let Some(marker) = self.item.take() {
             self.blocks.push(TexBlock::ListItem {
                 indent: self.lists.len().max(1),
@@ -342,8 +888,22 @@ impl Parser {
             // Later text in the same \item flows as further list lines.
             self.item = Some(String::new());
         } else {
-            self.blocks.push(TexBlock::Paragraph(spans));
+            self.blocks.push(TexBlock::Paragraph {
+                spans,
+                align: self.align(),
+                inset: self.inset > 0,
+            });
         }
+    }
+
+    /// How the float being filled may be set, if there is one.
+    fn float_info(&self) -> FloatInfo {
+        self.open_floats.last().copied().unwrap_or_default()
+    }
+
+    /// The alignment in force for the paragraph being flushed.
+    fn align(&self) -> TexAlign {
+        self.aligns.last().copied().unwrap_or_default()
     }
 
     /// Pushes inline math, italicizing only the variables.
@@ -353,9 +913,10 @@ impl Parser {
         let alone = self.spans.iter().all(|s| s.text.trim().is_empty());
         let node = parse_math(raw);
         let saved = self.style;
-        for (text, italic) in math_spans(&node) {
-            self.style.italic = italic;
-            self.push_text(&text);
+        for span in math_spans(&node) {
+            self.style.italic = span.italic;
+            self.style.script = span.script;
+            self.push_text(&span.text);
         }
         self.style = saved;
         self.solo_math = alone.then_some(node);
@@ -518,7 +1079,7 @@ impl Parser {
         }
         if self.peek() == Some('{') {
             self.pos += 1;
-            self.groups.push(self.style);
+            self.groups.push((self.style, self.aligns.len()));
             apply(&mut self.style);
         }
     }
@@ -528,25 +1089,59 @@ impl Parser {
         let Some(arg) = self.read_group() else { return };
         self.flush_paragraph();
         let mut spans = parse_inline_with(&arg, &self.resolved);
-        if !starred && (1..=3).contains(&level) {
+        let numbered = !starred
+            && (1..=3).contains(&level)
+            && i32::from(level) <= self.meta.style.secnumdepth;
+        if numbered {
             let idx = (level - 1) as usize;
             self.counters[idx] += 1;
             for c in &mut self.counters[idx + 1..] {
                 *c = 0;
             }
-            let number = self.counters[..=idx]
-                .iter()
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join(".");
-            self.last_numbered =
-                Some(RefTarget { kind: RefKind::Section, number: number.clone() });
-            spans.insert(0, Span { text: format!("{number}  "), ..Span::default() });
+            let (number, label) = self.section_number(level);
+            self.last_numbered = Some(RefTarget { kind: RefKind::Section, number });
+            spans.insert(0, Span { text: label, ..Span::default() });
         }
         self.blocks.push(TexBlock::Heading { level, spans });
     }
 
+    /// The number a section heading prints, as (the number a `\ref` shows,
+    /// the label in front of the title). The two-column journal classes count
+    /// I, A, 1) down the levels; everything else counts 1, 1.1, 1.1.1.
+    fn section_number(&self, level: u8) -> (String, String) {
+        let idx = (level - 1) as usize;
+        let n = self.counters[idx];
+        if self.meta.style.columns == 2 {
+            let number = match level {
+                1 => roman(n),
+                2 => letter(n),
+                _ => n.to_string(),
+            };
+            let label = match level {
+                3 => format!("{number}) "),
+                _ => format!("{number}. "),
+            };
+            return (number, label);
+        }
+        let number = self.counters[..=idx]
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(".");
+        let label = format!("{number}  ");
+        (number, label)
+    }
+
     fn begin_env(&mut self, env: &str) {
+        // An environment is a group: what it changes lasts until its `\end`.
+        // Only the ones that let their content flow get a mark — a tabular or
+        // a display swallows its own `\end`, so no `end_env` would pop it.
+        let consumes_end = CODE_ENVS.contains(&env)
+            || MATH_ENVS.contains(&env)
+            || TABLE_ENVS.contains(&env);
+        if !consumes_end {
+            self.env_marks.push((self.aligns.len(), self.style));
+        }
         if LIST_ENVS.contains(&env) {
             self.flush_paragraph();
             // enumitem's key=value list, e.g. [leftmargin=1.4em,itemsep=1pt].
@@ -575,21 +1170,37 @@ impl Parser {
         } else if TABLE_ENVS.contains(&env) {
             self.flush_paragraph();
             self.skip_opts(); // vertical placement, e.g. [t]
-            if env == "tabular*" {
-                let _ = self.read_group(); // width
+            if matches!(env, "tabular*" | "tabularx" | "tabulary") {
+                let _ = self.read_group(); // target width
             }
             let _ = self.read_group(); // column spec
             let raw = self.read_until_end(env);
-            let table = parse_tabular(&raw, &self.resolved);
-            if !table.is_empty() {
-                self.blocks.push(TexBlock::Table(table));
+            let rows = parse_tabular(&raw, &self.resolved);
+            if !rows.is_empty() {
+                self.blocks.push(TexBlock::Table { rows, float: self.float_info() });
             }
-        } else if env == "abstract" {
+        } else if env == "abstract" || env.eq_ignore_ascii_case("ieeekeywords") || env == "keywords" {
             self.flush_paragraph();
-            self.blocks.push(TexBlock::Heading {
-                level: 2,
-                spans: vec![Span { text: "Abstract".into(), bold: true, ..Span::default() }],
-            });
+            let label = if env == "abstract" { "Abstract" } else { "Index Terms" };
+            if self.meta.style.columns == 2 {
+                // A journal sets the abstract as one bold paragraph that the
+                // label runs into.
+                self.run_in = Some(vec![Span {
+                    text: format!("{label}—"),
+                    bold: true,
+                    italic: true,
+                    ..Span::default()
+                }]);
+                self.style.bold = true;
+            } else {
+                // An article sets the label centered over a block pulled in
+                // from both margins.
+                self.blocks.push(TexBlock::Heading {
+                    level: 5,
+                    spans: vec![Span { text: label.into(), bold: true, ..Span::default() }],
+                });
+                self.inset += 1;
+            }
         } else if env == "thebibliography" {
             let _ = self.read_group();
             self.flush_paragraph();
@@ -598,9 +1209,33 @@ impl Parser {
                 spans: vec![Span { text: "References".into(), bold: true, ..Span::default() }],
             });
             self.lists.push(ListCtx { counter: Some(1) });
+        } else if matches!(env, "minipage" | "subfigure" | "subcaptionblock" | "wrapfigure") {
+            // The figures inside a half-width box are half-width themselves.
+            self.skip_opts();
+            if env == "wrapfigure" {
+                let _ = self.read_group(); // placement
+            }
+            let raw = self.read_group().unwrap_or_default();
+            self.boxes.push(column_fraction(&raw).unwrap_or(1.0));
         } else if SKIP_ENVS.contains(&env) {
             self.flush_paragraph();
-            self.skip_opts(); // float placement, e.g. [htbp]
+            match env {
+                "center" => self.aligns.push(TexAlign::Center),
+                "flushleft" => self.aligns.push(TexAlign::Left),
+                "flushright" => self.aligns.push(TexAlign::Right),
+                "quote" | "quotation" => self.inset += 1,
+                _ => {}
+            }
+            let placement = self.read_opt().unwrap_or_default(); // e.g. [htbp]
+            self.skip_opts();
+            if matches!(env.trim_end_matches('*'), "figure" | "table") {
+                self.open_floats.push(FloatInfo {
+                    wide: env.ends_with('*'),
+                    // The float package's [H] pins a float where it stands;
+                    // everything else may travel to a page top.
+                    movable: !placement.contains('H'),
+                });
+            }
             for _ in 0..env_args(env) {
                 let _ = self.read_group();
             }
@@ -630,14 +1265,39 @@ impl Parser {
     }
 
     fn end_env(&mut self, env: &str) {
+        if matches!(env, "minipage" | "subfigure" | "subcaptionblock" | "wrapfigure") {
+            self.boxes.pop();
+        }
+        if let Some((depth, style)) = self.env_marks.pop() {
+            self.flush_paragraph();
+            self.aligns.truncate(depth);
+            self.style = style;
+        }
         if LIST_ENVS.contains(&env) || env == "thebibliography" {
             self.flush_paragraph();
             self.item = None;
             self.lists.pop();
-        } else if env == "abstract" || SKIP_ENVS.contains(&env) {
+        } else if env == "abstract"
+            || env.eq_ignore_ascii_case("ieeekeywords")
+            || env == "keywords"
+            || SKIP_ENVS.contains(&env)
+        {
             self.flush_paragraph();
+            match env {
+                "center" | "flushleft" | "flushright" => {
+                    self.aligns.pop();
+                }
+                "quote" | "quotation" => self.inset = self.inset.saturating_sub(1),
+                _ => {}
+            }
+            if matches!(env, "abstract" | "keywords") || env.eq_ignore_ascii_case("ieeekeywords") {
+                self.run_in = None;
+                self.style.bold = false;
+                self.inset = self.inset.saturating_sub(1);
+            }
             if matches!(env.trim_end_matches('*'), "figure" | "table") {
                 self.floats.pop();
+                self.open_floats.pop();
             }
         }
     }
@@ -762,7 +1422,11 @@ impl Parser {
             "itshape" | "em" | "it" | "sl" => self.style.italic = true,
             "ttfamily" | "tt" => self.style.mono = true,
             "rmfamily" | "sffamily" | "normalfont" | "mdseries" | "upshape" => {
-                self.style = StyleFlags { link: self.style.link, ..StyleFlags::default() };
+                self.style = StyleFlags {
+                    link: self.style.link,
+                    size: self.style.size,
+                    ..StyleFlags::default()
+                };
             }
             "verb" => {
                 // \verb<delim>...<delim>, raw.
@@ -785,9 +1449,17 @@ impl Parser {
                 self.skip_opts();
                 if let Some(path) = self.read_group() {
                     self.flush_paragraph();
-                    let width = opts.as_deref().and_then(graphics_width);
-                    self.blocks
-                        .push(TexBlock::Image { path: path.trim().to_string(), width });
+                    // A width is relative to the box the picture sits in.
+                    let scale: f32 = self.boxes.iter().product();
+                    let width = opts
+                        .as_deref()
+                        .and_then(graphics_width)
+                        .map(|w| (w * scale).clamp(0.05, 1.0));
+                    self.blocks.push(TexBlock::Image {
+                        path: path.trim().to_string(),
+                        width,
+                        float: self.float_info(),
+                    });
                 }
             }
             "caption" => {
@@ -795,35 +1467,50 @@ impl Parser {
                 if let Some(arg) = self.read_group() {
                     self.flush_paragraph();
                     let mut spans = parse_inline_with(&arg, &self.resolved);
-                    if let Some(float) = self.floats.last() {
-                        spans.insert(
-                            0,
-                            Span {
-                                text: format!("{} {}: ", float.kind.name(), float.number),
-                                bold: true,
-                                ..Span::default()
-                            },
-                        );
+                    if let Some(float) = self.floats.last().filter(|_| self.meta.style.caption_labels) {
+                        // The journal classes label floats "Fig. 1." and
+                        // "TABLE I"; the article classes spell them out.
+                        let label = if self.meta.style.columns == 2 {
+                            match float.kind {
+                                RefKind::Figure => format!("Fig. {}. ", float.number),
+                                _ => format!(
+                                    "TABLE {}. ",
+                                    float
+                                        .number
+                                        .parse::<u64>()
+                                        .map(roman)
+                                        .unwrap_or_else(|_| float.number.clone())
+                                ),
+                            }
+                        } else {
+                            format!("{} {}: ", float.kind.name(), float.number)
+                        };
+                        spans.insert(0, Span { text: label, bold: true, ..Span::default() });
                     }
-                    self.blocks.push(TexBlock::Caption(spans));
+                    self.blocks.push(TexBlock::Caption { spans, float: self.float_info() });
                 }
             }
             "maketitle" => {
                 self.flush_paragraph();
-                if let Some(t) = self.title.clone() {
+                if let Some(t) = self.meta.title.clone() {
                     self.blocks.push(TexBlock::Heading {
                         level: 0,
-                        spans: vec![Span { text: t, bold: true, ..Span::default() }],
+                        spans: parse_inline_with(&t, &self.resolved),
                     });
                 }
-                let byline: Vec<String> =
-                    [self.author.clone(), self.date.clone()].into_iter().flatten().collect();
-                if !byline.is_empty() {
-                    self.blocks.push(TexBlock::Paragraph(vec![Span {
-                        text: byline.join(" — "),
-                        italic: true,
-                        ..Span::default()
-                    }]));
+                for line in [self.meta.author.clone(), self.meta.date.clone()].into_iter().flatten() {
+                    self.blocks.push(TexBlock::Byline {
+                        spans: parse_inline_with(&line, &self.resolved),
+                        small: false,
+                    });
+                }
+                // The \thanks notes print as the footnote they are.
+                let notes = std::mem::take(&mut self.meta.notes);
+                if !notes.is_empty() {
+                    self.blocks.push(TexBlock::Byline {
+                        spans: parse_inline_with(&notes.join(" "), &self.resolved),
+                        small: true,
+                    });
                 }
             }
             "label" => {
@@ -874,9 +1561,22 @@ impl Parser {
             "cite" | "citep" | "citet" | "citealp" | "citeauthor" | "citeyear" => {
                 self.skip_opts();
                 if let Some(arg) = self.read_group() {
+                    // Print the numbers the reference list will show, the way
+                    // a compiled bibliography does; keys with no \bibitem
+                    // fall back to the key itself.
+                    let keys: Vec<String> = arg
+                        .split(',')
+                        .map(|k| {
+                            let k = k.trim();
+                            match self.meta.cites.get(k) {
+                                Some(n) => n.to_string(),
+                                None => k.to_string(),
+                            }
+                        })
+                        .collect();
                     let saved = self.style;
                     self.style.link = true;
-                    self.push_text(&format!("[{}]", arg.trim()));
+                    self.push_text(&format!("[{}]", keys.join(", ")));
                     self.style = saved;
                 }
             }
@@ -922,6 +1622,17 @@ impl Parser {
                     self.style = saved;
                 }
             }
+            "thanks" => {
+                // Outside the title block a \thanks is still a footnote; keep
+                // it out of the running text.
+                if let Some(arg) = self.read_group() {
+                    self.meta.notes.push(arg);
+                }
+            }
+            "textsuperscript" | "textsubscript" => {
+                let up = name == "textsuperscript";
+                self.styled_group(move |st| st.script = if up { 1 } else { -1 });
+            }
             "color" => {
                 let _ = self.read_group();
             }
@@ -950,13 +1661,24 @@ impl Parser {
                 self.push_text("\n")
             }
             "par" => self.flush_paragraph(),
+            "centering" | "raggedright" | "raggedleft" | "RaggedRight" | "RaggedLeft" => {
+                // Scoped to the group or environment it appears in.
+                self.flush_paragraph();
+                self.aligns.push(match name.as_str() {
+                    "centering" => TexAlign::Center,
+                    "raggedleft" | "RaggedLeft" => TexAlign::Right,
+                    _ => TexAlign::Left,
+                });
+            }
+            "tiny" | "scriptsize" | "footnotesize" | "small" | "normalsize" | "large"
+            | "Large" | "LARGE" | "huge" | "Huge" => {
+                self.style.size = type_size(&name);
+            }
             "newpage" | "clearpage" | "pagebreak" | "tableofcontents" | "listoffigures"
-            | "listoftables" | "noindent" | "indent" | "centering" | "raggedright"
-            | "raggedleft" | "smallskip" | "medskip" | "bigskip" | "hfill" | "vfill"
-            | "frontmatter" | "mainmatter" | "backmatter" | "appendix" | "printbibliography"
-            | "selectfont" | "flushbottom" | "onehalfspacing" | "doublespacing"
-            | "singlespacing" | "footnotesize" | "small" | "normalsize" | "large" | "Large"
-            | "LARGE" | "huge" | "Huge" | "tiny" | "scriptsize" => {}
+            | "listoftables" | "noindent" | "indent" | "smallskip" | "medskip" | "bigskip"
+            | "hfill" | "vfill" | "frontmatter" | "mainmatter" | "backmatter" | "appendix"
+            | "printbibliography" | "selectfont" | "flushbottom" | "onehalfspacing"
+            | "doublespacing" | "singlespacing" => {}
             "ldots" | "dots" | "dotsc" | "dotso" => self.push_text("…"),
             "textbackslash" => self.push_text("\\"),
             "textasciitilde" => self.push_text("~"),
@@ -998,13 +1720,14 @@ impl Parser {
                 '{' => {
                     commit!();
                     self.pos += 1;
-                    self.groups.push(self.style);
+                    self.groups.push((self.style, self.aligns.len()));
                 }
                 '}' => {
                     commit!();
                     self.pos += 1;
-                    if let Some(saved) = self.groups.pop() {
-                        self.style = saved;
+                    if let Some((style, aligns)) = self.groups.pop() {
+                        self.style = style;
+                        self.aligns.truncate(aligns);
                     }
                 }
                 '$' => {
@@ -1111,6 +1834,26 @@ impl Parser {
         }
         commit!();
     }
+}
+
+/// A length written as a fraction of the column (`0.47\linewidth`), if that
+/// is what it is.
+fn column_fraction(raw: &str) -> Option<f32> {
+    let raw = raw.trim();
+    let at = raw.find('\\')?;
+    let unit = raw[at + 1..].trim();
+    let named = unit.starts_with("linewidth")
+        || unit.starts_with("textwidth")
+        || unit.starts_with("columnwidth")
+        || unit.starts_with("hsize");
+    if !named {
+        return None;
+    }
+    let head = raw[..at].trim();
+    if head.is_empty() {
+        return Some(1.0);
+    }
+    head.parse::<f32>().ok().map(|f| f.clamp(0.05, 1.0))
 }
 
 /// Reads the width an \includegraphics asks for, as a fraction of the text
@@ -1340,6 +2083,70 @@ fn setup_args(name: &str) -> usize {
         | "captionsetup" | "hypersetup" | "lstset" | "newlength" | "newcounter" => 1,
         _ => 0,
     }
+}
+
+/// TeX's size commands as multiples of the body size.
+fn type_size(name: &str) -> f32 {
+    match name {
+        "tiny" => 0.6,
+        "scriptsize" => 0.72,
+        "footnotesize" => 0.84,
+        "small" => 0.92,
+        "large" => 1.2,
+        "Large" => 1.44,
+        "LARGE" => 1.73,
+        "huge" => 2.07,
+        "Huge" => 2.49,
+        _ => 1.0,
+    }
+}
+
+/// Upper-case roman numerals, for the section numbering of the journal
+/// classes (I, II, III, ...).
+fn roman(mut n: u64) -> String {
+    const TABLE: [(u64, &str); 13] = [
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+    let mut out = String::new();
+    for (value, sym) in TABLE {
+        while n >= value {
+            out.push_str(sym);
+            n -= value;
+        }
+    }
+    if out.is_empty() {
+        out.push('0');
+    }
+    out
+}
+
+/// A, B, ... Z, AA, ... for subsection numbering.
+fn letter(n: u64) -> String {
+    if n == 0 {
+        return "0".into();
+    }
+    let mut n = n - 1;
+    let mut out = Vec::new();
+    loop {
+        out.push((b'A' + (n % 26) as u8) as char);
+        if n < 26 {
+            break;
+        }
+        n = n / 26 - 1;
+    }
+    out.iter().rev().collect()
 }
 
 /// Braced arguments an environment takes before its content.
@@ -1728,48 +2535,78 @@ fn upright(node: MathNode) -> MathNode {
 /// Flattens a formula into runs tagged with whether they are variables.
 /// TeX italicizes variables but sets numbers, operators and function names
 /// like `min` or `tanh` upright; one italic blob gets that visibly wrong.
-pub fn math_spans(node: &MathNode) -> Vec<(String, bool)> {
-    let mut out: Vec<(String, bool)> = Vec::new();
-    collect_spans(node, &mut out);
+pub fn math_spans(node: &MathNode) -> Vec<MathSpan> {
+    let mut out: Vec<MathSpan> = Vec::new();
+    collect_spans(node, &mut out, 0);
     // Merge neighbours that share a style, and drop doubled spaces.
-    let mut merged: Vec<(String, bool)> = Vec::new();
-    for (text, italic) in out {
-        if text.is_empty() {
+    let mut merged: Vec<MathSpan> = Vec::new();
+    for span in out {
+        if span.text.is_empty() {
             continue;
         }
         match merged.last_mut() {
-            Some((prev, prev_it)) if *prev_it == italic => prev.push_str(&text),
-            _ => merged.push((text, italic)),
+            Some(prev) if prev.italic == span.italic && prev.script == span.script => {
+                prev.text.push_str(&span.text)
+            }
+            _ => merged.push(span),
         }
     }
     merged
 }
 
-fn collect_spans(node: &MathNode, out: &mut Vec<(String, bool)>) {
+/// A run of a formula flattened for inline setting: the text, whether TeX
+/// would slant it, and whether it sits above or below the baseline.
+pub struct MathSpan {
+    pub text: String,
+    pub italic: bool,
+    /// 1 superscript, -1 subscript, 0 on the baseline.
+    pub script: i8,
+}
+
+fn collect_spans(node: &MathNode, out: &mut Vec<MathSpan>, script: i8) {
+    let mut push = |text: String, italic: bool| out.push(MathSpan { text, italic, script });
     match node {
-        MathNode::Sym { text, italic } => out.push((text.clone(), *italic)),
-        MathNode::Row(items) => items.iter().for_each(|i| collect_spans(i, out)),
-        MathNode::Space { .. } => out.push((flatten_math(node), false)),
+        MathNode::Sym { text, italic } => push(text.clone(), *italic),
+        MathNode::Row(items) => items.iter().for_each(|i| collect_spans(i, out, script)),
+        MathNode::Space { .. } => push(flatten_math(node), false),
         // Descend so a scripted variable keeps its slant: the `x` of `x^2`
         // is still a variable, even though the exponent is not.
         MathNode::Script { base, sup, sub } => {
-            collect_spans(base, out);
+            collect_spans(base, out, script);
+            // Only one level of raising and lowering: a script inside a
+            // script falls back to the flattened Unicode form.
             if let Some(sb) = sub {
-                out.push((script_text(&flatten_math(sb), false), false));
+                if script == 0 {
+                    collect_spans(sb, out, -1);
+                } else {
+                    out.push(MathSpan {
+                        text: script_text(&flatten_math(sb), false),
+                        italic: false,
+                        script,
+                    });
+                }
             }
             if let Some(sp) = sup {
-                out.push((script_text(&flatten_math(sp), true), false));
+                if script == 0 {
+                    collect_spans(sp, out, 1);
+                } else {
+                    out.push(MathSpan {
+                        text: script_text(&flatten_math(sp), true),
+                        italic: false,
+                        script,
+                    });
+                }
             }
         }
-        MathNode::Accent { base, .. } => collect_spans(base, out),
+        MathNode::Accent { base, .. } => collect_spans(base, out, script),
         MathNode::Fenced { open, close, body } => {
-            out.push((open.clone(), false));
-            collect_spans(body, out);
-            out.push((close.clone(), false));
+            out.push(MathSpan { text: open.clone(), italic: false, script });
+            collect_spans(body, out, script);
+            out.push(MathSpan { text: close.clone(), italic: false, script });
         }
         // Everything else keeps the flattened form; its internals are
         // already positional rather than stylistic.
-        other => out.push((flatten_math(other), false)),
+        other => push(flatten_math(other), false),
     }
 }
 
@@ -1887,7 +2724,7 @@ mod tests {
             other => panic!("expected heading, got {other:?}"),
         }
         match &blocks[1] {
-            TexBlock::Paragraph(spans) => {
+            TexBlock::Paragraph { spans, .. } => {
                 assert_eq!(text_of(spans), "Hello bold and it.");
                 assert!(spans.iter().any(|s| s.bold && s.text == "bold"));
                 assert!(spans.iter().any(|s| s.italic && s.text == "it"));
@@ -1928,7 +2765,7 @@ mod tests {
     fn comments_stripped_and_escapes_kept() {
         let blocks = parse("50\\% done % a comment\nnext line\n");
         match &blocks[0] {
-            TexBlock::Paragraph(spans) => assert_eq!(text_of(spans), "50% done next line"),
+            TexBlock::Paragraph { spans, .. } => assert_eq!(text_of(spans), "50% done next line"),
             other => panic!("expected paragraph, got {other:?}"),
         }
     }
@@ -1939,7 +2776,7 @@ mod tests {
             "\\begin{tabular}{ll}\n\\hline\nA & B \\\\\n1 & 2 \\\\\n\\hline\n\\end{tabular}\n",
         );
         match &blocks[0] {
-            TexBlock::Table(rows) => {
+            TexBlock::Table { rows, .. } => {
                 assert_eq!(rows.len(), 2);
                 assert_eq!(text_of(&rows[0][0]), "A");
                 assert_eq!(text_of(&rows[0][1]), "B");
@@ -1953,11 +2790,11 @@ mod tests {
     fn inline_and_display_math() {
         let blocks = parse("Given $x^2$ we have\n\\[ y = \\alpha x \\]\ndone.\n");
         match &blocks[0] {
-            TexBlock::Paragraph(spans) => {
-                assert!(text_of(spans).contains("x²"));
-                // The variable slants; the exponent is a number, so it does not.
-                assert!(spans.iter().any(|s| s.italic && s.text.contains('x')));
-                assert!(spans.iter().any(|s| !s.italic && s.text.contains('²')));
+            TexBlock::Paragraph { spans, .. } => {
+                assert!(text_of(spans).contains("x2"), "got {}", text_of(spans));
+                // The variable slants; the exponent is a raised, upright run.
+                assert!(spans.iter().any(|s| s.italic && s.script == 0 && s.text.contains('x')));
+                assert!(spans.iter().any(|s| s.script == 1 && s.text.contains('2')));
             }
             other => panic!("expected paragraph, got {other:?}"),
         }
@@ -1976,8 +2813,8 @@ mod tests {
         let all: String = blocks
             .iter()
             .map(|b| match b {
-                TexBlock::Paragraph(s) | TexBlock::ListItem { spans: s, .. } => text_of(s),
-                TexBlock::Table(rows) => {
+                TexBlock::Paragraph { spans: s, .. } | TexBlock::ListItem { spans: s, .. } => text_of(s),
+                TexBlock::Table { rows, .. } => {
                     rows.iter().flatten().map(|c| text_of(c)).collect::<String>()
                 }
                 _ => String::new(),
@@ -1986,7 +2823,7 @@ mod tests {
         assert!(!all.contains("leftmargin"), "enumitem options leaked: {all}");
         assert!(!all.contains("htbp"), "float placement leaked: {all}");
         assert!(!all.contains("]sdfc"), "empty cite options leaked: {all}");
-        assert!(all.contains("[sdfc,mff]"), "citation key missing: {all}");
+        assert!(all.contains("[sdfc, mff]"), "citation keys missing: {all}");
         assert!(all.contains("one"), "list item text missing: {all}");
     }
 
@@ -1995,7 +2832,7 @@ mod tests {
     #[test]
     fn brackets_and_scripts_survive_inline_math() {
         let blocks = parse("Given $x \\in [0,1]^{B \\times C}$ done.\n");
-        let TexBlock::Paragraph(spans) = &blocks[0] else { panic!("expected paragraph") };
+        let TexBlock::Paragraph { spans, .. } = &blocks[0] else { panic!("expected paragraph") };
         let text = text_of(spans);
         assert!(text.contains("[0,1]"), "bracket group lost: {text}");
         assert!(text.contains('B') && text.contains('C'), "script lost: {text}");
@@ -2006,7 +2843,7 @@ mod tests {
     #[test]
     fn inline_math_italicizes_only_variables() {
         let blocks = parse("Let $g = \\min(8, H)$.\n");
-        let TexBlock::Paragraph(spans) = &blocks[0] else { panic!("expected paragraph") };
+        let TexBlock::Paragraph { spans, .. } = &blocks[0] else { panic!("expected paragraph") };
         let italic_of = |needle: &str| {
             spans.iter().find(|s| s.text.contains(needle)).map(|s| s.italic)
         };
@@ -2053,7 +2890,7 @@ mod tests {
         let para = blocks
             .iter()
             .find_map(|b| match b {
-                TexBlock::Paragraph(s) => Some(text_of(s)),
+                TexBlock::Paragraph { spans: s, .. } => Some(text_of(s)),
                 _ => None,
             })
             .expect("paragraph");
@@ -2068,7 +2905,7 @@ mod tests {
         let caps: Vec<String> = blocks
             .iter()
             .filter_map(|b| match b {
-                TexBlock::Caption(s) => Some(text_of(s)),
+                TexBlock::Caption { spans, .. } => Some(text_of(spans)),
                 _ => None,
             })
             .collect();
@@ -2080,7 +2917,7 @@ mod tests {
     #[test]
     fn unresolved_reference_keeps_its_key() {
         let blocks = parse("See \\ref{fig:elsewhere}.\n");
-        let TexBlock::Paragraph(spans) = &blocks[0] else { panic!("expected paragraph") };
+        let TexBlock::Paragraph { spans, .. } = &blocks[0] else { panic!("expected paragraph") };
         assert!(text_of(spans).contains("[fig:elsewhere]"));
     }
 
@@ -2117,7 +2954,7 @@ mod tests {
         let all: String = blocks
             .iter()
             .filter_map(|b| match b {
-                TexBlock::Paragraph(s) => Some(text_of(s)),
+                TexBlock::Paragraph { spans: s, .. } => Some(text_of(s)),
                 _ => None,
             })
             .collect();
@@ -2132,7 +2969,7 @@ mod tests {
     #[test]
     fn multicolumn_keeps_its_content() {
         let blocks = parse("\\begin{tabular}{ll}\\multicolumn{2}{c}{Header} \\\\ a & b \\\\\\end{tabular}\n");
-        let TexBlock::Table(rows) = &blocks[0] else { panic!("expected table, got {blocks:?}") };
+        let TexBlock::Table { rows, .. } = &blocks[0] else { panic!("expected table, got {blocks:?}") };
         let first = text_of(&rows[0][0]);
         assert!(first.contains("Header"), "content lost: {first:?}");
         assert!(!first.contains('c') || !first.contains('2'), "spec leaked: {first:?}");
@@ -2158,7 +2995,7 @@ mod tests {
         assert!(math[0].contains("clip"), "{:?}", math[0]);
         let last = blocks.last().expect("trailing paragraph");
         assert!(
-            matches!(last, TexBlock::Paragraph(s) if text_of(s).contains("stays inline")),
+            matches!(last, TexBlock::Paragraph { spans: s, .. } if text_of(s).contains("stays inline")),
             "inline math must not be promoted: {last:?}"
         );
     }
@@ -2173,9 +3010,162 @@ mod tests {
             other => panic!("expected title heading, got {other:?}"),
         }
         match &blocks[1] {
-            TexBlock::Paragraph(spans) => assert_eq!(text_of(spans), "Ada"),
+            TexBlock::Byline { spans, small } => {
+                assert_eq!(text_of(spans), "Ada");
+                assert!(!small);
+            }
             other => panic!("expected byline, got {other:?}"),
         }
+    }
+
+    /// \thanks inside \author is the affiliation footnote: it leaves the
+    /// byline and comes back as the small line under it.
+    #[test]
+    fn thanks_becomes_a_footnote_line() {
+        let blocks = parse(
+            "\\title{T}\\author{Ada\\thanks{Dept of Maths}}\\begin{document}\\maketitle\\end{document}",
+        );
+        let byline = blocks
+            .iter()
+            .find_map(|b| match b {
+                TexBlock::Byline { spans, small: false } => Some(text_of(spans)),
+                _ => None,
+            })
+            .expect("byline");
+        assert_eq!(byline.trim(), "Ada");
+        let note = blocks
+            .iter()
+            .find_map(|b| match b {
+                TexBlock::Byline { spans, small: true } => Some(text_of(spans)),
+                _ => None,
+            })
+            .expect("thanks note");
+        assert!(note.contains("Dept of Maths"), "note lost: {note}");
+    }
+
+    /// A two-column journal class changes the page, the numbering and the
+    /// float labels; an article keeps 1, 1.1 and "Figure 1:".
+    #[test]
+    fn journal_classes_use_their_own_page_and_numbering() {
+        let ieee = document_style("\\documentclass[journal,10pt]{IEEEtran}");
+        assert_eq!(ieee.columns, 2);
+        assert!(ieee.margin_x < 60.0, "journal margins are narrow: {ieee:?}");
+
+        let source = concat!(
+            "\\documentclass{IEEEtran}\\begin{document}\\section{First}\\subsection{Part}",
+            "\\begin{figure*}\\caption{A wide one}\\end{figure*}\\end{document}",
+        );
+        let blocks = parse_with(source, &ieee);
+        let headings: Vec<String> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                TexBlock::Heading { spans, .. } => Some(text_of(spans)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headings, vec!["I. First".to_string(), "A. Part".to_string()]);
+        let caption = blocks
+            .iter()
+            .find_map(|b| match b {
+                TexBlock::Caption { spans, float } => Some((text_of(spans), float.wide)),
+                _ => None,
+            })
+            .expect("caption");
+        assert_eq!(caption.0, "Fig. 1. A wide one");
+        assert!(caption.1, "a starred float spans both columns");
+
+        let article = parse("\\section{First}\\begin{figure}\\caption{Plain}\\end{figure}");
+        let text: String = article
+            .iter()
+            .map(|b| match b {
+                TexBlock::Heading { spans, .. } | TexBlock::Caption { spans, .. } => text_of(spans),
+                _ => String::new(),
+            })
+            .collect();
+        assert!(text.contains("1  First"), "article numbering: {text}");
+        assert!(text.contains("Figure 1: Plain"), "article caption: {text}");
+    }
+
+    /// An environment is a group: a size or an alignment set inside a float
+    /// must not leak into the text that follows it, and a cell that asks for
+    /// ragged setting must keep its text.
+    #[test]
+    fn environments_scope_what_they_change() {
+        let blocks = parse(concat!(
+            "\\begin{table}[t]\n\\centering\n\\scriptsize\n",
+            "\\begin{tabular}{ll}\n>{\\RaggedRight}A & \\RaggedRight B \\\\\n\\end{tabular}\n",
+            "\\end{table}\nPlain body text.\n",
+        ));
+        let TexBlock::Table { rows, .. } = &blocks[0] else {
+            panic!("expected a table, got {blocks:?}")
+        };
+        assert_eq!(text_of(&rows[0][1]).trim(), "B", "a ragged cell keeps its text");
+        let body = blocks
+            .iter()
+            .find_map(|b| match b {
+                TexBlock::Paragraph { spans, align, .. } => Some((text_of(spans), *align)),
+                _ => None,
+            })
+            .expect("body paragraph");
+        assert_eq!(body.0.trim(), "Plain body text.");
+        assert_eq!(body.1, TexAlign::Justify, "the float's \\centering stopped at \\end");
+        let sizes: Vec<f32> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                TexBlock::Paragraph { spans, .. } => spans.first().map(|s| s.size),
+                _ => None,
+            })
+            .collect();
+        assert!(sizes.iter().all(|s| (*s - 1.0).abs() < 0.01), "\\scriptsize leaked: {sizes:?}");
+    }
+
+    /// The preamble decides the page's paragraph shape and how deep the
+    /// section numbering goes.
+    #[test]
+    fn preamble_sets_paragraph_shape_and_numbering() {
+        let source = concat!(
+            "\\documentclass[11pt]{article}\n",
+            "\\usepackage[letterpaper,margin=1in]{geometry}\n",
+            "\\setcounter{secnumdepth}{0}\n\\setlength{\\parindent}{0pt}\n",
+            "\\setlength{\\parskip}{0.5em}\n\\graphicspath{{figures/}{plots/}}\n",
+            "\\begin{document}\n\\begin{center}{\\LARGE A Title}\\end{center}\n",
+            "\\section{1. Introduction}\nBody.\n\\end{document}\n",
+        );
+        let style = document_style(source);
+        assert_eq!(style.margin_x, 72.0, "geometry margin wins: {style:?}");
+        assert_eq!(style.secnumdepth, 0);
+        assert_eq!(style.parindent, 0.0);
+        assert!(style.parskip > 0.0);
+        assert_eq!(graphics_paths(source), vec!["figures/".to_string(), "plots/".to_string()]);
+
+        let blocks = parse_with(source, &style);
+        let heading = blocks
+            .iter()
+            .find_map(|b| match b {
+                TexBlock::Heading { spans, level: 1 } => Some(text_of(spans)),
+                _ => None,
+            })
+            .expect("section heading");
+        assert_eq!(heading, "1. Introduction", "secnumdepth 0 adds no number");
+        let title = blocks
+            .iter()
+            .find_map(|b| match b {
+                TexBlock::Paragraph { spans, align: TexAlign::Center, .. } => Some(spans.clone()),
+                _ => None,
+            })
+            .expect("centered title");
+        assert!(title[0].size > 1.5, "\\LARGE sets the title big: {:?}", title[0]);
+    }
+
+    /// \cite prints the number the reference list gives the key.
+    #[test]
+    fn citations_print_bibliography_numbers() {
+        let blocks = parse(concat!(
+            "See \\cite{b} and \\cite{a,b}.\\begin{thebibliography}{9}",
+            "\\bibitem{a} First.\\bibitem{b} Second.\\end{thebibliography}",
+        ));
+        let TexBlock::Paragraph { spans, .. } = &blocks[0] else { panic!("expected paragraph") };
+        assert_eq!(text_of(spans), "See [2] and [1, 2].");
     }
 }
 

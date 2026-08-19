@@ -1502,7 +1502,8 @@ impl App {
         }
     }
 
-    /// Cmd+= / Cmd+- / Cmd+0 zoom the viewer (images and PDF pages).
+    /// Cmd+= / Cmd+- / Cmd+0 zoom the viewer (images, PDF pages and the
+    /// typeset LaTeX page).
     fn viewer_zoom_key(&mut self, text: &str, mods: &Mods) -> bool {
         if !mods.meta || mods.ctrl || mods.alt {
             return false;

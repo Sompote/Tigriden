@@ -39,6 +39,67 @@ const PAPER_LINK: [u8; 3] = [24, 78, 158];
 const PAPER_RULE: [u8; 3] = [188, 188, 194];
 const PAPER_CODE_BG: [u8; 3] = [243, 243, 240];
 
+/// Smallest body type a typeset page is set at (device pixels). A pane too
+/// narrow for that gets a page wider than itself, which pans sideways.
+const MIN_BODY_PX: f32 = 11.0;
+
+/// Gap between the page sheets of a paginated document, and the gutter of
+/// app background kept either side of the sheet.
+const PAGE_GAP: f32 = 18.0;
+const PAGE_GUTTER: f32 = 14.0;
+
+/// The geometry of one page of a typeset document, in device pixels: the
+/// sheet, the margins printed around the text, and the column grid inside it.
+/// Everything is derived from the paper size the class asks for, scaled so the
+/// sheet fits the pane, which is what makes the view read like the PDF the
+/// same source compiles to.
+#[derive(Clone, Copy)]
+struct PageGeom {
+    w: f32,
+    h: f32,
+    margin_x: f32,
+    margin_y: f32,
+    columns: usize,
+    /// Gap between columns of a two-column page.
+    gutter: f32,
+}
+
+impl PageGeom {
+    /// Width of one column of text.
+    fn column_w(&self) -> f32 {
+        let text_w = self.w - 2.0 * self.margin_x;
+        let n = self.columns.max(1) as f32;
+        ((text_w - (n - 1.0) * self.gutter) / n).max(48.0)
+    }
+
+    /// Height available for text on a page.
+    fn column_h(&self) -> f32 {
+        (self.h - 2.0 * self.margin_y).max(48.0)
+    }
+
+    /// Left edge of column `i`, relative to the sheet's left edge.
+    fn column_x(&self, i: usize) -> f32 {
+        self.margin_x + i as f32 * (self.column_w() + self.gutter)
+    }
+}
+
+/// Where a block — or a slice of one, for a paragraph continued in the next
+/// column — sits in the document: its top-left corner in content coordinates
+/// (before scrolling), the width it was laid out for, and the vertical slice
+/// of the block it draws.
+#[derive(Clone, Copy)]
+struct Frag {
+    block: usize,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    /// Buffer-space top and bottom of the slice; `0.0` to `f32::MAX` is the
+    /// whole block.
+    from: f32,
+    to: f32,
+}
+
 /// Scrollbar (physical px): track width and minimum thumb height.
 const SCROLLBAR_W: f32 = 12.0;
 const SCROLLBAR_MIN_THUMB: f32 = 32.0;
@@ -84,7 +145,15 @@ fn split_math_tag(body: &str) -> (String, Option<String>) {
 }
 
 enum Block {
-    Text { buffer: Buffer, indent: f32, bg: Option<[u8; 3]>, height: f32 },
+    Text {
+        buffer: Buffer,
+        indent: f32,
+        /// Space kept on the right, for the blocks TeX pulls in from both
+        /// margins (an abstract, a quote).
+        inset_r: f32,
+        bg: Option<[u8; 3]>,
+        height: f32,
+    },
     /// An image; `size` is the original dimensions (layout comes from the
     /// header alone) and `scaled` the latest bitmap from the image worker —
     /// empty until the first one arrives.
@@ -166,9 +235,35 @@ pub struct ViewerState {
     /// Set for LaTeX documents, which are painted on a white sheet with dark
     /// ink the way a PDF of the same source would look.
     paper: bool,
+    /// Page grid for a paginated document (LaTeX): blocks are packed into
+    /// its columns and the sheets are painted under them. None for the
+    /// continuously flowing views (Markdown, CSV, images, PDF pages).
+    page_geom: Option<PageGeom>,
+    /// Every laid-out fragment, in document order; a paragraph split across
+    /// columns contributes one fragment per column.
+    places: Vec<Frag>,
+    /// Space to keep above each block, indexed like `blocks`; missing
+    /// entries fall back to the view's uniform `spacing`.
+    gaps: Vec<f32>,
+    /// Blocks that run across every column instead of sitting in one: the
+    /// title block of a two-column paper. Indexed like `blocks`.
+    spanning: Vec<bool>,
+    /// Blocks the page builder may hold over to the top of a later column,
+    /// as TeX floats a figure or table that will not fit. Indexed like
+    /// `blocks`.
+    floating: Vec<bool>,
+    /// Blocks that must not be left at the bottom of a column without the
+    /// block that follows them (headings, captions above a figure). Indexed
+    /// like `blocks`; missing entries mean "may break after".
+    keep_next: Vec<bool>,
+    /// Sheets of a paginated document as (top, height) in content
+    /// coordinates; empty for the flowing views.
+    sheets: Vec<(f32, f32)>,
     margin: f32,
     spacing: f32,
     font_px: f32,
+    /// Line height as a multiple of the type size, for flowed text.
+    leading: f32,
     theme: &'static ThemeDef,
     /// Effective accent (theme default or the user's override).
     accent: [u8; 3],
@@ -559,9 +654,17 @@ impl ViewerState {
             selecting: false,
             pdf_text: None,
             paper: false,
+            page_geom: None,
+            places: Vec::new(),
+            keep_next: Vec::new(),
+            gaps: Vec::new(),
+            spanning: Vec::new(),
+            floating: Vec::new(),
+            sheets: Vec::new(),
             margin: (font_px * 1.2).round(),
             spacing: (font_px * 0.5).round(),
             font_px,
+            leading: 1.5,
             theme,
             accent,
             font_family,
@@ -601,7 +704,13 @@ impl ViewerState {
             Buffer::new(font_system, Metrics::new(self.font_px, (self.font_px * 1.45).round()));
         buffer.set_wrap(wrap);
         buffer.set_text(text, &attrs, Shaping::Advanced, None);
-        self.blocks.push(Block::Text { buffer, indent: 0.0, bg: None, height: 0.0 });
+        self.blocks.push(Block::Text {
+            buffer,
+            indent: 0.0,
+            inset_r: 0.0,
+            bg: None,
+            height: 0.0,
+        });
     }
 
     fn push_table(
@@ -609,11 +718,21 @@ impl ViewerState {
         font_system: &mut FontSystem,
         rows: Vec<Vec<Vec<(String, Attrs<'static>)>>>,
     ) {
+        // Slightly smaller than body text so wide tables fit more per column.
+        let px = (self.font_px * 0.9).round().max(8.0);
+        self.push_table_sized(font_system, rows, px);
+    }
+
+    /// Lays out a table at an explicit type size.
+    fn push_table_sized(
+        &mut self,
+        font_system: &mut FontSystem,
+        rows: Vec<Vec<Vec<(String, Attrs<'static>)>>>,
+        px: f32,
+    ) {
         if rows.iter().all(|row| row.iter().all(|cell| cell.iter().all(|(t, _)| t.trim().is_empty()))) {
             return;
         }
-        // Slightly smaller than body text so wide tables fit more per column.
-        let px = (self.font_px * 0.9).round().max(8.0);
         let default = ui_attrs().color(self.text_color());
         let mut buffers: Vec<Vec<Buffer>> = Vec::with_capacity(rows.len());
         for cells in rows {
@@ -948,6 +1067,7 @@ impl ViewerState {
                         self.blocks.push(Block::Text {
                             buffer,
                             indent: 0.0,
+                            inset_r: 0.0,
                             bg: Some(code_bg),
                             height: 0.0,
                         });
@@ -990,13 +1110,22 @@ impl ViewerState {
                 // with variables slanted and operators upright.
                 Event::InlineMath(body) => {
                     let node = crate::tex::parse_math(&body);
-                    for (text, is_var) in crate::tex::math_spans(&node) {
+                    for span in crate::tex::math_spans(&node) {
                         let mut attrs =
                             attrs_for(bold, italic, 0, false, self.font_family).family(math_family);
-                        if is_var {
+                        if span.italic {
                             attrs = attrs.style(Style::Italic);
                         }
-                        spans.push((text, attrs));
+                        attrs = attrs.metadata(match span.script {
+                            1 => SCRIPT_SUP,
+                            -1 => SCRIPT_SUB,
+                            _ => SCRIPT_NONE,
+                        });
+                        if span.script != 0 {
+                            let px = (self.font_px * 0.72).round().max(5.0);
+                            attrs = attrs.metrics(Metrics::new(px, (self.font_px * 1.5).round()));
+                        }
+                        spans.push((span.text, attrs));
                     }
                 }
                 // A display equation becomes its own laid-out block — except
@@ -1005,13 +1134,13 @@ impl ViewerState {
                     let (body, number) = split_math_tag(&body);
                     let node = crate::tex::parse_math(&body);
                     if table.is_some() {
-                        for (text, is_var) in crate::tex::math_spans(&node) {
+                        for span in crate::tex::math_spans(&node) {
                             let mut attrs = attrs_for(bold, italic, 0, false, self.font_family)
                                 .family(math_family);
-                            if is_var {
+                            if span.italic {
                                 attrs = attrs.style(Style::Italic);
                             }
-                            spans.push((text, attrs));
+                            spans.push((span.text, attrs));
                         }
                     } else {
                         flush!(self, spans, heading, list_stack, quote_depth);
@@ -1044,14 +1173,36 @@ impl ViewerState {
         node: &crate::tex::MathNode,
         number: Option<&str>,
     ) {
+        let width = self.column_width();
+        self.push_math_within(font_system, node, number, width);
+    }
+
+    /// Lays out a display equation to fit `max_w`. A formula wider than its
+    /// column is set a size or two smaller, the way one would in TeX, rather
+    /// than running into the neighbouring column.
+    fn push_math_within(
+        &mut self,
+        font_system: &mut FontSystem,
+        node: &crate::tex::MathNode,
+        number: Option<&str>,
+        max_w: f32,
+    ) {
         let ink = self.text_color();
         let px = self.font_px;
-        let bx = mathlayout::layout(font_system, node, px * 1.06, ink).into_top_left();
         let num = number
             .map(|n| mathlayout::layout_number(font_system, n, px, ink).into_top_left());
+        let room = (max_w - num.as_ref().map_or(0.0, |n: &MathBox| n.width + px)).max(px * 4.0);
+        let mut size = px * 1.06;
+        let mut bx = mathlayout::layout(font_system, node, size, ink).into_top_left();
+        if bx.width > room {
+            // One measured shrink, floored so a runaway formula stays legible
+            // (and is clipped by the column instead of shrinking to nothing).
+            size = (size * room / bx.width).max(px * 0.62);
+            bx = mathlayout::layout(font_system, node, size, ink).into_top_left();
+        }
         // Hidden copy of the formula so Cmd+A still picks it up.
         let attrs = Attrs::new().family(mathlayout::serif_family(font_system)).color(ink);
-        let mut text = Buffer::new(font_system, Metrics::new(px, (px * 1.4).round()));
+        let mut text = Buffer::new(font_system, Metrics::new(size, (size * 1.4).round()));
         text.set_text(&crate::tex::math_text(node), &attrs, Shaping::Advanced, None);
         let height = bx.height().max(num.as_ref().map_or(0.0, MathBox::height));
         self.blocks.push(Block::Math { bx, number: num, text, height });
@@ -1066,10 +1217,25 @@ impl ViewerState {
         indent: f32,
         align: Option<Align>,
     ) {
+        self.push_inset(font_system, spans, base_px, indent, 0.0, align)
+    }
+
+    /// Same, with space kept on the right as well: an abstract or a quote is
+    /// pulled in from both margins.
+    fn push_inset(
+        &mut self,
+        font_system: &mut FontSystem,
+        spans: &[(String, Attrs<'static>)],
+        base_px: f32,
+        indent: f32,
+        inset_r: f32,
+        align: Option<Align>,
+    ) {
         if spans.iter().all(|(t, _)| t.trim().is_empty()) {
             return;
         }
-        let mut buffer = Buffer::new(font_system, Metrics::new(base_px, (base_px * 1.5).round()));
+        let mut buffer =
+            Buffer::new(font_system, Metrics::new(base_px, (base_px * self.leading).round()));
         buffer.set_wrap(Wrap::WordOrGlyph);
         let default = Attrs::new()
             .family(mathlayout::serif_family(font_system))
@@ -1085,7 +1251,7 @@ impl ViewerState {
                 line.set_align(align);
             }
         }
-        self.blocks.push(Block::Text { buffer, indent, bg: None, height: 0.0 });
+        self.blocks.push(Block::Text { buffer, indent, inset_r, bg: None, height: 0.0 });
     }
 
     /// Adds a figure. Bitmaps go through the image worker as usual; a vector
@@ -1108,18 +1274,53 @@ impl ViewerState {
     }
 
     /// Formats a LaTeX source file. The tex module parses it into blocks and
-    /// display equations; this sets them on a white sheet in serif type with
-    /// justified columns, so the result reads like the PDF the same source
-    /// would compile to.
+    /// display equations; this sets them on the page the document class asks
+    /// for — same paper, same margins, same column grid, scaled to the pane —
+    /// so the result reads like the PDF the source compiles to.
     fn build_tex(&mut self, font_system: &mut FontSystem, path: &Path) -> Result<(), String> {
         let source = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let style = crate::tex::document_style(&source);
+        // Where \includegraphics looks: the document's own folder first, then
+        // whatever \graphicspath declares, then the usual figure folders.
+        let mut search: Vec<std::path::PathBuf> = vec![base_dir.clone()];
+        for dir in crate::tex::graphics_paths(&source) {
+            search.push(base_dir.join(dir));
+        }
+        for dir in ["figures", "figs", "images", "img", "media"] {
+            let candidate = base_dir.join(dir);
+            if candidate.is_dir() && !search.contains(&candidate) {
+                search.push(candidate);
+            }
+        }
 
-        // Paper, with the generous margins a page has.
+        // The sheet fits the pane the way the PDF viewer fits a page, and
+        // every length on it is the page's own length at that scale — except
+        // in a pane too narrow to read at: there the page keeps a legible
+        // body size and pans sideways instead, as a PDF page would.
+        let fit = ((self.width_px - 2.0 * PAGE_GUTTER).max(160.0) / style.page_w)
+            .max(MIN_BODY_PX / style.base_pt);
+        let scale = fit * self.zoom;
+        let sheet_w = (style.page_w * scale).min(MAX_DRAW_W);
+        let scale = sheet_w / style.page_w;
+        let geom = PageGeom {
+            w: sheet_w,
+            h: (style.page_h * scale).round(),
+            margin_x: (style.margin_x * scale).round(),
+            margin_y: (style.margin_y * scale).round(),
+            columns: style.columns,
+            gutter: (style.gutter * scale).round(),
+        };
+        let body_px = (style.base_pt * scale).max(5.0);
         self.paper = true;
-        self.margin = (self.font_px * 2.8).round();
-        self.spacing = (self.font_px * 0.62).round();
+        self.page_geom = Some(geom);
+        self.font_px = body_px;
+        self.margin = geom.margin_x;
+        self.spacing = (body_px * 0.4).round();
+        // TeX sets solid paragraphs: no space between them, one line of
+        // leading, and an indented first line instead.
+        self.leading = 1.22;
 
         let ink = Color::rgb(PAPER_INK[0], PAPER_INK[1], PAPER_INK[2]);
         let muted = Color::rgb(PAPER_MUTED[0], PAPER_MUTED[1], PAPER_MUTED[2]);
@@ -1137,112 +1338,218 @@ impl ViewerState {
             if s.italic {
                 attrs = attrs.style(Style::Italic);
             }
+            attrs = attrs.metadata(match s.script {
+                1 => SCRIPT_SUP,
+                -1 => SCRIPT_SUB,
+                _ => SCRIPT_NONE,
+            });
             attrs
         };
-        let to_spans = |spans: &[crate::tex::Span]| -> Vec<(String, Attrs<'static>)> {
-            spans.iter().map(|s| (s.text.clone(), to_attrs(s))).collect()
+        let leading = self.leading;
+        let to_spans = |spans: &[crate::tex::Span], px: f32| -> Vec<(String, Attrs<'static>)> {
+            spans
+                .iter()
+                .map(|s| {
+                    let mut attrs = to_attrs(s);
+                    // Scripts are set small, as TeX does, and shifted off the
+                    // baseline by the painter; \large and friends scale the
+                    // run outright.
+                    let scale = if s.script != 0 { s.size * 0.72 } else { s.size };
+                    if (scale - 1.0).abs() > 0.01 {
+                        let sp = (px * scale).round().max(5.0);
+                        let line = (px * s.size.max(1.0) * leading).round();
+                        attrs = attrs.metrics(Metrics::new(sp, line));
+                    }
+                    (s.text.clone(), attrs)
+                })
+                .collect()
+        };
+        // The tallest run decides the block's own size, so a `\LARGE` title
+        // inside a centered group is not cramped.
+        let peak = |spans: &[crate::tex::Span]| spans.iter().map(|s| s.size).fold(1.0f32, f32::max);
+        let align_of = |a: crate::tex::TexAlign| match a {
+            crate::tex::TexAlign::Center => Some(Align::Center),
+            crate::tex::TexAlign::Right => Some(Align::Right),
+            crate::tex::TexAlign::Left => Some(Align::Left),
+            crate::tex::TexAlign::Justify => Some(Align::Justified),
         };
 
-        let body_px = self.font_px;
-        for block in crate::tex::parse(&source) {
+        // A paragraph's first line is indented, except right after a heading
+        // or a display, which is TeX's rule — unless the preamble set
+        // \parindent to zero and separates paragraphs with space instead.
+        let indent_em = style.parindent * scale;
+        let parskip = style.parskip * scale;
+        let mut fresh = true;
+        // Space owed under the block just pushed, applied to the next one.
+        let mut carry = 0.0f32;
+        let em = body_px;
+
+        for block in crate::tex::parse_with(&source, &style) {
+            let start = self.blocks.len();
+            let (before, after) = match &block {
+                crate::tex::TexBlock::Heading { level, .. } => match level {
+                    0 => (0.0, 0.35 * em),
+                    1 => (1.5 * em, 0.55 * em),
+                    2 => (1.1 * em, 0.4 * em),
+                    3 => (0.9 * em, 0.3 * em),
+                    5 => (1.2 * em, 0.45 * em),
+                    _ => (0.7 * em, 0.25 * em),
+                },
+                crate::tex::TexBlock::Paragraph { .. } => (parskip, 0.0),
+                crate::tex::TexBlock::Byline { small, .. } => {
+                    if *small {
+                        (1.0 * em, 0.8 * em)
+                    } else {
+                        (0.5 * em, 0.2 * em)
+                    }
+                }
+                crate::tex::TexBlock::Math { .. } => (0.75 * em, 0.75 * em),
+                crate::tex::TexBlock::ListItem { .. } => (0.15 * em, 0.15 * em),
+                crate::tex::TexBlock::Table { .. } => (0.7 * em, 0.5 * em),
+                crate::tex::TexBlock::Image { .. } => (0.9 * em, 0.4 * em),
+                crate::tex::TexBlock::Caption { .. } => (0.35 * em, 0.9 * em),
+                crate::tex::TexBlock::Code(_) => (0.6 * em, 0.6 * em),
+                crate::tex::TexBlock::Rule => (0.5 * em, 0.5 * em),
+            };
             match block {
                 crate::tex::TexBlock::Heading { level, spans } => {
+                    // Title and section heads take the class's own style: the
+                    // two-column journals center a small-caps head, the
+                    // article classes set a large bold one flush left.
+                    let ieee = style.columns == 2;
+                    let (scale, align, bold, italic, upper) = match level {
+                        0 => (1.65, Some(Align::Center), false, false, false),
+                        1 if ieee => (1.0, Some(Align::Center), false, false, true),
+                        2 if ieee => (1.0, None, false, true, false),
+                        3 if ieee => (1.0, None, false, true, false),
+                        1 => (1.44, None, true, false, false),
+                        2 => (1.2, None, true, false, false),
+                        3 => (1.05, None, true, false, false),
+                        // The "Abstract" label of an article, centered over
+                        // the block it introduces.
+                        5 => (0.98, Some(Align::Center), true, false, false),
+                        _ => (1.0, None, true, false, false),
+                    };
+                    let px = (body_px * scale).round();
                     let styled: Vec<(String, Attrs<'static>)> = spans
                         .iter()
                         .map(|s| {
                             let mut b = s.clone();
-                            b.bold = true;
+                            b.bold |= bold;
+                            b.italic |= italic;
+                            if upper {
+                                b.text = b.text.to_uppercase();
+                            }
                             (b.text.clone(), to_attrs(&b))
                         })
                         .collect();
-                    // A \maketitle title is centered; sections are flush left.
-                    let (scale, align) = match level {
-                        0 => (1.85, Some(Align::Center)),
-                        1 => (1.42, None),
-                        2 => (1.2, None),
-                        3 => (1.06, None),
-                        _ => (1.0, None),
-                    };
-                    self.push_aligned(
-                        font_system,
-                        &styled,
-                        (body_px * scale).round(),
-                        0.0,
-                        align,
-                    );
+                    self.push_aligned(font_system, &styled, px, 0.0, align);
+                    self.mark_keep(start);
+                    if level == 0 {
+                        // The title block runs across the whole page, above
+                        // the columns, the way \maketitle sets it.
+                        self.mark_spanning(start);
+                    }
+                    fresh = true;
                 }
-                crate::tex::TexBlock::Paragraph(spans) => {
-                    let styled = to_spans(&spans);
+                crate::tex::TexBlock::Byline { spans, small } => {
+                    let px = if small { (body_px * 0.8).round() } else { body_px };
+                    let styled = to_spans(&spans, px);
+                    let align = if small { Some(Align::Justified) } else { Some(Align::Center) };
+                    self.push_aligned(font_system, &styled, px, 0.0, align);
+                    self.mark_spanning(start);
+                    fresh = true;
+                }
+                crate::tex::TexBlock::Paragraph { spans, align, inset } => {
+                    let px = (body_px * if inset { 0.94 } else { 1.0 }).round();
+                    let mut styled = to_spans(&spans, px);
+                    let centered = align != crate::tex::TexAlign::Justify;
+                    if !fresh && !centered && indent_em >= 1.0 {
+                        // An em quad at the indent's size gives TeX's
+                        // \parindent without touching the shaper.
+                        styled.insert(0, ("\u{2003}".into(), serif.clone().color(ink).metrics(
+                            Metrics::new(indent_em, (body_px * leading).round()),
+                        )));
+                    }
                     // Justified columns are the strongest visual cue that
                     // this is a typeset document rather than a text dump.
-                    self.push_aligned(
-                        font_system,
-                        &styled,
-                        body_px,
-                        0.0,
-                        Some(Align::Justified),
-                    );
+                    let pad = if inset { body_px * 2.2 } else { 0.0 };
+                    let base = (px * peak(&spans)).round();
+                    self.push_inset(font_system, &styled, base, pad, pad, align_of(align));
+                    fresh = false;
                 }
                 crate::tex::TexBlock::Code(text) => {
                     let attrs = mono(fam).color(ink);
-                    let px = (body_px * 0.92).round();
+                    let px = (body_px * 0.88).round();
                     let mut buffer =
-                        Buffer::new(font_system, Metrics::new(px, (px * 1.4).round()));
+                        Buffer::new(font_system, Metrics::new(px, (px * 1.35).round()));
                     buffer.set_wrap(Wrap::WordOrGlyph);
                     buffer.set_text(&text, &attrs, Shaping::Advanced, None);
                     self.blocks.push(Block::Text {
                         buffer,
                         indent: 0.0,
+                        inset_r: 0.0,
                         bg: Some(PAPER_CODE_BG),
                         height: 0.0,
                     });
+                    fresh = true;
                 }
                 crate::tex::TexBlock::Math { node, number } => {
                     self.push_math(font_system, &node, number.as_deref());
+                    fresh = true;
                 }
                 crate::tex::TexBlock::ListItem { indent, marker, spans } => {
                     let mut styled = Vec::with_capacity(spans.len() + 1);
                     if !marker.is_empty() {
                         styled.push((marker, serif.clone().color(ink)));
                     }
-                    styled.extend(to_spans(&spans));
-                    let pad = indent as f32 * 1.6 * body_px;
-                    self.push_aligned(font_system, &styled, body_px, pad, None);
+                    styled.extend(to_spans(&spans, body_px));
+                    let pad = indent as f32 * 1.4 * body_px;
+                    self.push_aligned(font_system, &styled, body_px, pad, Some(Align::Justified));
+                    fresh = true;
                 }
-                crate::tex::TexBlock::Table(rows) => {
+                crate::tex::TexBlock::Table { rows, float } => {
+                    let px = (body_px * 0.86).round().max(6.0);
                     let cells: Vec<Vec<Vec<(String, Attrs<'static>)>>> = rows
                         .iter()
                         .enumerate()
                         .map(|(r, row)| {
                             row.iter()
                                 .map(|cell| {
-                                    cell.iter()
+                                    let bolded: Vec<crate::tex::Span> = cell
+                                        .iter()
                                         .map(|s| {
                                             // First row bolded as the header.
                                             let mut b = s.clone();
                                             b.bold |= r == 0;
-                                            (b.text.clone(), to_attrs(&b))
+                                            b
                                         })
-                                        .collect()
+                                        .collect();
+                                    to_spans(&bolded, px)
                                 })
                                 .collect()
                         })
                         .collect();
-                    self.push_table(font_system, cells);
+                    self.push_table_sized(font_system, cells, px);
+                    self.mark_float(start, float, style.columns);
+                    fresh = true;
                 }
-                crate::tex::TexBlock::Image { path: name, width } => {
+                crate::tex::TexBlock::Image { path: name, width, float } => {
                     // \includegraphics usually omits the extension and lets
-                    // the driver pick; try the formats we can decode.
+                    // the driver pick; try the formats we can decode, in each
+                    // of the folders LaTeX would search.
                     let mut resolved = None;
-                    let direct = base_dir.join(&name);
-                    if direct.is_file() {
-                        resolved = Some(direct);
-                    } else {
+                    'search: for dir in &search {
+                        let direct = dir.join(&name);
+                        if direct.is_file() {
+                            resolved = Some(direct);
+                            break;
+                        }
                         for ext in ["pdf", "png", "jpg", "jpeg"] {
-                            let candidate = base_dir.join(format!("{name}.{ext}"));
+                            let candidate = dir.join(format!("{name}.{ext}"));
                             if candidate.is_file() {
                                 resolved = Some(candidate);
-                                break;
+                                break 'search;
                             }
                         }
                     }
@@ -1258,29 +1565,25 @@ impl ViewerState {
                             Some(Align::Center),
                         );
                     }
+                    self.mark_keep(start);
+                    self.mark_float(start, float, style.columns);
+                    fresh = true;
                 }
-                crate::tex::TexBlock::Caption(spans) => {
-                    let styled: Vec<(String, Attrs<'static>)> = spans
-                        .iter()
-                        .map(|s| {
-                            let mut attrs = if s.mono { mono(fam) } else { serif.clone() };
-                            attrs = attrs.color(muted);
-                            if s.bold {
-                                attrs = attrs.weight(Weight::BOLD);
-                            }
-                            (s.text.clone(), attrs)
-                        })
-                        .collect();
-                    self.push_aligned(
-                        font_system,
-                        &styled,
-                        (body_px * 0.92).round(),
-                        body_px,
-                        Some(Align::Center),
-                    );
+                crate::tex::TexBlock::Caption { spans, float } => {
+                    let px = (body_px * 0.86).round();
+                    let styled = to_spans(&spans, px);
+                    self.push_aligned(font_system, &styled, px, 0.0, Some(Align::Justified));
+                    // A caption belongs with the float it names.
+                    self.mark_keep(start);
+                    self.mark_float(start, float, style.columns);
+                    fresh = true;
                 }
-                crate::tex::TexBlock::Rule => self.blocks.push(Block::Rule),
+                crate::tex::TexBlock::Rule => {
+                    self.blocks.push(Block::Rule);
+                    fresh = true;
+                }
             }
+            self.finish_block(start, before, after, &mut carry);
         }
         if self.blocks.is_empty() {
             let attrs = serif.color(ink);
@@ -1289,43 +1592,94 @@ impl ViewerState {
         Ok(())
     }
 
-    /// Recomputes block sizes for the current width and zoom.
+    /// Records the space kept above the blocks a source block turned into,
+    /// and carries the space owed under it to the next one. TeX quotes both
+    /// halves for every construct; the larger of the two wins, as it does in
+    /// TeX's own glue.
+    fn finish_block(&mut self, start: usize, before: f32, after: f32, carry: &mut f32) {
+        if self.blocks.len() <= start {
+            return;
+        }
+        while self.gaps.len() < self.blocks.len() {
+            self.gaps.push(self.spacing);
+        }
+        self.gaps[start] = before.max(*carry).round();
+        *carry = after;
+    }
+
+    /// Marks the block at `idx` as one that must not be stranded at the foot
+    /// of a column without what follows it.
+    fn mark_keep(&mut self, idx: usize) {
+        while self.keep_next.len() <= idx {
+            self.keep_next.push(false);
+        }
+        self.keep_next[idx] = true;
+    }
+
+    /// Marks the block at `idx` as running across every column.
+    fn mark_spanning(&mut self, idx: usize) {
+        while self.spanning.len() <= idx {
+            self.spanning.push(false);
+        }
+        self.spanning[idx] = true;
+    }
+
+    /// Records how the float a block came from may be set: spanning every
+    /// column, and/or free to move to the top of a later column.
+    fn mark_float(&mut self, idx: usize, float: crate::tex::FloatInfo, columns: usize) {
+        if float.wide && columns > 1 {
+            self.mark_spanning(idx);
+        }
+        if float.movable {
+            while self.floating.len() <= idx {
+                self.floating.push(false);
+            }
+            self.floating[idx] = true;
+        }
+    }
+
+    /// Recomputes block sizes for the current width and zoom, then places
+    /// every block: into the column grid of a paginated document, or one
+    /// under the other for the views that simply flow.
     fn reflow(&mut self, font_system: &mut FontSystem) {
-        let text_w = self.text_width();
+        let col_w = self.column_width();
+        // A block that spans the page — the title block, a starred float —
+        // is laid out for the whole text width instead of one column.
+        let full_w = match &self.page_geom {
+            Some(g) => g.w - 2.0 * g.margin_x,
+            None => col_w,
+        };
+        let spanning = std::mem::take(&mut self.spanning);
         let zoom = self.zoom;
-        let mut total = self.margin;
-        let mut max_w = text_w;
-        for block in self.blocks.iter_mut() {
+        let mut max_w = col_w;
+        for (bi, block) in self.blocks.iter_mut().enumerate() {
+            let text_w = if spanning.get(bi).copied().unwrap_or(false) { full_w } else { col_w };
             match block {
-                Block::Text { buffer, indent, bg, height } => {
-                    buffer.set_size(Some((text_w - *indent).max(48.0)), None);
+                Block::Text { buffer, indent, inset_r, bg, height } => {
+                    buffer.set_size(Some((text_w - *indent - *inset_r).max(48.0)), None);
                     buffer.shape_until_scroll(font_system, false);
                     let mut h = 0.0f32;
                     for run in buffer.layout_runs() {
                         h = h.max(run.line_top + run.line_height);
                     }
                     *height = h + if bg.is_some() { self.font_px } else { 0.0 };
-                    total += *height + self.spacing;
                 }
                 Block::Picture { size, fill, height, .. } => {
                     let (draw_w, draw_h) =
                         fit_draw(size.0, size.1, picture_target_w(*size, *fill, text_w, zoom));
                     *height = draw_h;
                     max_w = max_w.max(draw_w);
-                    total += draw_h + self.spacing;
                 }
                 Block::Page { size, height, .. } => {
                     let (draw_w, draw_h) = fit_draw(size.0, size.1, text_w * zoom);
                     *height = draw_h;
                     max_w = max_w.max(draw_w);
-                    total += draw_h + self.spacing;
                 }
-                Block::Rule => total += self.font_px + self.spacing,
+                Block::Rule => {}
                 // Equations are laid out once, at build time: their size does
                 // not depend on the column width.
-                Block::Math { bx, height, .. } => {
+                Block::Math { bx, .. } => {
                     max_w = max_w.max(bx.width);
-                    total += *height + self.spacing;
                 }
                 Block::Table { rows, font_px, col_widths, row_heights, height } => {
                     let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
@@ -1394,20 +1748,374 @@ impl ViewerState {
                     *height = heights.iter().sum::<f32>() + (rows.len() + 1) as f32;
                     *col_widths = cols;
                     *row_heights = heights;
-                    total += *height + self.spacing;
                 }
             }
         }
-        self.content_h = total + self.margin;
-        self.content_w = max_w + 2.0 * self.margin;
+        self.spanning = spanning;
+        self.place(max_w);
         self.clamp_scroll();
+    }
+
+    /// Width one column of text is laid out for: a page's column in a
+    /// paginated document, the whole pane minus margins otherwise.
+    fn column_width(&self) -> f32 {
+        match &self.page_geom {
+            Some(g) => g.column_w(),
+            None => self.text_width(),
+        }
+    }
+
+    /// Left edge of the sheet within the pane. A page wider than the pane
+    /// (zoomed in) starts at the gutter and pans horizontally instead.
+    fn sheet_x(&self) -> f32 {
+        let Some(g) = &self.page_geom else { return self.margin };
+        ((self.width_px - g.w) / 2.0).max(PAGE_GUTTER)
+    }
+
+    /// Assigns every block a position. Paginated documents fill one column
+    /// after another and start a new sheet when the last column is full,
+    /// splitting a paragraph that runs off the bottom the way TeX would;
+    /// everything else stacks in one flowing column.
+    fn place(&mut self, max_w: f32) {
+        self.places.clear();
+        self.sheets.clear();
+        let Some(g) = self.page_geom else {
+            let text_w = self.text_width();
+            let mut y = self.margin;
+            for (i, block) in self.blocks.iter().enumerate() {
+                let h = self.block_height(block);
+                if i > 0 {
+                    y += self.gap_before(i);
+                }
+                self.places.push(Frag {
+                    block: i,
+                    x: self.margin,
+                    y,
+                    w: text_w,
+                    h,
+                    from: 0.0,
+                    to: f32::MAX,
+                });
+                y += h;
+            }
+            self.content_h = y + self.margin;
+            self.content_w = max_w + 2.0 * self.margin;
+            return;
+        };
+
+        let sheet_x = self.sheet_x();
+        let full_w = g.w - 2.0 * g.margin_x;
+        let col_w = g.column_w();
+        let full_h = g.column_h();
+        let mut sheet_top = PAGE_GAP;
+        // Height taken by the full-width blocks at the top of the sheet — a
+        // title block or a starred float — and what is left for the columns.
+        let mut col_top = 0.0f32;
+        let mut col_h = full_h;
+        let mut col = 0usize;
+        // Height used in the current column, and the deepest column on this
+        // sheet: a block taller than a column grows the sheet rather than
+        // spilling over its edge.
+        let mut used = 0.0f32;
+        let mut deepest = 0.0f32;
+        let mut i = 0usize;
+        // Where the current block starts drawing, for a paragraph continued
+        // from the previous column.
+        let mut from = 0.0f32;
+        // Floats waiting for the top of a column (or, for the full-width
+        // ones, a page), exactly as TeX holds a float over.
+        let mut deferred: Vec<usize> = Vec::new();
+
+        macro_rules! place_full {
+            ($idx:expr) => {{
+                let idx = $idx;
+                let gap = if col_top > 0.0 { self.gap_before(idx) } else { 0.0 };
+                let h = self.block_height(&self.blocks[idx]);
+                self.places.push(Frag {
+                    block: idx,
+                    x: sheet_x + g.margin_x,
+                    y: sheet_top + g.margin_y + col_top + gap,
+                    w: full_w,
+                    h,
+                    from: 0.0,
+                    to: f32::MAX,
+                });
+                col_top += gap + h;
+                deepest = deepest.max(col_top);
+            }};
+        }
+        macro_rules! finish_sheet {
+            () => {{
+                let sheet_h = g.h.max(deepest + 2.0 * g.margin_y);
+                self.sheets.push((sheet_top, sheet_h));
+                sheet_top += sheet_h + PAGE_GAP;
+                col = 0;
+                used = 0.0;
+                deepest = 0.0;
+                col_top = 0.0;
+                col_h = full_h;
+            }};
+        }
+
+        while i < self.blocks.len() {
+            // A column starts by taking whatever floats are waiting, which is
+            // where TeX puts them too.
+            if used == 0.0 && !deferred.is_empty() {
+                let mut k = 0;
+                while k < deferred.len() {
+                    let b = deferred[k];
+                    if self.spanning.get(b).copied().unwrap_or(false) {
+                        k += 1;
+                        continue;
+                    }
+                    let h = self.block_height(&self.blocks[b]);
+                    let gap = if used > 0.0 { self.gap_before(b) } else { 0.0 };
+                    if used > 0.0 && gap + h > col_h - used {
+                        break;
+                    }
+                    self.places.push(Frag {
+                        block: b,
+                        x: sheet_x + g.column_x(col),
+                        y: sheet_top + g.margin_y + col_top + used + gap,
+                        w: col_w,
+                        h,
+                        from: 0.0,
+                        to: f32::MAX,
+                    });
+                    used += gap + h;
+                    deepest = deepest.max(col_top + used);
+                    deferred.remove(k);
+                }
+            }
+            // The top of a sheet is where full-width material goes: the title
+            // block, and any float that has been waiting for a page top.
+            if col == 0 && used == 0.0 {
+                while !deferred.is_empty() && col_top < full_h * 0.8 {
+                    place_full!(deferred.remove(0));
+                }
+                while i < self.blocks.len()
+                    && self.spanning.get(i).copied().unwrap_or(false)
+                    && col_top < full_h * 0.8
+                {
+                    place_full!(i);
+                    i += 1;
+                }
+                col_h = (full_h - col_top).max(full_h * 0.15);
+                if i >= self.blocks.len() {
+                    break;
+                }
+            }
+            if self.spanning.get(i).copied().unwrap_or(false) {
+                // Mid-page: hold it over for the next page rather than
+                // squeezing it into a column.
+                deferred.push(i);
+                i += 1;
+                continue;
+            }
+            // A float that will not fit here travels to the top of the next
+            // column, and the text after it keeps flowing — which is what
+            // leaves a LaTeX page full instead of half empty.
+            if self.floating.get(i).copied().unwrap_or(false) && used > 0.0 {
+                let (end, need) = self.float_group(i);
+                if need > col_h - used {
+                    for b in i..end {
+                        deferred.push(b);
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+            let gap = if used > 0.0 && from == 0.0 { self.gap_before(i) } else { 0.0 };
+            let h = self.block_height(&self.blocks[i]) - from;
+            let left = col_h - used - gap;
+            // A paragraph splits so the column stays full; anything else moves
+            // whole, and a block too tall for any column grows the sheet
+            // instead of hanging off it. A heading keeps the block under it
+            // company rather than sitting alone at the foot of a column.
+            let keep = self.keep_next.get(i).copied().unwrap_or(false);
+            // A heading or caption needs the head of the next block with it.
+            let need = h + if keep { self.keep_room(i) } else { 0.0 };
+            let cut = (h > left + 0.5 && !keep)
+                .then(|| self.split_at(i, from, left))
+                .flatten();
+            if need > left + 0.5 && (used > 0.0 || cut.is_some()) {
+                if let Some(cut) = cut {
+                    self.places.push(Frag {
+                        block: i,
+                        x: sheet_x + g.column_x(col),
+                        y: sheet_top + g.margin_y + col_top + used + gap,
+                        w: col_w,
+                        h: cut - from,
+                        from,
+                        to: cut,
+                    });
+                    deepest = deepest.max(col_top + used + gap + cut - from);
+                    from = cut;
+                }
+                col += 1;
+                used = 0.0;
+                if col >= g.columns.max(1) {
+                    finish_sheet!();
+                }
+                continue;
+            }
+            self.places.push(Frag {
+                block: i,
+                x: sheet_x + g.column_x(col),
+                y: sheet_top + g.margin_y + col_top + used + gap,
+                w: col_w,
+                h,
+                from,
+                to: f32::MAX,
+            });
+            used += gap + h;
+            deepest = deepest.max(col_top + used);
+            from = 0.0;
+            i += 1;
+        }
+        // Floats still in hand get pages of their own at the end, which is
+        // where LaTeX flushes them too.
+        while !deferred.is_empty() {
+            if deepest > 0.0 {
+                finish_sheet!();
+            }
+            let before = deferred.len();
+            while !deferred.is_empty() && col_top < full_h * 0.8 {
+                place_full!(deferred.remove(0));
+            }
+            if deferred.len() == before {
+                break;
+            }
+        }
+        if deepest > 0.0 || !self.blocks.is_empty() {
+            let sheet_h = g.h.max(deepest + 2.0 * g.margin_y);
+            self.sheets.push((sheet_top, sheet_h));
+            sheet_top += sheet_h + PAGE_GAP;
+        }
+        self.content_h = sheet_top;
+        self.content_w = (g.w + 2.0 * PAGE_GUTTER).max(self.width_px);
+        // The trailing flush leaves the column cursors behind on purpose.
+        let _ = (col, used, col_h);
+    }
+
+    /// The run of blocks a float contributes — its caption and its body —
+    /// as (one past the last block, the height they need together).
+    fn float_group(&self, start: usize) -> (usize, f32) {
+        let mut end = start;
+        let mut need = 0.0;
+        while end < self.blocks.len() && self.floating.get(end).copied().unwrap_or(false) {
+            if end > start {
+                need += self.gap_before(end);
+            }
+            need += self.block_height(&self.blocks[end]);
+            end += 1;
+        }
+        (end.max(start + 1), need)
+    }
+
+    /// Blank space to keep under block `i`: a heading (or a caption above its
+    /// figure) needs the start of what follows on the same column, or it
+    /// reads as a stranded line.
+    fn keep_room(&self, i: usize) -> f32 {
+        if !self.keep_next.get(i).copied().unwrap_or(false) {
+            return 0.0;
+        }
+        match self.blocks.get(i + 1) {
+            Some(next) => self.block_height(next).min(self.font_px * 3.0),
+            None => 0.0,
+        }
+    }
+
+    /// Space kept above block `i`. The LaTeX builder sets these per block —
+    /// paragraphs run on with no gap at all, headings get air above them —
+    /// and everything else falls back to the view's uniform spacing.
+    fn gap_before(&self, i: usize) -> f32 {
+        self.gaps.get(i).copied().unwrap_or(self.spacing)
+    }
+
+    /// The line boundary of a text block nearest under `budget` pixels from
+    /// `from`, or None when the block cannot usefully be split there (it is
+    /// not text, or one of the halves would be a single stranded line).
+    fn split_at(&self, block: usize, from: f32, budget: f32) -> Option<f32> {
+        let Some(Block::Text { buffer, bg, .. }) = self.blocks.get(block) else { return None };
+        if bg.is_some() {
+            // Code panels carry a background; splitting one would cut the box.
+            return None;
+        }
+        let tops: Vec<f32> = buffer
+            .layout_runs()
+            .map(|r| r.line_top)
+            .filter(|t| *t >= from - 0.5)
+            .collect();
+        // Two lines have to stay on each side of the break.
+        if tops.len() < 4 {
+            return None;
+        }
+        let cut = tops
+            .iter()
+            .copied()
+            .skip(2)
+            .take(tops.len() - 4 + 1)
+            .filter(|t| *t - from <= budget)
+            .next_back()?;
+        Some(cut)
+    }
+
+    /// The laid-out height of a block, spacing excluded.
+    fn block_height(&self, block: &Block) -> f32 {
+        match block {
+            Block::Rule => self.font_px,
+            Block::Text { height, .. }
+            | Block::Picture { height, .. }
+            | Block::Page { height, .. }
+            | Block::Math { height, .. }
+            | Block::Table { height, .. } => *height,
+        }
     }
 
     pub fn set_viewport(&mut self, font_system: &mut FontSystem, width_px: f32, _height_px: f32) {
         if (width_px - self.width_px).abs() > 1.0 {
+            // A page's type size follows its width, so a resized pane
+            // re-typesets the document rather than reflowing the old sizes —
+            // but only once the width has really moved, since dragging the
+            // split sends a stream of one-pixel changes and setting a long
+            // paper again is not free.
+            let step = (self.width_px * 0.015).max(2.0);
+            let retypeset = self.kind == ViewKind::Tex && (width_px - self.width_px).abs() > step;
             self.width_px = width_px.max(64.0);
-            self.reflow(font_system);
+            if retypeset {
+                self.rebuild_tex(font_system);
+            } else {
+                self.reflow(font_system);
+            }
         }
+    }
+
+    /// Re-typesets a LaTeX document after the page scale changed (a resized
+    /// pane, a zoom step), keeping the reader roughly where they were.
+    fn rebuild_tex(&mut self, font_system: &mut FontSystem) {
+        let anchor = if self.content_h > 1.0 { self.scroll / self.content_h } else { 0.0 };
+        let path = self.path.clone();
+        self.blocks.clear();
+        self.places.clear();
+        self.sheets.clear();
+        self.gaps.clear();
+        self.keep_next.clear();
+        self.spanning.clear();
+        self.sel_anchor = None;
+        self.sel_head = None;
+        // The image worker holds the originals and is keyed by block index,
+        // which the rebuild reproduces exactly; the new picture blocks simply
+        // ask it for their bitmaps again.
+        self.img_paths.clear();
+        self.pending_imgs.clear();
+        if self.build_tex(font_system, &path).is_err() {
+            return;
+        }
+        self.img_paths.clear();
+        self.reflow(font_system);
+        self.scroll = anchor * self.content_h;
+        self.clamp_scroll();
     }
 
     fn clamp_scroll(&mut self) {
@@ -1521,15 +2229,57 @@ impl ViewerState {
         }
     }
 
-    /// Vertical space a block occupies in the document, spacing included.
-    fn advance(&self, block: &Block) -> f32 {
-        match block {
-            Block::Rule => self.font_px + self.spacing,
-            Block::Text { height, .. }
-            | Block::Picture { height, .. }
-            | Block::Page { height, .. }
-            | Block::Math { height, .. }
-            | Block::Table { height, .. } => *height + self.spacing,
+    /// Paints the sheets a paper document sits on: one white rectangle per
+    /// page, edged with a hairline so it still reads as paper against a light
+    /// theme, and the page number centered in the bottom margin the way TeX
+    /// prints it. Views that flow rather than paginate get one tall sheet.
+    fn paint_sheets(
+        &self,
+        canvas: &mut Canvas,
+        font_system: &mut FontSystem,
+        swash_cache: &mut SwashCache,
+        view_h: f32,
+    ) {
+        let Some(g) = self.page_geom else {
+            let gutter = (self.margin * 0.35).round();
+            let top = (-self.scroll).min(0.0).max(-1.0);
+            let sheet_h = (self.content_h - self.scroll).min(view_h) - top;
+            canvas.fill_rect(
+                gutter as i32,
+                top as i32,
+                (self.width_px - 2.0 * gutter) as i32,
+                sheet_h.max(0.0) as i32,
+                PAPER_BG,
+            );
+            return;
+        };
+        let x = (self.sheet_x() - self.scroll_x) as i32;
+        let edge = [214, 214, 218];
+        let num_px = (self.font_px * 0.85).round().max(7.0);
+        let attrs = Attrs::new()
+            .family(mathlayout::serif_family(font_system))
+            .color(Color::rgb(PAPER_MUTED[0], PAPER_MUTED[1], PAPER_MUTED[2]));
+        for (i, (top, height)) in self.sheets.iter().enumerate() {
+            let y = top - self.scroll;
+            if y + height < 0.0 || y > view_h {
+                continue;
+            }
+            canvas.fill_rect(x, y as i32, g.w as i32, *height as i32, PAPER_BG);
+            let (w, h) = (g.w as i32, *height as i32);
+            canvas.fill_rect(x - 1, y as i32 - 1, w + 2, 1, edge);
+            canvas.fill_rect(x - 1, y as i32 + h, w + 2, 1, edge);
+            canvas.fill_rect(x - 1, y as i32, 1, h, edge);
+            canvas.fill_rect(x + w, y as i32, 1, h, edge);
+            let mut buffer =
+                Buffer::new(font_system, Metrics::new(num_px, (num_px * 1.3).round()));
+            buffer.set_text(&(i + 1).to_string(), &attrs, Shaping::Advanced, None);
+            buffer.shape_until_scroll(font_system, false);
+            let tw = buffer.layout_runs().map(|r| r.line_w).fold(0.0f32, f32::max);
+            let nx = x + ((g.w - tw) / 2.0) as i32;
+            let ny = (y + height - g.margin_y * 0.62) as i32;
+            buffer.draw(font_system, swash_cache, attrs.color_opt.unwrap(), |px, py, pw, ph, color| {
+                canvas.blend_rect(nx + px, ny + py, pw as i32, ph as i32, color);
+            });
         }
     }
 
@@ -1539,23 +2289,26 @@ impl ViewerState {
     /// view has no text at all (plain images, page-rendered PDFs).
     fn hit_text(&self, x: f32, y: f32) -> Option<(usize, Cursor)> {
         let doc_y = y + self.scroll;
-        let mut top = self.margin;
+        let doc_x = x + self.scroll_x;
         let mut best: Option<(usize, Cursor)> = None;
-        for (i, block) in self.blocks.iter().enumerate() {
-            if let Block::Text { buffer, indent, bg, .. } = block {
-                if doc_y < top && best.is_some() {
-                    break;
-                }
-                let pad = if bg.is_some() { self.font_px / 2.0 } else { 0.0 };
-                let cursor = buffer
-                    .hit(x - self.margin - *indent, doc_y - top - pad)
-                    .unwrap_or_else(|| Cursor::new(0, 0));
-                best = Some((i, cursor));
-                if doc_y < top {
-                    break;
-                }
+        for frag in &self.places {
+            let Block::Text { buffer, indent, bg, .. } = &self.blocks[frag.block] else { continue };
+            let pad = if bg.is_some() { self.font_px / 2.0 } else { 0.0 };
+            let cursor = buffer
+                .hit(doc_x - frag.x - *indent, doc_y - frag.y - pad + frag.from)
+                .unwrap_or_else(|| Cursor::new(0, 0));
+            let inside = doc_y >= frag.y
+                && doc_y < frag.y + frag.h
+                && doc_x >= frag.x - self.spacing
+                && doc_x < frag.x + frag.w + self.spacing;
+            if inside {
+                return Some((frag.block, cursor));
             }
-            top += self.advance(block);
+            // Otherwise keep the last fragment that started above the
+            // pointer, so a drag past the end of a column still selects.
+            if doc_y >= frag.y || best.is_none() {
+                best = Some((frag.block, cursor));
+            }
         }
         best
     }
@@ -1565,19 +2318,16 @@ impl ViewerState {
     /// the worker, or for views with no pages at all.
     fn hit_page(&self, x: f32, y: f32) -> Option<(usize, usize)> {
         let doc_y = y + self.scroll;
-        let text_w = self.text_width();
-        let mut top = self.margin;
         // The page containing doc_y, or the last one above it.
         let mut found: Option<(usize, f32, f32)> = None;
-        for block in &self.blocks {
-            if let Block::Page { index, size, height } = block {
-                let draw_w = fit_draw(size.0, size.1, text_w * self.zoom).0;
-                found = Some((*index, top, draw_w / size.0.max(1.0)));
-                if doc_y < top + *height {
+        for frag in &self.places {
+            if let Block::Page { index, size, .. } = &self.blocks[frag.block] {
+                let draw_w = fit_draw(size.0, size.1, frag.w * self.zoom).0;
+                found = Some((*index, frag.y, draw_w / size.0.max(1.0)));
+                if doc_y < frag.y + frag.h {
                     break;
                 }
             }
-            top += self.advance(block);
         }
         let (index, page_top, scale) = found?;
         let layer = self.page_text.get(&index)?;
@@ -1796,7 +2546,7 @@ impl ViewerState {
     /// Whether zoom applies: images always, PDFs only when pages rendered
     /// (the text-extraction fallback has nothing to magnify).
     pub fn zoomable(&self) -> bool {
-        matches!(self.kind, ViewKind::Image) || self.worker.is_some()
+        matches!(self.kind, ViewKind::Image | ViewKind::Tex) || self.worker.is_some()
     }
 
     /// Multiplies the zoom, keeping the viewport center roughly anchored.
@@ -1810,8 +2560,13 @@ impl ViewerState {
         }
         let ratio = next / self.zoom;
         self.zoom = next;
-        self.reflow(font_system);
-        self.scroll *= ratio;
+        if self.kind == ViewKind::Tex {
+            // A bigger page means bigger type, so the document is set again.
+            self.rebuild_tex(font_system);
+        } else {
+            self.reflow(font_system);
+            self.scroll *= ratio;
+        }
         self.scroll_x = (self.scroll_x + self.width_px / 2.0) * ratio - self.width_px / 2.0;
         self.clamp_scroll();
     }
@@ -1823,8 +2578,12 @@ impl ViewerState {
         let ratio = 1.0 / self.zoom;
         self.zoom = 1.0;
         self.scroll_x = 0.0;
-        self.reflow(font_system);
-        self.scroll *= ratio;
+        if self.kind == ViewKind::Tex {
+            self.rebuild_tex(font_system);
+        } else {
+            self.reflow(font_system);
+            self.scroll *= ratio;
+        }
         self.clamp_scroll();
     }
 
@@ -1848,23 +2607,14 @@ impl ViewerState {
                 }
             }
         }
-        let target_w = self.text_width() * self.zoom;
-        let mut y = self.margin - self.scroll;
+        let target_w = self.column_width() * self.zoom;
         // (page index, size, intersects viewport) in document order.
         let mut pages: Vec<(usize, (f32, f32), bool)> = Vec::new();
-        for block in &self.blocks {
-            let advance = match block {
-                Block::Text { height, .. }
-                | Block::Picture { height, .. }
-                | Block::Math { height, .. }
-                | Block::Table { height, .. } => *height,
-                Block::Rule => self.font_px,
-                Block::Page { index, size, height } => {
-                    pages.push((*index, *size, y + *height >= 0.0 && y <= view_h));
-                    *height
-                }
-            };
-            y += advance + self.spacing;
+        for frag in &self.places {
+            if let Block::Page { index, size, .. } = &self.blocks[frag.block] {
+                let y = frag.y - self.scroll;
+                pages.push((*index, *size, y + frag.h >= 0.0 && y <= view_h));
+            }
         }
         let (Some(first), Some(last)) = (
             pages.iter().position(|&(_, _, v)| v),
@@ -1921,36 +2671,30 @@ impl ViewerState {
             self.pending_imgs.remove(&slot);
             done.insert(slot, img);
         }
-        let text_w = self.text_width();
         let zoom = self.zoom;
-        let mut y = self.margin - self.scroll;
-        for (idx, block) in self.blocks.iter_mut().enumerate() {
-            let advance = match block {
-                Block::Text { height, .. }
-                | Block::Table { height, .. }
-                | Block::Math { height, .. } => *height,
-                Block::Rule => self.font_px,
-                Block::Page { height, .. } => *height,
-                Block::Picture { scaled, size, fill, height } => {
-                    if let Some(img) = done.remove(&idx) {
-                        *scaled = img;
-                    }
-                    let (dw, dh) =
-                        fit_draw(size.0, size.1, picture_target_w(*size, *fill, text_w, zoom));
-                    let want = (dw as u32, dh as u32);
-                    let visible = y + *height >= 0.0 && y <= view_h;
-                    if visible
-                        && (scaled.width(), scaled.height()) != want
-                        && self.pending_imgs.get(&idx) != Some(&want)
-                        && worker.req_tx.send((idx, want.0, want.1)).is_ok()
-                    {
-                        self.pending_imgs.insert(idx, want);
-                    }
-                    *height
-                }
+        let scroll = self.scroll;
+        let places = std::mem::take(&mut self.places);
+        for frag in &places {
+            let idx = frag.block;
+            let Block::Picture { scaled, size, fill, height } = &mut self.blocks[idx] else {
+                continue;
             };
-            y += advance + self.spacing;
+            if let Some(img) = done.remove(&idx) {
+                *scaled = img;
+            }
+            let (dw, dh) = fit_draw(size.0, size.1, picture_target_w(*size, *fill, frag.w, zoom));
+            let want = (dw as u32, dh as u32);
+            let y = frag.y - scroll;
+            let visible = y + *height >= 0.0 && y <= view_h;
+            if visible
+                && (scaled.width(), scaled.height()) != want
+                && self.pending_imgs.get(&idx) != Some(&want)
+                && worker.req_tx.send((idx, want.0, want.1)).is_ok()
+            {
+                self.pending_imgs.insert(idx, want);
+            }
         }
+        self.places = places;
     }
 
     pub fn render(
@@ -1968,24 +2712,10 @@ impl ViewerState {
         let mut canvas = Canvas { pixels: frame.make_mut_slice(), width: w, height: h };
         canvas.fill(bg);
         if self.paper {
-            // One continuous sheet: the document sits on paper, with a gutter
-            // of app background either side so it reads as a page.
-            let gutter = (self.margin * 0.35).round();
-            let top = (-self.scroll).min(0.0).max(-1.0);
-            let sheet_h = (self.content_h - self.scroll).min(h as f32) - top;
-            canvas.fill_rect(
-                gutter as i32,
-                top as i32,
-                (w as f32 - 2.0 * gutter) as i32,
-                sheet_h.max(0.0) as i32,
-                PAPER_BG,
-            );
+            self.paint_sheets(&mut canvas, font_system, swash_cache, h as f32);
         }
 
-        let mut y = self.margin - self.scroll;
-        let margin = self.margin;
         let scroll_x = self.scroll_x;
-        let text_w = self.text_width();
         let fg = self.fg();
         let default_color = Color::rgb(fg[0], fg[1], fg[2]);
         let page_cache = &self.page_cache;
@@ -1993,76 +2723,93 @@ impl ViewerState {
         let sel = self.sel_range();
         let page_sel = self.page_sel_range();
         let sel_color = Color::rgba(self.accent[0], self.accent[1], self.accent[2], 80);
-        for (block_i, block) in self.blocks.iter_mut().enumerate() {
-            match block {
-                Block::Text { buffer, indent, bg: block_bg, height } => {
-                    if y + *height >= 0.0 && y <= h as f32 {
-                        let x0 = (margin + *indent) as i32;
-                        let pad = if block_bg.is_some() { (self.font_px / 2.0) as i32 } else { 0 };
-                        if let Some(color) = block_bg {
-                            canvas.fill_rect(
-                                x0 - pad,
-                                y as i32,
-                                (text_w - *indent) as i32 + 2 * pad,
-                                *height as i32,
-                                *color,
-                            );
-                        }
-                        let oy = y as i32 + pad;
-                        // Selection highlight behind the glyphs.
-                        if let Some(((sb, sc), (eb, ec))) = sel {
-                            if block_i >= sb && block_i <= eb {
-                                let s = if block_i == sb { sc } else { Cursor::new(0, 0) };
-                                let e = if block_i == eb {
-                                    ec
-                                } else {
-                                    Cursor::new(usize::MAX, usize::MAX)
-                                };
-                                for run in buffer.layout_runs() {
-                                    for (hx, hw) in run.highlight(s, e) {
-                                        canvas.blend_rect(
-                                            x0 + hx as i32,
-                                            oy + run.line_top as i32,
-                                            hw.ceil() as i32,
-                                            run.line_height.ceil() as i32,
-                                            sel_color,
-                                        );
-                                    }
+        let places = std::mem::take(&mut self.places);
+        for frag in &places {
+            let block_i = frag.block;
+            let y = frag.y - self.scroll;
+            let text_w = frag.w;
+            if y + frag.h < 0.0 || y > h as f32 {
+                continue;
+            }
+            let margin = frag.x - scroll_x;
+            match &mut self.blocks[block_i] {
+                Block::Text { buffer, indent, inset_r, bg: block_bg, .. } => {
+                    let x0 = (margin + *indent) as i32;
+                    let pad = if block_bg.is_some() { (self.font_px / 2.0) as i32 } else { 0 };
+                    if let Some(color) = block_bg {
+                        canvas.fill_rect(
+                            x0 - pad,
+                            y as i32,
+                            (text_w - *indent - *inset_r) as i32 + 2 * pad,
+                            frag.h as i32,
+                            *color,
+                        );
+                    }
+                    let oy = y as i32 + pad;
+                    // Selection highlight behind the glyphs.
+                    if let Some(((sb, sc), (eb, ec))) = sel {
+                        if block_i >= sb && block_i <= eb {
+                            let s = if block_i == sb { sc } else { Cursor::new(0, 0) };
+                            let e = if block_i == eb {
+                                ec
+                            } else {
+                                Cursor::new(usize::MAX, usize::MAX)
+                            };
+                            for run in buffer.layout_runs() {
+                                if run.line_top < frag.from - 0.5 || run.line_top >= frag.to - 0.5 {
+                                    continue;
+                                }
+                                for (hx, hw) in run.highlight(s, e) {
+                                    canvas.blend_rect(
+                                        x0 + hx as i32,
+                                        oy + (run.line_top - frag.from) as i32,
+                                        hw.ceil() as i32,
+                                        run.line_height.ceil() as i32,
+                                        sel_color,
+                                    );
                                 }
                             }
                         }
-                        buffer.draw(font_system, swash_cache, default_color, |px, py, pw, ph, color| {
-                            canvas.blend_rect(x0 + px, oy + py, pw as i32, ph as i32, color);
-                        });
                     }
-                    y += *height + self.spacing;
+                    draw_buffer_slice(
+                        buffer,
+                        font_system,
+                        swash_cache,
+                        &mut canvas,
+                        default_color,
+                        x0,
+                        oy,
+                        frag.from,
+                        frag.to,
+                    );
                 }
                 Block::Picture { scaled, size, fill, height } => {
-                    if y + *height >= 0.0 && y <= h as f32 {
-                        let draw_w = fit_draw(
-                            size.0,
-                            size.1,
-                            picture_target_w(*size, *fill, text_w, self.zoom),
-                        )
-                        .0 as i32;
-                        // A float is centered in its column on paper.
-                        let indent =
-                            if self.paper { ((text_w - draw_w as f32) / 2.0).max(0.0) } else { 0.0 };
-                        let x0 = (margin + indent - scroll_x) as i32;
-                        if scaled.width() == draw_w as u32 && scaled.height() == *height as u32 {
-                            blit_image(&mut canvas, scaled, x0, y as i32);
-                        } else if scaled.width() > 0 {
-                            // Decode/rescale still in flight: nearest preview.
-                            blit_scaled(&mut canvas, scaled, x0, y as i32, draw_w, *height as i32);
-                        } else {
-                            canvas.fill_rect(x0, y as i32, draw_w, *height as i32, self.theme.ui.panel_hover);
-                        }
+                    let draw_w = fit_draw(
+                        size.0,
+                        size.1,
+                        picture_target_w(*size, *fill, text_w, self.zoom),
+                    )
+                    .0 as i32;
+                    // A float is centered in its column on paper.
+                    let indent =
+                        if self.paper { ((text_w - draw_w as f32) / 2.0).max(0.0) } else { 0.0 };
+                    let x0 = (margin + indent) as i32;
+                    if scaled.width() == draw_w as u32 && scaled.height() == *height as u32 {
+                        blit_image(&mut canvas, scaled, x0, y as i32);
+                    } else if scaled.width() > 0 {
+                        // Decode/rescale still in flight: nearest preview.
+                        blit_scaled(&mut canvas, scaled, x0, y as i32, draw_w, *height as i32);
+                    } else {
+                        // Not decoded yet: a light frame on paper, so the
+                        // page does not flash a dark hole while it loads.
+                        let wait =
+                            if self.paper { PAPER_CODE_BG } else { self.theme.ui.panel_hover };
+                        canvas.fill_rect(x0, y as i32, draw_w, *height as i32, wait);
                     }
-                    y += *height + self.spacing;
                 }
                 Block::Page { index, size, height } => {
-                    if y + *height >= 0.0 && y <= h as f32 {
-                        let x0 = (margin - scroll_x) as i32;
+                    {
+                        let x0 = margin as i32;
                         let dim = colors::base_palette(self.theme)[8];
                         let draw_w = fit_draw(size.0, size.1, text_w * self.zoom).0 as i32;
                         match page_cache.get(index) {
@@ -2106,16 +2853,14 @@ impl ViewerState {
                         canvas.fill_rect(x0 - 1, y as i32, 1, ph, dim);
                         canvas.fill_rect(x0 + draw_w, y as i32, 1, ph, dim);
                     }
-                    y += *height + self.spacing;
                 }
                 Block::Rule => {
                     let ry = (y + self.font_px / 2.0) as i32;
                     let dim = if self.paper { PAPER_RULE } else { colors::base_palette(self.theme)[8] };
                     canvas.fill_rect(margin as i32, ry, text_w as i32, 1, dim);
-                    y += self.font_px + self.spacing;
                 }
                 Block::Math { bx, number, height, .. } => {
-                    if y + *height >= 0.0 && y <= h as f32 {
+                    {
                         // Display equations are centered in the column, with
                         // the number set flush right like LaTeX does.
                         let x0 = margin + ((text_w - bx.width) / 2.0).max(0.0);
@@ -2161,21 +2906,27 @@ impl ViewerState {
                             }
                         }
                     }
-                    y += *height + self.spacing;
                 }
                 Block::Table { rows, font_px, col_widths, row_heights, height } => {
-                    if y + *height >= 0.0 && y <= h as f32 && !col_widths.is_empty() {
-                        let dim = if self.paper { PAPER_RULE } else { colors::base_palette(self.theme)[8] };
-                        let head_bg = if self.paper { PAPER_CODE_BG } else { self.theme.ui.panel_hover };
+                    if !col_widths.is_empty() {
+                        let paper = self.paper;
+                        let dim = if paper { PAPER_RULE } else { colors::base_palette(self.theme)[8] };
+                        // On paper a table is set booktabs style: rules above
+                        // the head, under it and at the foot, and nothing
+                        // else — no grid, no shading.
+                        let rule = if paper { PAPER_INK } else { dim };
+                        let head_bg = if paper { PAPER_BG } else { self.theme.ui.panel_hover };
                         let pad_h = (*font_px * 0.5).round();
                         let pad_v = (*font_px * 0.3).round();
                         let table_w = (col_widths.iter().map(|w| w + 2.0 * pad_h).sum::<f32>()
                             + (col_widths.len() + 1) as f32) as i32;
-                        canvas.fill_rect(margin as i32, y as i32, table_w, 1, dim);
-                        let mut row_y = y + 1.0;
+                        let thick = if paper { (*font_px / 9.0).round().max(1.0) as i32 } else { 1 };
+                        let nrows = rows.len();
+                        canvas.fill_rect(margin as i32, y as i32, table_w, thick, rule);
+                        let mut row_y = y + thick as f32;
                         for (ri, row) in rows.iter_mut().enumerate() {
                             let row_h = row_heights[ri];
-                            if ri == 0 {
+                            if ri == 0 && !paper {
                                 canvas.fill_rect(
                                     margin as i32 + 1,
                                     row_y as i32,
@@ -2188,31 +2939,40 @@ impl ViewerState {
                             for (ci, buffer) in row.iter_mut().enumerate() {
                                 let ox = (cell_x + pad_h) as i32;
                                 let oy = (row_y + pad_v) as i32;
-                                buffer.draw(
+                                draw_buffer_slice(
+                                    buffer,
                                     font_system,
                                     swash_cache,
+                                    &mut canvas,
                                     default_color,
-                                    |px, py, pw, ph, color| {
-                                        canvas.blend_rect(ox + px, oy + py, pw as i32, ph as i32, color);
-                                    },
+                                    ox,
+                                    oy,
+                                    0.0,
+                                    f32::MAX,
                                 );
                                 cell_x += col_widths[ci] + 2.0 * pad_h + 1.0;
                             }
                             row_y += row_h;
-                            canvas.fill_rect(margin as i32, row_y as i32, table_w, 1, dim);
+                            let last = ri + 1 == nrows;
+                            if !paper || ri == 0 || last {
+                                let t = if paper && last { thick } else { 1 };
+                                canvas.fill_rect(margin as i32, row_y as i32, table_w, t, rule);
+                            }
                             row_y += 1.0;
                         }
-                        let mut line_x = margin;
-                        canvas.fill_rect(line_x as i32, y as i32, 1, *height as i32, dim);
-                        for w in col_widths.iter() {
-                            line_x += w + 2.0 * pad_h + 1.0;
+                        if !paper {
+                            let mut line_x = margin;
                             canvas.fill_rect(line_x as i32, y as i32, 1, *height as i32, dim);
+                            for w in col_widths.iter() {
+                                line_x += w + 2.0 * pad_h + 1.0;
+                                canvas.fill_rect(line_x as i32, y as i32, 1, *height as i32, dim);
+                            }
                         }
                     }
-                    y += *height + self.spacing;
                 }
             }
         }
+        self.places = places;
         // Scrollbar along the right edge whenever the content overflows.
         if let Some((bar_x, thumb_y, thumb_h)) = self.scrollbar(h as f32) {
             let track = self.theme.ui.panel_hover;
@@ -2651,11 +3411,74 @@ mod tests {
         let all = viewer.selected_text().expect("select-all yields text");
         assert!(all.contains("Sample Paper"), "title from \\maketitle: {all}");
         assert!(all.contains("1  Intro"), "numbered section heading: {all}");
-        assert!(all.contains("E = mc²"), "inline math as unicode: {all}");
+        assert!(all.contains("E = mc2"), "inline math, with the 2 as a script run: {all}");
         assert!(all.contains("first point"), "list item text: {all}");
         assert!(all.contains("α + β"), "display math as unicode: {all}");
         // The preamble itself must not leak into the formatted view.
         assert!(!all.contains("documentclass"), "preamble hidden: {all}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A LaTeX document is set on the page its class asks for: the sheet has
+    /// the paper's proportions, a two-column class fills two columns per
+    /// sheet, the title block spans them, and the text runs onto further
+    /// sheets rather than one endless strip.
+    #[test]
+    fn tex_paginates_onto_the_class_page() {
+        let path = std::env::temp_dir().join("tigriden-viewer-tex-page-test.tex");
+        let body = "Filler sentence for the column. ".repeat(400);
+        std::fs::write(
+            &path,
+            format!(
+                "\\documentclass[journal]{{IEEEtran}}\n\\title{{Wide Title}}\n\\author{{Ada}}\n                 \\begin{{document}}\n\\maketitle\n\\section{{Intro}}\n{body}\n\\end{{document}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut font_system = FontSystem::new();
+        let theme = crate::theme::default_theme();
+        let viewer = ViewerState::open(
+            &mut font_system,
+            &path,
+            ViewKind::Tex,
+            "Menlo",
+            13.0,
+            theme,
+            [0, 0, 0],
+            1200.0,
+            std::sync::Arc::new(|| {}),
+        )
+        .expect("viewer opens the tex file");
+
+        let geom = viewer.page_geom.expect("a LaTeX view is paginated");
+        assert_eq!(geom.columns, 2, "IEEEtran is a two-column class");
+        let ratio = geom.h / geom.w;
+        assert!((ratio - 11.0 / 8.5).abs() < 0.02, "letter proportions, got {ratio}");
+        assert!(viewer.sheets.len() > 1, "the filler must run past one page");
+        assert!(
+            viewer.content_h > viewer.sheets.len() as f32 * geom.h,
+            "every sheet is on the strip",
+        );
+
+        // The title spans the page; the body sits in two columns under it.
+        let title = viewer.places[0];
+        assert!(title.w > geom.column_w() * 1.9, "the title block spans both columns");
+        let mut lefts: Vec<i32> = viewer.places.iter().map(|f| f.x as i32).collect();
+        lefts.sort_unstable();
+        lefts.dedup();
+        assert_eq!(lefts.len(), 2, "one x for each column, got {lefts:?}");
+        for frag in &viewer.places {
+            let sheet = viewer
+                .sheets
+                .iter()
+                .find(|(top, h)| frag.y >= *top && frag.y < top + h)
+                .expect("every fragment sits on a sheet");
+            assert!(
+                frag.y + frag.h <= sheet.0 + sheet.1 + 1.0,
+                "a fragment must not hang off the bottom of its sheet",
+            );
+        }
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2897,6 +3720,106 @@ mod tests {
         assert_eq!(viewer.selected_text().as_deref(), Some("Hello"));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Dev aid, not a regression test: renders a real `.tex` through the
+    /// viewer and writes the scrolled sheet out as PNGs, so the LaTeX layout
+    /// can be eyeballed without launching the app.
+    ///
+    ///   TEX_DUMP=/path/paper.tex TEX_DUMP_OUT=/tmp/tex cargo test tex_sheet_dump -- --nocapture
+    #[test]
+    fn tex_sheet_dump() {
+        let Ok(src) = std::env::var("TEX_DUMP") else { return };
+        let out = std::env::var("TEX_DUMP_OUT").unwrap_or_else(|_| "/tmp/texdump".into());
+        let pages: usize = std::env::var("TEX_DUMP_PAGES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let w: u32 = std::env::var("TEX_DUMP_W").ok().and_then(|v| v.parse().ok()).unwrap_or(1700);
+        let h = 2100u32;
+        std::fs::create_dir_all(&out).unwrap();
+
+        let mut font_system = FontSystem::new();
+        let mut swash_cache = SwashCache::new();
+        let theme = crate::theme::default_theme();
+        let mut viewer = ViewerState::open(
+            &mut font_system,
+            Path::new(&src),
+            ViewKind::Tex,
+            "Menlo",
+            46.0,
+            theme,
+            [70, 120, 200],
+            w as f32,
+            std::sync::Arc::new(|| {}),
+        )
+        .expect("viewer opens the tex");
+        println!("blocks={} content_h={}", viewer.blocks.len(), viewer.content_h);
+        let from: usize = std::env::var("TEX_DUMP_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let sheets = viewer.sheets.clone();
+        println!("sheets={}", sheets.len());
+        for i in from..(from + pages).min(sheets.len().max(from + pages)) {
+            let (top, sheet_h) = sheets.get(i).copied().unwrap_or((i as f32 * h as f32, h as f32));
+            let h = (sheet_h + 2.0 * PAGE_GAP) as u32;
+            viewer.scroll = top - PAGE_GAP;
+            viewer.clamp_scroll();
+            // Figures decode on the worker thread; give them a moment.
+            for _ in 0..25 {
+                let _ = viewer.render(&mut font_system, &mut swash_cache, w, h);
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            let frame = viewer.render(&mut font_system, &mut swash_cache, w, h);
+            let mut img = RgbaImage::new(w, h);
+            for (i, p) in frame.as_slice().iter().enumerate() {
+                let (x, y) = ((i as u32) % w, (i as u32) / w);
+                img.put_pixel(x, y, image::Rgba([p.r, p.g, p.b, 255]));
+            }
+            let path = std::path::Path::new(&out).join(format!("sheet{i}.png"));
+            img.save(&path).unwrap();
+            println!("wrote {}", path.display());
+        }
+    }
+}
+/// Metadata tags the LaTeX builder puts on spans so the painter can raise or
+/// lower them off the baseline: a plain text buffer has no notion of scripts,
+/// and inline math is full of them.
+const SCRIPT_NONE: usize = 0;
+const SCRIPT_SUB: usize = 1;
+const SCRIPT_SUP: usize = 2;
+
+/// Draws the part of `buffer` between the buffer-space heights `from` and
+/// `to` at (`x`, `y`), which is how a paragraph continues in the next column.
+/// Glyphs tagged as scripts are shifted off the baseline; everything else is
+/// drawn exactly where the layout put it.
+fn draw_buffer_slice(
+    buffer: &mut Buffer,
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    canvas: &mut Canvas,
+    color: Color,
+    x: i32,
+    y: i32,
+    from: f32,
+    to: f32,
+) {
+    buffer.shape_until_scroll(font_system, false);
+    for run in buffer.layout_runs() {
+        if run.line_top < from - 0.5 || run.line_top >= to - 0.5 {
+            continue;
+        }
+        let line_y = run.line_y - from;
+        for glyph in run.glyphs {
+            let shift = match glyph.metadata {
+                SCRIPT_SUB => glyph.font_size * 0.16,
+                SCRIPT_SUP => -glyph.font_size * 0.34,
+                _ => 0.0,
+            };
+            let physical = glyph.physical((0.0, line_y + shift), 1.0);
+            let glyph_color = glyph.color_opt.unwrap_or(color);
+            swash_cache.with_pixels(font_system, physical.cache_key, glyph_color, |px, py, c| {
+                canvas.blend_rect(x + physical.x + px, y + physical.y + py, 1, 1, c);
+            });
+        }
     }
 }
 

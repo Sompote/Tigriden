@@ -1,0 +1,126 @@
+name: Release
+
+# Builds the download artifacts for a version tag and publishes them on the
+# release for that tag. Push `v0.1.7` (or run this by hand with the tag as the
+# input) and the three macOS packages plus the Windows zip appear on it.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and release (e.g. v0.1.7)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Version from the tag
+        id: version
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Package the bare binaries
+        run: |
+          v=${{ steps.version.outputs.version }}
+          mkdir -p out
+          tar -czf "out/tigriden-$v-macos-arm64.tar.gz" \
+            -C target/aarch64-apple-darwin/release tigriden
+          tar -czf "out/tigriden-$v-macos-x86_64.tar.gz" \
+            -C target/x86_64-apple-darwin/release tigriden
+
+      - name: Package the universal app
+        run: |
+          v=${{ steps.version.outputs.version }}
+          app="dist/Tigriden.app"
+          rm -rf "$app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp bundle/Info.plist "$app/Contents/"
+          cp assets/icon.icns "$app/Contents/Resources/"
+          lipo -create -output "$app/Contents/MacOS/tigriden" \
+            target/aarch64-apple-darwin/release/tigriden \
+            target/x86_64-apple-darwin/release/tigriden
+          # The bundle is unsigned, so strip the quarantine-triggering cruft
+          # and keep the zip flat enough for Finder to open in place.
+          xattr -cr "$app"
+          (cd dist && zip -qry "../out/Tigriden-$v-macos-universal.app.zip" Tigriden.app)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: out/*
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Version from the tag
+        id: version
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: bash
+        run: |
+          v=${{ steps.version.outputs.version }}
+          mkdir -p out
+          7z a "out/tigriden-$v-windows-x86_64.zip" ./target/release/tigriden.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
+
+  publish:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          ls -la out
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" out/* --clobber
+          else
+            gh release create "$tag" out/* --title "Tigriden ${tag#v}" --generate-notes
+          fi
