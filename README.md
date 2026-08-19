@@ -8,9 +8,9 @@ Run `claude`, `codex`, `gemini` — any terminal agent — each in its own folde
 
 Written in pure Rust. No Electron, no webview, no TeX installation. **~10 MB binary, ~40 MB RAM**, and a paper opens the moment you click it.
 
-![Tigriden showing paperIEE.tex typeset: a two-column journal page with a figure, its caption and running text, beside the manuscript folder's file panel](assets/screenshot.png)
+![Tigriden with paperIEE.tex typeset in the viewer — a two-column journal page with figures and captions — the manuscript folder in the file panel on the left, and Claude Code running in the terminal below](assets/screenshot.png)
 
-*Above: a real session — `paperIEE.tex` set on the two-column page its `\documentclass` produces, figure, caption and justified columns included, straight from the source with no LaTeX run. The manuscript folder is in the panel on the left; the agent's terminal sits under the viewer, here dragged out of the way to read.*
+*Above: the whole loop in one window — the manuscript folder in the panel on the left, `paperIEE.tex` set on the two-column page its `\documentclass` produces (page 12, figures, captions and justified columns, straight from the source with no LaTeX run), and the agent that wrote it running underneath, one preset click away.*
 
 ## The research loop, end to end
 
