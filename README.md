@@ -1,10 +1,10 @@
-# Tigriden — Read Your Papers, Let an Agent Revise Them
+# Tigriden — Agentic Coding Workbench, and a Paper Reader
 
 ![Version](https://img.shields.io/badge/version-0.1.7-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 
-**A tiny desktop workbench for researchers and engineers: your `.tex` shown as the page it compiles to, your PDFs and figures next to it, and an AI agent doing the revising — in one window.**
+**A tiny desktop workbench for two jobs: supervising AI coding agents, and writing or revising papers with them.** Per-folder terminals, a live file panel, change tracking with one-click rollback, a lightweight editor — and a viewer that shows your `.tex` as the page it compiles to, your PDFs as real pages, and your figures and data next to both.
 
-Point it at a manuscript folder, click **claude** (or `codex`, `gemini`, any terminal agent), and ask for the revision you want. The agent edits the files; the panel lists every file it touched and reverts any of them with one click; the viewer shows the result **typeset** — two-column IEEE, single-column arXiv, equations, tables and figures — **without running LaTeX at all**.
+Run `claude`, `codex`, `gemini` — any terminal agent — each in its own folder, side by side, and watch what they do: the file panel updates as they write, the Changes panel lists every file they touched and reverts any of it, and the viewer renders whatever they produced — code, a chart, a CSV, a manuscript.
 
 Written in pure Rust. No Electron, no webview, no TeX installation. **~10 MB binary, ~40 MB RAM**, and a paper opens the moment you click it.
 
@@ -14,9 +14,21 @@ Written in pure Rust. No Electron, no webview, no TeX installation. **~10 MB bin
 
 ## Why
 
-Revising a paper with an agent normally means three apps: a terminal for the agent, Overleaf or a PDF viewer to see what the text actually looks like, and Finder to move figures around. And every look at the page costs a full LaTeX compile.
+**Agentic coding** means running several agents in several folders and checking in on them. A full IDE is overkill for that; a bare terminal multiplexer gives you no file browser, no diff, no editor. Tigriden is the minimal middle: **one session per folder — agent, files, editor and change tracking together.**
 
-Tigriden collapses that into one window per project: **agent, files, and a typeset view of the document together.** The `.tex` view is a real page — the paper size, margins and column grid your `\documentclass` asks for — rendered by a built-in typesetter, so it appears instantly and works on a machine with no TeX distribution installed. Compile when you are ready to submit, not to read a paragraph.
+**Writing with an agent** has the same shape, plus a document. Today that means three apps — a terminal for the agent, Overleaf or a PDF viewer to see what the text actually looks like, and Finder to move figures around — and every look at the page costs a full LaTeX compile. Tigriden puts the typeset page in the same window: the paper size, margins and column grid your `\documentclass` asks for, rendered by a built-in typesetter, so it appears instantly and works on a machine with no TeX distribution. Compile when you are ready to submit, not to read a paragraph.
+
+## For agentic coding
+
+- **One-click agents** — preset buttons type the agent command into the terminal for you (`claude`, `codex`, `gemini`, `opencode`, or your own, fully configurable).
+- **A real terminal** — VTE-compliant ([alacritty_terminal](https://crates.io/crates/alacritty_terminal) + a real PTY), so `vim`, `top` and the Claude Code TUI just work: bracketed paste, truecolor, mouse selection, right-click Copy / Paste / Select All, and a wheel that scrolls inside full-screen apps as well as through history (Shift+PgUp/PgDn/Home/End/↑/↓ page the scrollback). Drop a file from Finder on the terminal and its shell-quoted path is typed in, ready to attach to a prompt.
+- **Multiple terminals per folder** — `+` spawns extra shells in the same workspace, so an agent can run while you use a second tab for git, tests, or another agent.
+- **Every file the agent touched, and an undo** *(0.1.1)* — **File ▸ Show Changes Panel** lists modified/added/deleted files within ~1 s of a write, with a syntax-highlighted diff per file. **Discard Changes…** reverts one file, **↺** reverts the whole run, both behind a confirmation. Git folders compare against the last commit; folders without git get invisible shadow snapshots, so a scratch project or a manuscript folder is just as safe.
+- **Several projects at once** — one session per folder with its own shell, tree and open file; switching is instant. **File ▸ New Window** runs independent windows in parallel, and named `[[teams]]` give each window its own agent buttons.
+- **A file panel that manages files** *(0.1.6)* — gitignore-aware and live as the agent works. Drag files in from Finder, Cut/Copy/Paste through the system pasteboard in both directions, Delete to the Trash behind a confirmation, rename/duplicate/reveal from the keyboard or the context menu.
+- **Built-in editor** — syntax highlighting for 40+ languages ([cosmic-text](https://crates.io/crates/cosmic-text) + syntect), Cmd+S to save. When the agent rewrites the file you have open, it reloads automatically (or asks, if you have unsaved edits).
+- **Settings, themes, persistence** *(0.1.2)* — **File ▸ Settings… (⌘,)**: six themes, accent color, fonts, **separate editor and terminal text sizes** *(0.1.6)*, scrollback, applied live to every window. A native menu bar (Add Folder ⌘O, New Terminal ⌘T, Open Recent, New Window ▸ team, Save ⌘S, Close ⌘W) routes to whichever pane has focus, and folders, layout and the recent list come back on relaunch.
+- **Small on purpose** — no webview, no Electron, no C regex libraries; a Slint shell with both panes rasterized straight to pixel buffers, which is where the ~10 MB binary and the instant startup come from.
 
 ## For writing and revising
 
@@ -26,19 +38,8 @@ Tigriden collapses that into one window per project: **agent, files, and a types
 - **Figures and tables of real manuscripts** — `\graphicspath` searched, vector **PDF** plots rasterized, pictures scaled by the `minipage` they sit in; `tabular`/`tabularx`/`longtable` set booktabs style. Preamble noise, package options and unknown commands never leak onto the page.
 - **PDFs as actual pages** — the compiled paper, a reference you are citing, a datasheet. **Select and copy text straight off the page**, with two-column papers copying one column at a time instead of zig-zagging across the gutter.
 - **Markdown on the same white page**, with the same typeset math — for notes, READMEs and agent-written summaries.
-- **Everything else you drop in a paper folder** — images (png/jpg/gif/webp/bmp/tiff) and CSV/TSV as an aligned table.
+- **Everything else in the folder** — images (png/jpg/gif/webp/bmp/tiff) and CSV/TSV as an aligned table, so a plot or a results file the agent just wrote is one click away.
 - **Fast, because nothing compiles** — no `pdflatex` run to see a change; PDF pages rasterize and images decode on background threads with the next page prefetched, so scrolling and zooming never stall. Cmd+= / Cmd+- / Cmd+0 zoom, and the LaTeX page re-typesets at the new size.
-
-## For working with an agent
-
-- **One-click agents** — preset buttons type the agent command into the terminal for you (`claude`, `codex`, `gemini`, `opencode`, or your own).
-- **A real terminal** — VTE-compliant ([alacritty_terminal](https://crates.io/crates/alacritty_terminal) + a real PTY), so `vim`, `top` and the Claude Code TUI just work, including bracketed paste, truecolor and wheel scrolling inside full-screen apps. Drop a figure from Finder on the terminal and its shell-quoted path is typed in, ready to attach to a prompt.
-- **Every file the agent touched, and an undo** *(0.1.1)* — **File ▸ Show Changes Panel** lists modified/added/deleted files within ~1 s of a write, with a syntax-highlighted diff per file. **Discard Changes…** reverts one file, **↺** reverts the whole run. Git folders compare against the last commit; folders without git get invisible shadow snapshots, so a manuscript folder needs no repo to be safe.
-- **Several papers, or several agents, at once** — one session per folder with its own shell, tree and open file; `+` adds more terminals in the same folder (one agent working while you run `latexmk` or `git` in the next tab); **File ▸ New Window** runs independent windows in parallel.
-- **A file panel that manages files** *(0.1.6)* — gitignore-aware and live as the agent works. Drag figures in from Finder, Cut/Copy/Paste through the system pasteboard in both directions, Delete to the Trash behind a confirmation, rename/duplicate from the keyboard.
-- **Built-in editor** — syntax highlighting for 40+ languages, Cmd+S to save. When the agent rewrites the file you have open, it reloads automatically (or asks, if you have unsaved edits). A header button flips Markdown/CSV/LaTeX between the rendered page and the editable source.
-- **Settings, themes, persistence** *(0.1.2)* — **File ▸ Settings… (⌘,)**: six themes, accent color, fonts, **separate editor and terminal text sizes** *(0.1.6)*, scrollback, applied live to every window. A native menu bar (Add Folder ⌘O, New Terminal ⌘T, Open Recent, New Window ▸ team, Save ⌘S, Close ⌘W) routes to whichever pane has focus, and folders, layout and the recent list come back on relaunch.
-- **Small on purpose** — no webview, no Electron, no C regex libraries; a Slint shell with both panes rasterized straight to pixel buffers, which is where the ~10 MB binary and the instant startup come from.
 
 <details>
 <summary><b>Everything the LaTeX view understands</b> (the long list)</summary>
@@ -76,6 +77,15 @@ macOS is the primary target; Linux/Windows are untested but the stack is cross-p
 
 ## Usage
 
+### Supervise a coding agent
+
+1. Click **+ Add folder** and pick a project directory — a login shell opens there.
+2. Click a preset button (e.g. **claude**) to launch the agent, or type any command.
+3. Watch the file panel update as the agent works; click any file to read or edit it.
+4. Click **+** in the terminal tab strip for more shells in the same folder (each tab is its own shell; ✕ on hover closes one).
+5. Add more folders to run more agents in parallel; switch by clicking a session in the sidebar. The ✕ on a session header removes the folder (its shells stop; the folder stays in Recent).
+6. Click **⟳** (bottom of the sidebar) to reopen any previously added folder without the file dialog.
+
 ### Revise a paper with an agent
 
 1. **+ Add folder** → pick the manuscript folder (the one with `paper.tex` and `figures/`). A login shell opens there.
@@ -86,15 +96,6 @@ macOS is the primary target; Linux/Windows are untested but the stack is cross-p
 6. Ready to submit? Run `latexmk` (or your build) in a second terminal tab with **+**, and open the resulting `paper.pdf` in the same viewer to check the real thing.
 
 Everything else works the same way: drop new figures in from Finder, click a `.csv` the agent generated to read it as a table, open a reference PDF and copy a quotation straight off the page.
-
-### Day to day
-
-1. Click **+ Add folder** and pick a project directory — a login shell opens there.
-2. Click a preset button (e.g. **claude**) to launch the agent, or type any command.
-3. Watch the file panel update as the agent works; click any file to read or edit it.
-4. Click **+** in the terminal tab strip for more shells in the same folder (each tab is its own shell; ✕ on hover closes one).
-5. Add more folders to run more agents in parallel; switch by clicking a session in the sidebar. The ✕ on a session header removes the folder (its shells stop; the folder stays in Recent).
-6. Click **⟳** (bottom of the sidebar) to reopen any previously added folder without the file dialog.
 
 ### Track & roll back what the agent changes
 
