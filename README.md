@@ -1,8 +1,8 @@
-# Tigriden — Agentic Coding Workbench, and a Paper Reader
+# Tigriden — An End-to-End Research Workbench
 
 ![Version](https://img.shields.io/badge/version-0.1.7-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 
-**A tiny desktop workbench for two jobs: supervising AI coding agents, and writing or revising papers with them.** Per-folder terminals, a live file panel, change tracking with one-click rollback, a lightweight editor — and a viewer that shows your `.tex` as the page it compiles to, your PDFs as real pages, and your figures and data next to both.
+**From the coding agent that runs your experiments to the scientific paper you submit — one window for the whole thing.** An agentic coding workbench (per-folder terminals, a live file panel, change tracking with one-click rollback, a lightweight editor) with a document viewer bolted to the same window: your `.tex` shown as the page it compiles to, your PDFs as real pages, and the figures and data your code just produced next to both.
 
 Run `claude`, `codex`, `gemini` — any terminal agent — each in its own folder, side by side, and watch what they do: the file panel updates as they write, the Changes panel lists every file they touched and reverts any of it, and the viewer renders whatever they produced — code, a chart, a CSV, a manuscript.
 
@@ -11,6 +11,21 @@ Written in pure Rust. No Electron, no webview, no TeX installation. **~10 MB bin
 ![Tigriden supervising an agent: the viewer shows a chart the agent produced while the agent CLI runs in one of three terminal tabs below](assets/screenshot.png)
 
 *Above: a real session — the workspace file tree on the left, the built-in viewer inspecting a figure the agent just generated, and the agent CLI running in one of three terminal tabs below.*
+
+## The research loop, end to end
+
+One folder, one window, the whole cycle — the agent never leaves the terminal, and you never leave the app to look at what came out:
+
+| Stage | What you do | What Tigriden gives you |
+|-------|-------------|-------------------------|
+| **1. Code** | `claude` / `codex` / `gemini` in the project folder writes and runs the experiment | A real terminal per folder, extra tabs for `pytest`, `git` or a second agent, and a file panel that updates as files appear |
+| **2. Check** | Read what the run produced before trusting it | `results.csv` as an aligned table, `loss.png` or a vector PDF plot as an image, the agent's Markdown notes typeset on a page |
+| **3. Keep or undo** | Decide what survives the run | The Changes panel lists every file touched, diffs each one, and reverts a file — or the whole run — with git or with invisible snapshots when there is no repo |
+| **4. Write** | Ask the agent to draft or revise the manuscript in the same folder | `paper.tex` opens **typeset** on the page your `\documentclass` produces: two-column IEEE, single-column arXiv, equations, tables, figures — no compile |
+| **5. Iterate** | Reread, re-prompt, discard what missed | The typeset page re-renders the instant the agent saves; rollback is one right-click |
+| **6. Submit** | Build the real artifact | `latexmk` in a second terminal tab, then open the produced `paper.pdf` in the same viewer — pages, text selection, side-by-side with the source |
+
+Nothing in steps 2–5 costs a LaTeX run or a second application.
 
 ## Why
 
