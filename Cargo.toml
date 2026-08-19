@@ -2,7 +2,7 @@
 name = "tigriden"
 version = "0.1.7"
 edition = "2021"
-description = "Minimal IDE for supervising AI coding agents: per-folder terminals, file trees, and a lightweight editor."
+description = "Fast, tiny end-to-end research workbench: per-folder terminals for AI coding agents, change tracking with one-click rollback, and LaTeX/PDF/Markdown read as typeset pages."
 license = "MIT"
 
 [dependencies]
