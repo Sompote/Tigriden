@@ -1,4 +1,4 @@
-# Tigriden — An End-to-End Research Workbench
+# Tigriden — A Fast, Tiny End-to-End Research Workbench
 
 ![Version](https://img.shields.io/badge/version-0.1.7-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 
