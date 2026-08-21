@@ -30,7 +30,14 @@ pub struct Config {
     pub theme: String,
     /// Accent override as "#rrggbb"; empty means the theme's own accent.
     pub accent: String,
+    /// Editor / viewer font family. A family this machine does not have is
+    /// swapped for one it does at startup — see [`Config::resolve_families`].
     pub font_family: String,
+    /// Terminal font family. Empty means "follow `font_family`", which is what
+    /// a config written before the two were split says, so an upgrade keeps
+    /// the terminal exactly as it was until the user picks a font for it.
+    #[serde(default)]
+    pub term_font_family: String,
     /// Editor / viewer text size, in logical pixels.
     pub font_size: f32,
     /// Terminal text size, in logical pixels. `0` means "follow `font_size`",
@@ -84,7 +91,10 @@ impl Config {
             self.accent.clear();
         }
         if self.font_family.trim().is_empty() {
-            self.font_family = "Menlo".into();
+            self.font_family = crate::fonts::default_family().into();
+        }
+        if self.term_font_family.trim().is_empty() {
+            self.term_font_family = self.font_family.clone();
         }
         self.font_size = self.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
         if self.term_font_size <= 0.0 {
@@ -93,6 +103,20 @@ impl Config {
         self.term_font_size = self.term_font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
         self.ui_font_size = self.ui_font_size.clamp(MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE);
         self.scrollback = self.scrollback.clamp(200, 500_000);
+    }
+
+    /// Points both families at something the machine actually has. Called
+    /// once the font database is up, since `sanitize` runs before it; returns
+    /// whether either name moved, so the caller can write the substitution
+    /// back instead of resolving it again on every launch.
+    pub fn resolve_families(&mut self) -> bool {
+        let font_family = crate::fonts::resolve(&self.font_family);
+        let term_font_family = crate::fonts::resolve(&self.term_font_family);
+        let changed =
+            font_family != self.font_family || term_font_family != self.term_font_family;
+        self.font_family = font_family;
+        self.term_font_family = term_font_family;
+        changed
     }
 
     /// Takes on newly shipped agent buttons, but only for a preset list still
@@ -124,7 +148,8 @@ impl Default for Config {
         Self {
             theme: "classic-dark".into(),
             accent: String::new(),
-            font_family: "Menlo".into(),
+            font_family: crate::fonts::default_family().into(),
+            term_font_family: crate::fonts::default_family().into(),
             font_size: 13.0,
             term_font_size: 13.0,
             ui_font_size: 13.0,
@@ -200,6 +225,52 @@ mod tests {
         config.sanitize();
         assert_eq!(config.term_font_size, 17.0, "the terminal inherits the one size on file");
         assert_eq!(config.font_size, 17.0);
+    }
+
+    /// Same for the family: an upgrade must not leave the terminal in a
+    /// different font from the one the user has been reading all along.
+    #[test]
+    fn an_old_config_keeps_one_family_for_both() {
+        let mut config: Config =
+            toml::from_str("font_family = \"Courier New\"\n").expect("an old config still parses");
+        config.sanitize();
+        assert_eq!(config.term_font_family, "Courier New", "the terminal inherits the one family");
+        assert_eq!(config.font_family, "Courier New");
+    }
+
+    /// Once the terminal has a family of its own, editing the editor's leaves
+    /// it alone.
+    #[test]
+    fn the_two_families_are_independent() {
+        let mut config: Config =
+            toml::from_str("font_family = \"Courier New\"\nterm_font_family = \"Menlo\"\n")
+                .expect("both families parse");
+        config.sanitize();
+        assert_eq!((config.font_family.as_str(), config.term_font_family.as_str()),
+            ("Courier New", "Menlo"));
+
+        config.font_family = "Monaco".into();
+        config.sanitize();
+        assert_eq!(config.term_font_family, "Menlo", "the terminal keeps its own font");
+    }
+
+    /// The macOS default in a config carried to a machine without it (a
+    /// Windows one, say) must not be handed to cosmic-text, which would answer
+    /// with the platform's proportional interface font.
+    #[test]
+    fn a_family_this_machine_lacks_is_swapped_for_one_it_has() {
+        let mut db = cosmic_text::fontdb::Database::new();
+        db.load_font_file("vendor/cosmic-text/fonts/FiraMono-Medium.ttf")
+            .expect("the vendored mono font is there");
+        crate::fonts::index(&db);
+
+        let mut config: Config =
+            toml::from_str("font_family = \"Menlo\"\n").expect("the config parses");
+        config.sanitize();
+        assert!(config.resolve_families(), "the substitution is worth writing back");
+        assert_eq!(config.font_family, "Fira Mono");
+        assert_eq!(config.term_font_family, "Fira Mono");
+        assert!(!config.resolve_families(), "resolving again changes nothing");
     }
 
     /// Once the two are set apart they stay apart, each clamped on its own.

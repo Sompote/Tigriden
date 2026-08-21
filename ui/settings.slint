@@ -32,88 +32,97 @@ component Chip inherits TouchArea {
     }
 }
 
-// Dropdown built from plain elements: unlike std-widgets' ComboBox it holds no
-// state of its own, so "Reset to defaults" can never leave it showing a value
-// the config no longer has.
-component Dropdown inherits Rectangle {
+component FieldLabel inherits Text {
+    color: Theme.text;
+    font-size: Theme.font-size-small;
+    vertical-alignment: center;
+    overflow: elide;
+    width: 106px;
+}
+
+// Font picker built from plain elements. The list opens *inline*, in the
+// dialog's own scroll view, rather than in a PopupWindow: a popup is placed
+// from its unscrolled layout position, so once the dialog is scrolled at all
+// the list can open outside the window and a pick never lands. Only the
+// open/closed flag is state — the value always comes from the config, so
+// "Reset to defaults" can never leave a stale name showing.
+component FontPicker inherits VerticalLayout {
+    in property <string> label;
     in property <[string]> options;
     in property <string> value;
     callback picked(string);
 
-    height: Theme.chip-height + 4px;
-    border-radius: 5px;
-    border-width: 1px;
-    border-color: touch.has-hover ? Theme.accent : Theme.border;
-    background: Theme.bg;
+    private property <bool> open: false;
+
+    spacing: 6px;
 
     HorizontalLayout {
-        padding-left: 9px;
-        padding-right: 9px;
-        spacing: 6px;
-        Text {
-            text: root.value;
-            color: Theme.text;
-            font-size: Theme.font-size-small;
-            vertical-alignment: center;
-            overflow: elide;
+        spacing: 8px;
+        FieldLabel { text: root.label; }
+        field := Rectangle {
+            height: Theme.chip-height + 4px;
             horizontal-stretch: 1;
-        }
-        Text {
-            text: "▾";
-            color: Theme.text-dim;
-            font-size: Theme.font-size-tiny;
-            vertical-alignment: center;
-        }
-    }
-
-    touch := TouchArea {
-        clicked => { popup.show(); }
-    }
-
-    popup := PopupWindow {
-        x: 0;
-        y: parent.height + 2px;
-        width: root.width;
-        height: 220px;
-        close-policy: close-on-click-outside;
-
-        Rectangle {
-            background: Theme.panel;
+            border-radius: 5px;
             border-width: 1px;
-            border-color: Theme.border;
-            border-radius: 6px;
+            border-color: touch.has-hover || root.open ? Theme.accent : Theme.border;
+            background: Theme.bg;
 
-            ScrollView {
-                x: 4px;
-                y: 4px;
-                width: parent.width - 8px;
-                height: parent.height - 8px;
+            HorizontalLayout {
+                padding-left: 9px;
+                padding-right: 9px;
+                spacing: 6px;
+                Text {
+                    text: root.value;
+                    color: Theme.text;
+                    font-size: Theme.font-size-small;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                Text {
+                    text: root.open ? "▴" : "▾";
+                    color: Theme.text-dim;
+                    font-size: Theme.font-size-tiny;
+                    vertical-alignment: center;
+                }
+            }
 
-                VerticalLayout {
-                    alignment: start;
-                    for option in root.options: option-row := TouchArea {
-                        height: Theme.row-height;
-                        Rectangle {
-                            border-radius: 4px;
-                            background: option-row.has-hover ? Theme.panel-hover
-                                : (option == root.value ? Theme.selection : transparent);
-                            HorizontalLayout {
-                                padding-left: 8px;
-                                padding-right: 8px;
-                                Text {
-                                    text: option;
-                                    color: option == root.value ? Theme.accent : Theme.text;
-                                    font-size: Theme.font-size-small;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                }
-                            }
-                        }
-                        clicked => {
-                            popup.close();
-                            root.picked(option);
+            touch := TouchArea {
+                clicked => { root.open = !root.open; }
+            }
+        }
+    }
+
+    if root.open: Rectangle {
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: Theme.border;
+        background: Theme.bg;
+
+        VerticalLayout {
+            padding: 4px;
+            alignment: start;
+            for option in root.options: option-row := TouchArea {
+                height: Theme.row-height;
+                Rectangle {
+                    border-radius: 4px;
+                    background: option-row.has-hover ? Theme.panel-hover
+                        : (option == root.value ? Theme.selection : transparent);
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        Text {
+                            text: option;
+                            color: option == root.value ? Theme.accent : Theme.text;
+                            font-size: Theme.font-size-small;
+                            vertical-alignment: center;
+                            overflow: elide;
                         }
                     }
+                }
+                clicked => {
+                    root.open = false;
+                    root.picked(option);
                 }
             }
         }
@@ -127,14 +136,6 @@ component SectionTitle inherits Text {
     letter-spacing: 0.8px;
 }
 
-component FieldLabel inherits Text {
-    color: Theme.text;
-    font-size: Theme.font-size-small;
-    vertical-alignment: center;
-    overflow: elide;
-    width: 106px;
-}
-
 export component SettingsDialog inherits Rectangle {
     in property <string> mode;
     in property <string> style;
@@ -144,6 +145,7 @@ export component SettingsDialog inherits Rectangle {
     in property <string> theme-label;
     in property <[string]> font-families;
     in property <string> font-family;
+    in property <string> term-font-family;
     in property <float> font-size;
     in property <float> term-font-size;
     in property <float> ui-font-size;
@@ -337,15 +339,20 @@ export component SettingsDialog inherits Rectangle {
                         spacing: 9px;
                         SectionTitle { text: "TYPOGRAPHY"; }
 
-                        HorizontalLayout {
-                            spacing: 8px;
-                            FieldLabel { text: "Font"; }
-                            Dropdown {
-                                horizontal-stretch: 1;
-                                options: root.font-families;
-                                value: root.font-family;
-                                picked(name) => { root.changed("font-family", name); }
-                            }
+                        // Editor and viewer read as a document, the terminal
+                        // as a grid; each picks its own face.
+                        FontPicker {
+                            label: "Editor font";
+                            options: root.font-families;
+                            value: root.font-family;
+                            picked(name) => { root.changed("font-family", name); }
+                        }
+
+                        FontPicker {
+                            label: "Terminal font";
+                            options: root.font-families;
+                            value: root.term-font-family;
+                            picked(name) => { root.changed("term-font-family", name); }
                         }
 
                         // Editor and viewer.

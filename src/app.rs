@@ -156,6 +156,7 @@ pub fn settings_changed(key: &str, value: &str) {
         "style" => config.theme = theme::by_style_mode(value, current.mode()).id.into(),
         "accent" => config.accent = value.to_string(),
         "font-family" => config.font_family = value.to_string(),
+        "term-font-family" => config.term_font_family = value.to_string(),
         "font-size" => match value.parse::<f32>() {
             Ok(size) => config.font_size = size,
             Err(_) => return,
@@ -318,7 +319,9 @@ pub struct App {
     theme: &'static ThemeDef,
     /// Theme index shared with the PTY threads for OSC color answerbacks.
     theme_index: Arc<AtomicU8>,
+    /// Editor and viewer family; the terminal has its own below.
     font_family: &'static str,
+    term_font_family: &'static str,
     sessions: Vec<Session>,
     active: usize,
     recents: Vec<PathBuf>,
@@ -367,9 +370,21 @@ impl App {
         is_primary: bool,
     ) -> Self {
         let id = NEXT_APP_ID.fetch_add(1, Ordering::Relaxed);
+        // The font database first: only with it up can a family the config
+        // names be told from one this machine does not have.
+        let font_system = FontSystem::new();
+        crate::fonts::index(font_system.db());
+        let mut config = config;
+        if config.resolve_families() {
+            // Say so on disk, so the Settings picker and the next launch agree
+            // with what is on screen.
+            set_config(config.clone());
+            config::save_config(&config);
+        }
         let theme = theme::by_id(&config.theme);
         let theme_index = Arc::new(AtomicU8::new(theme::index_of(&config.theme)));
         let font_family = intern_font(&config.font_family);
+        let term_font_family = intern_font(&config.term_font_family);
         let presets: Vec<crate::config::Preset> = config.presets_for(team).to_vec();
         let preset_items: Vec<PresetItem> = presets
             .iter()
@@ -401,11 +416,12 @@ impl App {
             theme,
             theme_index,
             font_family,
+            term_font_family,
             sessions: Vec::new(),
             active: 0,
             recents,
             row_map: Vec::new(),
-            font_system: FontSystem::new(),
+            font_system,
             swash_cache: SwashCache::new(),
             term_renderer: None,
             renderer_scale: 0.0,
@@ -447,17 +463,12 @@ impl App {
         ui.invoke_focus_terminal();
     }
 
-    /// Monospaced families cosmic-text can actually resolve, plus whatever the
+    /// Monospaced families the font database really holds, plus the two the
     /// config names (so a hand-written family still shows as selected).
     fn font_families(&self) -> Vec<SharedString> {
-        let mut names: Vec<String> = self
-            .font_system
-            .db()
-            .faces()
-            .filter(|face| face.monospaced)
-            .filter_map(|face| face.families.first().map(|(name, _)| name.clone()))
-            .collect();
+        let mut names = crate::fonts::monospace_families();
         names.push(self.config.font_family.clone());
+        names.push(self.config.term_font_family.clone());
         names.sort_by_key(|n| n.to_lowercase());
         names.dedup();
         names.into_iter().map(SharedString::from).collect()
@@ -489,6 +500,7 @@ impl App {
 
         ui.set_settings_font_families(ModelRc::new(VecModel::from(self.font_families())));
         ui.set_settings_font_family(SharedString::from(self.config.font_family.as_str()));
+        ui.set_settings_term_font_family(SharedString::from(self.config.term_font_family.as_str()));
         ui.set_settings_font_size(self.config.font_size);
         ui.set_settings_term_font_size(self.config.term_font_size);
         ui.set_settings_ui_font_size(self.config.ui_font_size);
@@ -502,9 +514,15 @@ impl App {
     /// Adopts an edited config: chrome colors, terminal palette, editor theme
     /// and fonts all change in place, without restarting shells.
     pub fn apply_config(&mut self, config: Config) {
+        let mut config = config;
+        // A hand-edited config.toml can name anything; keep what is drawn to
+        // fonts that exist.
+        config.resolve_families();
         let theme = theme::by_id(&config.theme);
         let font_family = intern_font(&config.font_family);
+        let term_font_family = intern_font(&config.term_font_family);
         let family_changed = !std::ptr::eq(font_family, self.font_family);
+        let term_family_changed = !std::ptr::eq(term_font_family, self.term_font_family);
         // The terminal and the editor/viewer size independently, so each side
         // only rebuilds for the one that actually moved.
         let term_px_changed =
@@ -517,6 +535,7 @@ impl App {
         self.theme = theme;
         self.theme_index.store(theme::index_of(theme.id), Ordering::Relaxed);
         self.font_family = font_family;
+        self.term_font_family = term_font_family;
         self.presets = self.config.presets_for(self.team).to_vec();
 
         if let Some(ui) = self.ui() {
@@ -534,30 +553,39 @@ impl App {
             }
         }
 
-        if !family_changed && !term_px_changed && !view_px_changed && !theme_changed {
+        if !family_changed
+            && !term_family_changed
+            && !term_px_changed
+            && !view_px_changed
+            && !theme_changed
+        {
             return;
         }
-        if family_changed || term_px_changed {
+        if term_family_changed || term_px_changed {
             // Cell metrics moved: rebuild on the next render, then re-grid.
             self.term_renderer = None;
         }
 
-        let scale = self.scale();
-        let font_px = self.config.font_size * scale;
-        for idx in 0..self.sessions.len() {
-            if let Some(editor) = self.sessions[idx].editor.as_mut() {
-                editor.restyle(&mut self.font_system, font_family, font_px, theme);
+        // Re-typesetting a viewer is the expensive part of a settings change,
+        // so a change that only touches the terminal skips it.
+        if family_changed || view_px_changed || theme_changed {
+            let scale = self.scale();
+            let font_px = self.config.font_size * scale;
+            for idx in 0..self.sessions.len() {
+                if let Some(editor) = self.sessions[idx].editor.as_mut() {
+                    editor.restyle(&mut self.font_system, font_family, font_px, theme);
+                }
             }
-        }
-        // Viewers bake colors and layout into their blocks, so rebuild them.
-        let viewers: Vec<(usize, PathBuf, viewer::ViewKind)> = self
-            .sessions
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.viewer.as_ref().map(|v| (i, v.path.clone(), v.kind)))
-            .collect();
-        for (idx, path, kind) in viewers {
-            self.open_viewer(idx, path, kind);
+            // Viewers bake colors and layout into their blocks, so rebuild them.
+            let viewers: Vec<(usize, PathBuf, viewer::ViewKind)> = self
+                .sessions
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| s.viewer.as_ref().map(|v| (i, v.path.clone(), v.kind)))
+                .collect();
+            for (idx, path, kind) in viewers {
+                self.open_viewer(idx, path, kind);
+            }
         }
 
         self.apply_editor_size();
@@ -599,7 +627,8 @@ impl App {
         let scale = self.scale();
         if self.term_renderer.is_none() || (self.renderer_scale - scale).abs() > 0.01 {
             let px = self.config.term_font_size * scale;
-            self.term_renderer = Some(TermRenderer::new(self.font_family, px, &mut self.font_system));
+            self.term_renderer =
+                Some(TermRenderer::new(self.term_font_family, px, &mut self.font_system));
             self.renderer_scale = scale;
         }
         let r = self.term_renderer.as_ref().unwrap();

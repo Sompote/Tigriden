@@ -201,6 +201,7 @@ export component MainWindow inherits Window {
     in property <string> settings-theme-label: "";
     in property <[string]> settings-font-families;
     in property <string> settings-font-family: "";
+    in property <string> settings-term-font-family: "";
     in property <float> settings-font-size: 13;
     in property <float> settings-term-font-size: 13;
     in property <float> settings-ui-font-size: 13;
@@ -658,6 +659,7 @@ export component MainWindow inherits Window {
         theme-label: root.settings-theme-label;
         font-families: root.settings-font-families;
         font-family: root.settings-font-family;
+        term-font-family: root.settings-term-font-family;
         font-size: root.settings-font-size;
         term-font-size: root.settings-term-font-size;
         ui-font-size: root.settings-ui-font-size;

@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod editor;
+mod fonts;
 mod git;
 mod mac;
 mod mathlayout;
