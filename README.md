@@ -1,6 +1,6 @@
 # Tigriden — A Fast, Tiny End-to-End Research Workbench
 
-![Version](https://img.shields.io/badge/version-0.1.8-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
+![Version](https://img.shields.io/badge/version-0.1.9-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 
 **From the coding agent that runs your experiments to the scientific paper you submit — one window for the whole thing.** An agentic coding workbench (per-folder terminals, a live file panel, change tracking with one-click rollback, a lightweight editor) with a document viewer bolted to the same window: your `.tex` shown as the page it compiles to, your PDFs as real pages, and the figures and data your code just produced next to both.
 
@@ -36,7 +36,7 @@ Nothing in steps 2–5 costs a LaTeX run or a second application.
 ## For agentic coding
 
 - **One-click agents** — preset buttons type the agent command into the terminal for you (`claude`, `codex`, `gemini`, `opencode`, or your own, fully configurable).
-- **A real terminal** — VTE-compliant ([alacritty_terminal](https://crates.io/crates/alacritty_terminal) + a real PTY), so `vim`, `top` and the Claude Code TUI just work: bracketed paste, truecolor, mouse selection, right-click Copy / Paste / Select All, and a wheel that scrolls inside full-screen apps as well as through history (Shift+PgUp/PgDn/Home/End/↑/↓ page the scrollback). Drop a file from Finder on the terminal and its shell-quoted path is typed in, ready to attach to a prompt.
+- **A real terminal** — VTE-compliant ([alacritty_terminal](https://crates.io/crates/alacritty_terminal) + a real PTY), so `vim`, `top` and the Claude Code TUI just work: bracketed paste, truecolor, mouse selection, right-click Copy / Paste / Select All, and a wheel that scrolls inside full-screen apps as well as through history (Shift+PgUp/PgDn/Home/End/↑/↓ page the scrollback). Drop a file from Finder on the terminal and its shell-quoted path is typed in, ready to attach to a prompt. **Marks stay on the letters they belong to** *(0.1.9)* — a cell's zero-width vowels, tones and accents are drawn as the one stack they are, so `สวัสดีครับ` keeps its Thai vowels and tone marks instead of thinning to bare consonants.
 - **Multiple terminals per folder** — `+` spawns extra shells in the same workspace, so an agent can run while you use a second tab for git, tests, or another agent.
 - **Every file the agent touched, and an undo** *(0.1.1)* — **File ▸ Show Changes Panel** lists modified/added/deleted files within ~1 s of a write, with a syntax-highlighted diff per file. **Discard Changes…** reverts one file, **↺** reverts the whole run, both behind a confirmation. Git folders compare against the last commit; folders without git get invisible shadow snapshots, so a scratch project or a manuscript folder is just as safe.
 - **Several projects at once** — one session per folder with its own shell, tree and open file; switching is instant. **File ▸ New Window** runs independent windows in parallel, and named `[[teams]]` give each window its own agent buttons.
@@ -67,7 +67,7 @@ Paper and margins from `\documentclass` options and `geometry`; one or two colum
 
 No Rust needed — grab the prebuilt app from the [latest release](https://github.com/Sompote/Tigriden/releases/latest):
 
-1. Download **`Tigriden-0.1.8-macos-universal.app.zip`** (one download for both Apple Silicon and Intel).
+1. Download **`Tigriden-0.1.9-macos-universal.app.zip`** (one download for both Apple Silicon and Intel).
 2. Unzip and drag **Tigriden.app** into **/Applications**.
 3. First launch only: the app isn't notarized, so **right-click → Open → Open**, or run:
 
@@ -75,9 +75,9 @@ No Rust needed — grab the prebuilt app from the [latest release](https://githu
    xattr -d com.apple.quarantine /Applications/Tigriden.app
    ```
 
-Prefer a bare binary? The release also ships `tigriden-0.1.8-macos-arm64.tar.gz` (Apple Silicon) and `tigriden-0.1.8-macos-x86_64.tar.gz` (Intel) — untar and run `./tigriden`.
+Prefer a bare binary? The release also ships `tigriden-0.1.9-macos-arm64.tar.gz` (Apple Silicon) and `tigriden-0.1.9-macos-x86_64.tar.gz` (Intel) — untar and run `./tigriden`.
 
-**Windows** builds on the same release: unzip `tigriden-0.1.8-windows-x86_64.zip` and run `tigriden.exe`. It is built by CI on every tag rather than tested by hand — macOS is still the primary target — but 0.1.8 fixes the one thing that made it look broken on sight: a config naming a font Windows does not have (Menlo, say) rendered the terminal in Segoe UI, the platform's *proportional* interface font.
+**Windows** builds on the same release: unzip `tigriden-0.1.9-windows-x86_64.zip` and run `tigriden.exe`. It is built by CI on every tag rather than tested by hand — macOS is still the primary target — but the last two releases fixed what made it look broken on sight. 0.1.8: a config naming a font Windows does not have (Menlo, say) rendered the terminal in Segoe UI, the platform's *proportional* interface font. 0.1.9's mark stacking is platform-neutral code, and Windows falls back to Leelawadee UI for Thai — an OpenType face with real mark attachment, so tone marks sit slightly better there than under the Ayuthaya macOS reaches for.
 
 <details>
 <summary><b>Build from source</b> (stable Rust required)</summary>
@@ -216,6 +216,8 @@ Only the PTY reader threads and the viewer's rasterizer/decoder workers run in t
 `cargo build --features framedump`, then run with `TIGRIDEN_DUMP=/tmp/frames` to dump both panes as PNGs. `TIGRIDEN_TEST_INPUT='claude\r'`, `TIGRIDEN_TEST_OPEN=path`, `TIGRIDEN_TEST_SETTINGS='style=vivid,font-size-step=2'`, `TIGRIDEN_TEST_CHANGES=1` (reports the Changes panel's tracking mode and contents around a write), `TIGRIDEN_TEST_CTXMENU=1` (runs the right-click menu's Copy and Select All against the terminal and reports what reached the clipboard), `TIGRIDEN_TEST_SCROLLBACK=up|down` (wheels the terminal and reports the mode, history size and resulting screen — the way to tell scrollback from alternate-screen scrolling) and `TIGRIDEN_TEST_WHEEL_UI=1` (dispatches a real scroll event through Slint's hit-testing, to prove wheel input still reaches the terminal) script the first session for headless testing. For the typeset LaTeX page there is a faster loop that needs no window: `TEX_DUMP=paper.tex TEX_DUMP_OUT=/tmp/tex TEX_DUMP_PAGES=3 TEX_DUMP_FROM=0 cargo test tex_sheet_dump -- --nocapture` writes one PNG per page.
 
 ## Changelog
+
+- **0.1.9** — **Thai in the terminal, marks and all.** A Thai syllable is one grid cell holding a consonant plus zero-width vowels and tone marks: alacritty stacks those marks onto the cell rather than giving them columns of their own, and the renderer only ever read the cell's base character. Every mark was dropped on the way to the screen, so `สวัสดีครับ ที่นี่` arrived as `สวสดครบ ทน` — consonants standing, vowels and tones gone, which is the same thing as being unable to type Thai. A cell's whole stack is now shaped as **one cluster**, which is also what puts each mark over the right part of the letter instead of beside it; a cell carrying nothing but a mark draws instead of being skipped as blank, and a syllable under the block cursor keeps its marks rather than dropping to a bare consonant. Every mark a terminal stores this way travels the same path — Lao vowels and tones, Hebrew niqqud, Arabic harakat, a combining accent on a Vietnamese or Greek letter — and an emoji written with a variation selector now gets its emoji form. Copying always carried the marks — only the drawing was losing them.
 
 - **0.1.8** — **Display math set the way TeX sets it.** `\left(…\right)` delimiters were scaled to the body's *line box*, which carries leading no glyph reaches into, so every fence came out oversized and each nesting level multiplied the last — `LN(ReLU(Wf + b))` in four different paren sizes. Fences are now measured against the body's **ink** either side of the math axis and grown by TeX's delimiter factor, whose slack is exactly what stops the cascade. Scripts, roots and accents measure the same way, so a superscript sits on the base it belongs to and a radical over a fraction stays a radical. Atom spacing grew a left and a right side: punctuation takes its space on the right only, and a named operator is followed by the thin space that the `\!` of `\LN\!\left(` is written to cancel. **`align` keeps every row** — the math parser stopped at `\\` and the block-level code never split there, so all but the first row vanished; each row is now its own numbered equation, breaks nested in a `matrix` are left alone, and a `\label` binds to the row carrying it. Plus `\mathbb` and `\mathcal` letters, a real minus sign, spacing accents in place of combining marks that shape to nothing, a second script level for inline math (`R^{d_{model}}` no longer reads as R^d_(model)), and a wide equation nudged clear of its own number.
 

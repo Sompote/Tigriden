@@ -19,13 +19,15 @@ struct GlyphPos {
 }
 
 /// Rasterizes an alacritty grid into an RGBA pixel buffer. One instance per
-/// (font, size, scale); glyph positions are cached per distinct character.
+/// (font, size, scale); glyph positions are cached per distinct cell cluster.
 pub struct TermRenderer {
     font_family: String,
     font_size_px: f32,
     pub cell_w: u32,
     pub cell_h: u32,
-    glyphs: HashMap<(char, bool), Option<GlyphPos>>,
+    /// Shaped glyphs per cell cluster, indexed `[bold as usize]` so a lookup
+    /// can be keyed by `&str` without building an owned key per cell.
+    clusters: [HashMap<String, Vec<GlyphPos>>; 2],
     shape_buffer: Buffer,
 }
 
@@ -41,7 +43,7 @@ impl TermRenderer {
             font_size_px,
             cell_w: 0,
             cell_h: cell_h as u32,
-            glyphs: HashMap::new(),
+            clusters: [HashMap::new(), HashMap::new()],
             shape_buffer,
         };
         renderer.cell_w = renderer.measure_advance(font_system).max(1.0).round() as u32;
@@ -59,27 +61,39 @@ impl TermRenderer {
             .unwrap_or(self.font_size_px * 0.6)
     }
 
-    fn glyph(&mut self, font_system: &mut FontSystem, c: char, bold: bool) -> Option<GlyphPos> {
-        if let Some(cached) = self.glyphs.get(&(c, bold)) {
-            return *cached;
+    /// The glyphs one cell draws: its character plus the zero-width marks
+    /// stacked on it. Thai spells a syllable that way — a consonant carrying a
+    /// vowel above or below and a tone mark over that — and the marks only sit
+    /// where they belong when the whole stack is shaped in one go, so the
+    /// cluster is the unit that gets shaped and cached, not the character.
+    fn cluster(&mut self, font_system: &mut FontSystem, text: &str, bold: bool) -> &[GlyphPos] {
+        let slot = bold as usize;
+        if !self.clusters[slot].contains_key(text) {
+            let attrs = Attrs::new().family(Family::Name(&self.font_family));
+            let attrs = if bold { attrs.weight(Weight::BOLD) } else { attrs };
+            self.shape_buffer.set_text(text, &attrs, Shaping::Advanced, None);
+            self.shape_buffer.shape_until_scroll(font_system, false);
+            let shaped = self
+                .shape_buffer
+                .layout_runs()
+                .next()
+                .map(|run| {
+                    run.glyphs
+                        .iter()
+                        .map(|glyph| {
+                            let physical = glyph.physical((0.0, 0.0), 1.0);
+                            GlyphPos {
+                                cache_key: physical.cache_key,
+                                x: physical.x,
+                                y: run.line_y as i32 + physical.y,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.clusters[slot].insert(text.to_string(), shaped);
         }
-        let mut text = [0u8; 4];
-        let attrs = Attrs::new().family(Family::Name(&self.font_family));
-        let attrs = if bold { attrs.weight(Weight::BOLD) } else { attrs };
-        self.shape_buffer.set_text(c.encode_utf8(&mut text), &attrs, Shaping::Advanced, None);
-        self.shape_buffer.shape_until_scroll(font_system, false);
-        let pos = self.shape_buffer.layout_runs().next().and_then(|run| {
-            run.glyphs.first().map(|glyph| {
-                let physical = glyph.physical((0.0, 0.0), 1.0);
-                GlyphPos {
-                    cache_key: physical.cache_key,
-                    x: physical.x,
-                    y: run.line_y as i32 + physical.y,
-                }
-            })
-        });
-        self.glyphs.insert((c, bold), pos);
-        pos
+        &self.clusters[slot][text]
     }
 
     pub fn grid_size(&self, width_px: u32, height_px: u32) -> (u16, u16) {
@@ -114,6 +128,8 @@ impl TermRenderer {
 
         struct DrawCell {
             c: char,
+            /// Zero-width marks alacritty stacked onto this cell, if any.
+            marks: Option<Box<str>>,
             col: i32,
             row: i32,
             fg: [u8; 3],
@@ -145,20 +161,38 @@ impl TermRenderer {
             }
 
             let c = indexed.cell.c;
-            if c != ' ' && c != '\t' && !flags.contains(Flags::HIDDEN) {
-                draw_cells.push(DrawCell { c, col, row, fg, bold: flags.intersects(Flags::BOLD), flags });
+            let marks = indexed
+                .cell
+                .zerowidth()
+                .filter(|marks| !marks.is_empty())
+                .map(|marks| marks.iter().collect::<String>().into_boxed_str());
+            // A cell holding only marks still has something to draw: a lone
+            // Thai vowel typed with no consonant before it lands on a space.
+            let printable = (c != ' ' && c != '\t') || marks.is_some();
+            if printable && !flags.contains(Flags::HIDDEN) {
+                let bold = flags.intersects(Flags::BOLD);
+                draw_cells.push(DrawCell { c, marks, col, row, fg, bold, flags });
             } else if flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT) {
-                draw_cells.push(DrawCell { c: ' ', col, row, fg, bold: false, flags });
+                draw_cells.push(DrawCell { c: ' ', marks: None, col, row, fg, bold: false, flags });
             }
         }
 
+        // Reused across cells so an ordinary screenful of text shapes without
+        // allocating a key per cell.
+        let mut cluster_key = String::new();
         for cell in &draw_cells {
             let origin_x = cell.col * cell_w;
             let origin_y = cell.row * cell_h;
-            if cell.c != ' ' {
-                if let Some(pos) = self.glyph(font_system, cell.c, cell.bold) {
-                    let fg = cell.fg;
-                    let base = cosmic_text::Color::rgb(fg[0], fg[1], fg[2]);
+            if cell.c != ' ' || cell.marks.is_some() {
+                cluster_key.clear();
+                cluster_key.push(cell.c);
+                if let Some(marks) = &cell.marks {
+                    cluster_key.push_str(marks);
+                }
+                let fg = cell.fg;
+                let base = cosmic_text::Color::rgb(fg[0], fg[1], fg[2]);
+                for pos in self.cluster(font_system, &cluster_key, cell.bold) {
+                    let pos = *pos;
                     swash_cache.with_pixels(font_system, pos.cache_key, base, |px, py, color| {
                         let x = origin_x + pos.x + px;
                         let y = origin_y + pos.y + py;
@@ -184,11 +218,16 @@ impl TermRenderer {
             let cursor_color = default_fg;
             if focused && content.cursor.shape == CursorShape::Block {
                 canvas.fill_rect(x, y, cell_w, cell_h, cursor_color);
-                // Redraw the glyph under the cursor in background color.
-                let under = term.grid()[content.cursor.point].c;
-                if under != ' ' {
-                    if let Some(pos) = self.glyph(font_system, under, false) {
-                        let base = cosmic_text::Color::rgb(bg[0], bg[1], bg[2]);
+                // Redraw the glyph under the cursor in background color, marks
+                // and all — a Thai syllable sitting under a block cursor is
+                // otherwise left showing its bare consonant.
+                let under_cell = &term.grid()[content.cursor.point];
+                let mut under: String = under_cell.c.to_string();
+                under.extend(under_cell.zerowidth().into_iter().flatten());
+                if under != " " {
+                    let base = cosmic_text::Color::rgb(bg[0], bg[1], bg[2]);
+                    for pos in self.cluster(font_system, &under, false) {
+                        let pos = *pos;
                         swash_cache.with_pixels(font_system, pos.cache_key, base, |px, py, color| {
                             canvas.blend_pixel(x + pos.x + px, y + pos.y + py, color);
                         });
@@ -212,5 +251,54 @@ impl TermRenderer {
         }
 
         buffer
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Thai syllable is one grid cell: a consonant carrying a vowel and a
+    /// tone mark, both zero-width. Every mark has to reach the rasterizer, and
+    /// above the letter rather than beside it, or the terminal shows Thai
+    /// stripped down to bare consonants.
+    #[test]
+    fn a_cell_draws_the_marks_stacked_on_it() {
+        let mut font_system = FontSystem::new();
+        let mut renderer = TermRenderer::new("Menlo", 14.0, &mut font_system);
+        let bare = renderer.cluster(&mut font_system, "ท", false).len();
+        assert_eq!(bare, 1, "a consonant on its own is one glyph");
+        // ท + SARA II + MAI EK, the three codepoints behind "ที่".
+        let stacked = renderer.cluster(&mut font_system, "ท\u{0e35}\u{0e48}", false).to_vec();
+        assert_eq!(stacked.len(), 3, "consonant, vowel and tone mark each draw");
+
+        // Shaped together, the marks rasterize clear of the consonant's own
+        // ink; shaped one codepoint at a time they would pile onto it.
+        let mut swash_cache = SwashCache::new();
+        let tops: Vec<i32> = stacked
+            .iter()
+            .map(|glyph| top_of_ink(&mut font_system, &mut swash_cache, glyph))
+            .collect();
+        assert!(
+            tops[1..].iter().all(|mark| *mark < tops[0]),
+            "the marks sit above the consonant, not over it: {tops:?}"
+        );
+    }
+
+    /// The topmost row this glyph paints, in the cell's own coordinates.
+    fn top_of_ink(
+        font_system: &mut FontSystem,
+        swash_cache: &mut SwashCache,
+        glyph: &GlyphPos,
+    ) -> i32 {
+        let mut top = i32::MAX;
+        let white = cosmic_text::Color::rgb(255, 255, 255);
+        swash_cache.with_pixels(font_system, glyph.cache_key, white, |_x, y, color| {
+            if color.a() > 0 {
+                top = top.min(glyph.y + y);
+            }
+        });
+        top
     }
 }
