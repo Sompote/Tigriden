@@ -15,7 +15,7 @@ mod tree;
 mod viewer;
 mod webview;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -38,6 +38,94 @@ fn mods(ctrl: bool, alt: bool, meta: bool, shift: bool) -> Mods {
     // modifier is down right now.
     let (nc, na, nm, ns) = app::native_modifier_state();
     Mods { ctrl: ctrl || nc, alt: alt || na, meta: meta || nm, shift: shift || ns }
+}
+
+thread_local! {
+    /// What the key of the event slint is about to deliver types on a Latin
+    /// layout, kept from the winit event that still knows its position.
+    static LATIN_KEY: Cell<Option<char>> = const { Cell::new(None) };
+}
+
+/// The character a key types on a US layout, from where it sits on the board.
+fn latin_key(code: winit::keyboard::KeyCode) -> Option<char> {
+    use winit::keyboard::KeyCode as C;
+    Some(match code {
+        C::KeyA => 'a',
+        C::KeyB => 'b',
+        C::KeyC => 'c',
+        C::KeyD => 'd',
+        C::KeyE => 'e',
+        C::KeyF => 'f',
+        C::KeyG => 'g',
+        C::KeyH => 'h',
+        C::KeyI => 'i',
+        C::KeyJ => 'j',
+        C::KeyK => 'k',
+        C::KeyL => 'l',
+        C::KeyM => 'm',
+        C::KeyN => 'n',
+        C::KeyO => 'o',
+        C::KeyP => 'p',
+        C::KeyQ => 'q',
+        C::KeyR => 'r',
+        C::KeyS => 's',
+        C::KeyT => 't',
+        C::KeyU => 'u',
+        C::KeyV => 'v',
+        C::KeyW => 'w',
+        C::KeyX => 'x',
+        C::KeyY => 'y',
+        C::KeyZ => 'z',
+        C::Digit0 => '0',
+        C::Digit1 => '1',
+        C::Digit2 => '2',
+        C::Digit3 => '3',
+        C::Digit4 => '4',
+        C::Digit5 => '5',
+        C::Digit6 => '6',
+        C::Digit7 => '7',
+        C::Digit8 => '8',
+        C::Digit9 => '9',
+        C::Minus => '-',
+        C::Equal => '=',
+        C::BracketLeft => '[',
+        C::BracketRight => ']',
+        C::Backslash => '\\',
+        C::Semicolon => ';',
+        C::Quote => '\'',
+        C::Backquote => '`',
+        C::Comma => ',',
+        C::Period => '.',
+        C::Slash => '/',
+        C::Space => ' ',
+        _ => return None,
+    })
+}
+
+/// The text of a key event, resolved through a Latin layout when it is part
+/// of a Ctrl or ⌘ combo.
+///
+/// Slint reports what the current layout types, and a Thai (or Cyrillic, or
+/// Greek) layout types Ctrl+ญ where the key cap says O: no shortcut matches
+/// it and no control byte encodes it, so ^O never reaches nano. macOS itself
+/// falls back to a Latin layout for ⌘ shortcuts; do the same for both, using
+/// the position of the key that was actually pressed.
+fn key_text(text: &slint::SharedString, mods: &Mods) -> slint::SharedString {
+    if !(mods.ctrl || mods.meta) {
+        return text.clone();
+    }
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        // Arrows, Home, the F-keys: slint spells those in the private use
+        // area, and no layout types them.
+        (Some(ch), None) if !ch.is_ascii() && !('\u{e000}'..='\u{f8ff}').contains(&ch) => {}
+        _ => return text.clone(),
+    }
+    match LATIN_KEY.get() {
+        Some(latin) if mods.shift => latin.to_ascii_uppercase().to_string().into(),
+        Some(latin) => latin.to_string().into(),
+        None => text.clone(),
+    }
 }
 
 struct WindowOpts {
@@ -121,8 +209,10 @@ fn wire_callbacks(ui: &MainWindow, app_id: u64) {
     ui.on_menu_close_session(move || with_app_id(app_id, |app| app.menu_close_session()));
     ui.on_tree_context(move |action, id| with_app_id(app_id, |app| app.tree_context(action, id)));
     ui.on_tree_key(move |text, ctrl, alt, meta, shift| {
+        let mods = mods(ctrl, alt, meta, shift);
+        let text = key_text(&text, &mods);
         let mut handled = false;
-        with_app_id(app_id, |app| handled = app.tree_key(&text, mods(ctrl, alt, meta, shift)));
+        with_app_id(app_id, |app| handled = app.tree_key(&text, mods));
         handled
     });
     ui.on_name_dialog_accept(move |name| {
@@ -144,8 +234,10 @@ fn wire_callbacks(ui: &MainWindow, app_id: u64) {
     ui.on_banner_secondary(move || with_app_id(app_id, |app| app.banner_secondary()));
 
     ui.on_term_key(move |text, ctrl, alt, meta, shift| {
+        let mods = mods(ctrl, alt, meta, shift);
+        let text = key_text(&text, &mods);
         let mut handled = false;
-        with_app_id(app_id, |app| handled = app.term_key(&text, mods(ctrl, alt, meta, shift)));
+        with_app_id(app_id, |app| handled = app.term_key(&text, mods));
         handled
     });
     ui.on_term_wheel(move |delta| with_app_id(app_id, |app| app.term_wheel(delta)));
@@ -154,8 +246,10 @@ fn wire_callbacks(ui: &MainWindow, app_id: u64) {
     ui.on_term_context(move |action| with_app_id(app_id, |app| app.term_context(action)));
 
     ui.on_editor_key(move |text, ctrl, alt, meta, shift| {
+        let mods = mods(ctrl, alt, meta, shift);
+        let text = key_text(&text, &mods);
         let mut handled = false;
-        with_app_id(app_id, |app| handled = app.editor_key(&text, mods(ctrl, alt, meta, shift)));
+        with_app_id(app_id, |app| handled = app.editor_key(&text, mods));
         handled
     });
     ui.on_editor_mouse(move |kind, x, y| with_app_id(app_id, |app| app.editor_mouse(kind, x, y)));
@@ -168,6 +262,17 @@ fn wire_callbacks(ui: &MainWindow, app_id: u64) {
     // External file drops arrive as winit events the Slint DropArea never
     // sees; forward them to the active terminal as a typed path.
     ui.window().on_winit_window_event(move |_, event| match event {
+        // Remember where the key sits on the board: by the time slint hands us
+        // the event, only the character the layout types is left.
+        winit::event::WindowEvent::KeyboardInput { event, .. } => {
+            if event.state == winit::event::ElementState::Pressed {
+                LATIN_KEY.set(match event.physical_key {
+                    winit::keyboard::PhysicalKey::Code(code) => latin_key(code),
+                    _ => None,
+                });
+            }
+            EventResult::Propagate
+        }
         winit::event::WindowEvent::DroppedFile(path) => {
             let path = path.clone();
             with_app_id(app_id, move |app| app.file_dropped(path));
@@ -222,4 +327,42 @@ fn main() {
     slint::run_event_loop().expect("event loop failed");
     // Covers macOS ⌘Q, which quits the loop without a per-window close_requested.
     app::shutdown_all();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_mods() -> Mods {
+        Mods { ctrl: false, alt: false, meta: false, shift: false }
+    }
+
+    #[test]
+    fn ctrl_combos_resolve_through_a_latin_layout() {
+        // A Thai layout types ญ where the key cap says O.
+        LATIN_KEY.set(Some('o'));
+        let ctrl = Mods { ctrl: true, ..no_mods() };
+        assert_eq!(key_text(&"ญ".into(), &ctrl), "o");
+        let cmd = Mods { meta: true, ..no_mods() };
+        assert_eq!(key_text(&"ญ".into(), &cmd), "o");
+        let shifted = Mods { ctrl: true, shift: true, ..no_mods() };
+        assert_eq!(key_text(&"ญ".into(), &shifted), "O");
+        // Typing Thai is typing Thai: only combos are resolved.
+        assert_eq!(key_text(&"ญ".into(), &no_mods()), "ญ");
+        // A layout that already types Latin keeps what it typed, wherever the
+        // key sits (Dvorak, AZERTY).
+        assert_eq!(key_text(&"c".into(), &ctrl), "c");
+        // Special keys (arrows, F-keys) and IME bursts pass through.
+        let up = term::keys::K_UP.to_string();
+        assert_eq!(key_text(&up.as_str().into(), &ctrl), up);
+        assert_eq!(key_text(&"ญญ".into(), &ctrl), "ญญ");
+    }
+
+    #[test]
+    fn latin_key_maps_the_letter_row() {
+        use winit::keyboard::KeyCode;
+        assert_eq!(latin_key(KeyCode::KeyO), Some('o'));
+        assert_eq!(latin_key(KeyCode::Slash), Some('/'));
+        assert_eq!(latin_key(KeyCode::F1), None);
+    }
 }
