@@ -359,6 +359,12 @@ pub struct App {
     /// `show_changes` in the config.
     changes_enabled: bool,
     shutting_down: bool,
+    /// The live WebKit view parked over the viewer pane for HTML files. One
+    /// per window: only the active session's pane is ever on screen.
+    web: Option<crate::webview::WebView>,
+    /// What `web` currently has loaded, so switching back to a file it
+    /// already holds does not reload it.
+    web_path: Option<PathBuf>,
 }
 
 impl App {
@@ -443,6 +449,8 @@ impl App {
             resize_timer_armed: false,
             changes_enabled,
             shutting_down: false,
+            web: None,
+            web_path: None,
         }
     }
 
@@ -454,11 +462,13 @@ impl App {
         if let Some(ui) = self.ui() {
             ui.set_settings_visible(true);
         }
+        self.sync_web();
     }
 
     pub fn close_settings(&mut self) {
         let Some(ui) = self.ui() else { return };
         ui.set_settings_visible(false);
+        self.sync_web();
         // The dialog took focus from the panes; hand it back to the terminal.
         ui.invoke_focus_terminal();
     }
@@ -1342,6 +1352,9 @@ impl App {
 
     fn really_open_file(&mut self, idx: usize, path: PathBuf) {
         self.active = idx;
+        // Opening is also how a changed file is re-read, so the page is
+        // fetched again rather than kept from the last load.
+        self.web_path = None;
         if let Some(kind) = viewer::classify(&path) {
             self.open_viewer(idx, path, kind);
             return;
@@ -1398,8 +1411,15 @@ impl App {
             self.really_open_file(self.active, path);
             return;
         }
-        if let Some(viewer_state) = &session.viewer {
-            let path = viewer_state.path.clone();
+        if let Some((kind, path)) = session.viewer.as_ref().map(|v| (v.kind, v.path.clone())) {
+            // The first step of an HTML file's cycle swaps the web view for
+            // the typeset page; the same file stays open behind both.
+            if kind == viewer::ViewKind::Html && session.html_web {
+                session.html_web = false;
+                self.render_editor();
+                self.update_chrome();
+                return;
+            }
             session.viewer = None;
             self.open_text_editor(self.active, path);
         } else if let Some(editor) = &session.editor {
@@ -1410,6 +1430,10 @@ impl App {
                     return;
                 }
                 session.editor = None;
+                // Coming back from Source, an HTML file lands on the web view,
+                // fetched again in case the source was edited while it showed.
+                session.html_web = true;
+                self.web_path = None;
                 self.open_viewer(self.active, path, kind);
             }
         }
@@ -1715,6 +1739,7 @@ impl App {
         self.editor_view = (w, h);
         self.apply_editor_size();
         self.render_editor();
+        self.sync_web();
     }
 
     fn apply_editor_size(&mut self) {
@@ -2359,6 +2384,7 @@ impl App {
             ui.set_name_dialog_value(SharedString::from(initial));
             ui.set_name_dialog_visible(true);
         }
+        self.sync_web();
     }
 
     fn close_name_dialog(&mut self) {
@@ -2366,6 +2392,7 @@ impl App {
         if let Some(ui) = self.ui() {
             ui.set_name_dialog_visible(false);
         }
+        self.sync_web();
     }
 
     /// Refreshes a directory listing right away instead of waiting for the
@@ -3050,6 +3077,61 @@ impl App {
         self.update_chrome();
     }
 
+    /// Keeps the native web view in step with what the pane should show: the
+    /// active session's HTML file in Rendered mode, parked over the pane and
+    /// moved with it. Anything else — a reader view, another tab, a dialog —
+    /// takes it off screen.
+    fn sync_web(&mut self) {
+        let Some(ui) = self.ui() else { return };
+        let wanted = self.sessions.get(self.active).and_then(|session| {
+            let viewer_state = session.viewer.as_ref()?;
+            (viewer_state.kind == viewer::ViewKind::Html && session.html_web)
+                .then(|| viewer_state.path.clone())
+        });
+        // A Slint dialog draws inside the window, and a native subview would
+        // sit on top of it, so the page stands down while one is up.
+        let covered = ui.get_settings_visible() || ui.get_name_dialog_visible();
+        let Some(path) = wanted.filter(|_| !covered) else {
+            if let Some(web) = &self.web {
+                web.set_hidden(true);
+            }
+            return;
+        };
+        if self.web.is_none() {
+            self.web = self.create_web();
+        }
+        let Some(web) = self.web.as_ref() else { return };
+        if self.web_path.as_deref() != Some(path.as_path()) {
+            web.load(&path);
+            self.web_path = Some(path);
+        }
+        let window = ui.window();
+        let size = window.size().to_logical(window.scale_factor());
+        web.set_frame(
+            size.height,
+            ui.get_editor_pane_left(),
+            ui.get_editor_pane_top(),
+            ui.get_editor_pane_width(),
+            ui.get_editor_pane_height(),
+        );
+        web.set_hidden(false);
+    }
+
+    /// Makes the WebKit view, parented to the window's own content view.
+    fn create_web(&self) -> Option<crate::webview::WebView> {
+        use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let ui = self.ui()?;
+        let ns_view = ui.window().with_winit_window(|w| {
+            match w.window_handle().ok()?.as_raw() {
+                RawWindowHandle::AppKit(handle) => Some(handle.ns_view.as_ptr()),
+                _ => None,
+            }
+        })??;
+        // Safety: the handle is the live window's content view, and the view
+        // is dropped (and unparented) with the App that owns the window.
+        unsafe { crate::webview::WebView::new(ns_view) }
+    }
+
     fn update_chrome(&mut self) {
         let Some(ui) = self.ui() else { return };
         ui.set_has_session(!self.sessions.is_empty());
@@ -3064,7 +3146,10 @@ impl App {
                             session.relative_name(&viewer_state.path),
                         ));
                         ui.set_editor_dirty(false);
+                        // HTML cycles Rendered -> Reader -> Source; the
+                        // other rendered views are a straight pair.
                         ui.set_editor_view_toggle(SharedString::from(match viewer_state.kind {
+                            viewer::ViewKind::Html if session.html_web => "Reader",
                             viewer::ViewKind::Markdown
                             | viewer::ViewKind::Csv
                             | viewer::ViewKind::Tex
@@ -3121,6 +3206,8 @@ impl App {
                 ui.set_active_term(0);
             }
         }
+        // Last, so the native page follows whatever the chrome just decided.
+        self.sync_web();
     }
 
     pub fn split_changed(&mut self) {

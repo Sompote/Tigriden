@@ -13,6 +13,7 @@ mod tex;
 mod theme;
 mod tree;
 mod viewer;
+mod webview;
 
 use std::cell::RefCell;
 use std::path::PathBuf;

@@ -179,6 +179,12 @@ export component MainWindow inherits Window {
     // ----- file panel drag & drop -----
     in property <int> tree-drop-row: -1;
     in property <bool> tree-drop-active: false;
+    // Where the viewer pane sits in the window, so the native web view for
+    // an HTML file can be parked exactly over it.
+    out property <length> editor-pane-left: editor-pane.absolute-position.x;
+    out property <length> editor-pane-top: editor-pane.absolute-position.y;
+    out property <length> editor-pane-width: editor-pane.width;
+    out property <length> editor-pane-height: editor-pane.height;
     out property <length> tree-list-top: sidebar.list-top;
     out property <length> tree-list-height: sidebar.list-height;
     out property <length> tree-list-left: sidebar.list-left;

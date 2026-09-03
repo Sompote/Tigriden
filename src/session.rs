@@ -26,6 +26,9 @@ pub struct Session {
     pub active_term: usize,
     pub editor: Option<EditorState>,
     pub viewer: Option<ViewerState>,
+    /// For an HTML file: whether the pane shows the live WebKit view rather
+    /// than the typeset reader. The chip cycles Rendered / Reader / Source.
+    pub html_web: bool,
     pub tree: TreeState,
     pub tree_visible: bool,
     /// Directories whose listings changed on disk since the last model rebuild.
@@ -69,6 +72,7 @@ impl Session {
             active_term: 0,
             editor: None,
             viewer: None,
+            html_web: true,
             tree: TreeState::new(root),
             tree_visible: true,
             pending_fs: Vec::new(),
