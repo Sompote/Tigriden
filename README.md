@@ -53,6 +53,7 @@ Nothing in steps 2–5 costs a LaTeX run or a second application.
 - **Figures and tables of real manuscripts** — `\graphicspath` searched, vector **PDF** plots rasterized, pictures scaled by the `minipage` they sit in; `tabular`/`tabularx`/`longtable` set booktabs style. Preamble noise, package options and unknown commands never leak onto the page.
 - **PDFs as actual pages** — the compiled paper, a reference you are citing, a datasheet. **Select and copy text straight off the page**, with two-column papers copying one column at a time instead of zig-zagging across the gutter.
 - **Markdown on the same white page**, with the same typeset math — for notes, READMEs and agent-written summaries.
+- **HTML read as a page**, not as source — headings, lists, tables, `<pre>` blocks and local `<img>` figures set on that same white sheet, with entities decoded and `<script>`/`<style>` left out. For the report an agent just wrote, or a saved page you are reading.
 - **Everything else in the folder** — images (png/jpg/gif/webp/bmp/tiff) and CSV/TSV as an aligned table, so a plot or a results file the agent just wrote is one click away.
 - **Fast, because nothing compiles** — no `pdflatex` run to see a change; PDF pages rasterize and images decode on background threads with the next page prefetched, so scrolling and zooming never stall. Cmd+= / Cmd+- / Cmd+0 zoom, and the LaTeX page re-typesets at the new size.
 

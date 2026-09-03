@@ -3067,7 +3067,8 @@ impl App {
                         ui.set_editor_view_toggle(SharedString::from(match viewer_state.kind {
                             viewer::ViewKind::Markdown
                             | viewer::ViewKind::Csv
-                            | viewer::ViewKind::Tex => "Source",
+                            | viewer::ViewKind::Tex
+                            | viewer::ViewKind::Html => "Source",
                             viewer::ViewKind::Image | viewer::ViewKind::Pdf => "",
                         }));
                     }
@@ -3085,7 +3086,8 @@ impl App {
                         ui.set_editor_view_toggle(SharedString::from(
                             match viewer::classify(&editor.path) {
                                 Some(viewer::ViewKind::Markdown)
-                                | Some(viewer::ViewKind::Tex) => "Rendered",
+                                | Some(viewer::ViewKind::Tex)
+                                | Some(viewer::ViewKind::Html) => "Rendered",
                                 Some(viewer::ViewKind::Csv) => "Table",
                                 _ => "",
                             },

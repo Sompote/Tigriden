@@ -22,6 +22,7 @@ pub enum ViewKind {
     Csv,
     Pdf,
     Tex,
+    Html,
 }
 
 /// Zoom bounds for images and PDF pages (factor over the fit-to-width size).
@@ -145,6 +146,41 @@ fn fit_draw(w: f32, h: f32, target_w: f32) -> (f32, f32) {
         dw = (w * dh / h.max(1.0)).max(1.0);
     }
     (dw, dh)
+}
+
+/// Elements whose subtree the page never shows: document metadata, code the
+/// browser would run, and the widgets a stylesheet-less view cannot draw.
+const SKIPPED_HTML: &[&str] = &[
+    "head", "title", "script", "style", "noscript", "template", "svg", "iframe", "object",
+    "canvas", "select", "textarea",
+];
+
+/// Reads an HTML length as a fraction of the column: only a percentage says
+/// anything about the column, so `width="600"` keeps the picture's own size.
+fn percent_of(value: &str) -> Option<f32> {
+    let pct: f32 = value.trim().strip_suffix('%')?.trim().parse().ok()?;
+    (pct > 0.0).then(|| (pct / 100.0).min(1.0))
+}
+
+/// Collapses HTML text the way flowed layout does: every run of spacing
+/// becomes one space. `after_space` is false when nothing precedes the run in
+/// the line, which is where a leading space is dropped instead.
+fn collapse_spaces(raw: &str, after_space: bool) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut space = !after_space;
+    for c in raw.chars() {
+        // A no-break space is content, not spacing; it survives verbatim.
+        if c.is_whitespace() && c != '\u{a0}' {
+            if !space {
+                out.push(' ');
+                space = true;
+            }
+        } else {
+            out.push(c);
+            space = false;
+        }
+    }
+    out
 }
 
 /// Splits a display formula from a trailing `\tag{…}`. Markdown has no
@@ -695,6 +731,7 @@ impl ViewerState {
             ViewKind::Csv => viewer.build_csv(font_system, path)?,
             ViewKind::Pdf => viewer.build_pdf(font_system, path, notify.clone())?,
             ViewKind::Tex => viewer.build_tex(font_system, path)?,
+            ViewKind::Html => viewer.build_html(font_system, path)?,
         }
         if !viewer.img_paths.is_empty() {
             viewer.img_worker = Some(spawn_img_worker(std::mem::take(&mut viewer.img_paths), notify));
@@ -1173,6 +1210,317 @@ impl ViewerState {
             }
         }
         flush!(self, spans, heading, list_stack, quote_depth);
+        if self.blocks.is_empty() {
+            let attrs = ui_attrs().color(fg);
+            self.push_plain(font_system, "(empty file)", attrs, Wrap::WordOrGlyph);
+        }
+        Ok(())
+    }
+
+    /// Formats an HTML file. The reader hands back a balanced tag stream, so
+    /// this only has to say what each element sets; the result is the same
+    /// white sheet of running text the Markdown view paints, which is what a
+    /// browser would show of the same file minus its stylesheet.
+    fn build_html(&mut self, font_system: &mut FontSystem, path: &Path) -> Result<(), String> {
+        let source = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+
+        self.paper = true;
+        self.margin = (self.font_px * 2.8).round();
+        self.spacing = (self.font_px * 0.62).round();
+
+        let accent = PAPER_LINK;
+        let code_bg = PAPER_CODE_BG;
+        let serif = mathlayout::serif_family(font_system);
+        let fg = self.text_color();
+        let family = self.font_family;
+
+        let mut spans: Vec<(String, Attrs<'static>)> = Vec::new();
+        let mut bold = 0usize;
+        let mut italic = 0usize;
+        let mut link = 0usize;
+        let mut code = 0usize;
+        // Scripts do not nest in prose, so one level either way is enough.
+        let mut script = 0i8;
+        let mut heading: Option<f32> = None;
+        let mut list_stack: Vec<Option<u64>> = Vec::new();
+        let mut quote_depth = 0usize;
+        let mut dd_depth = 0usize;
+        // Some while inside `<pre>`, collecting its text with the spacing kept.
+        let mut pre: Option<String> = None;
+        // rows -> cells -> styled spans; Some while inside a table.
+        let mut table: Option<Vec<Vec<Vec<(String, Attrs<'static>)>>>> = None;
+        let mut table_row: Vec<Vec<(String, Attrs<'static>)>> = Vec::new();
+        // Element nesting, and the depth at which a skipped subtree started.
+        let mut depth = 0usize;
+        let mut skip: Option<usize> = None;
+
+        let attrs_for = |bold: usize, italic: usize, link: usize, code: usize, script: i8,
+                         base_px: f32| {
+            let mut attrs = if code > 0 { mono(family) } else { Attrs::new().family(serif) };
+            attrs = attrs.color(fg);
+            if bold > 0 {
+                attrs = attrs.weight(Weight::BOLD);
+            }
+            if italic > 0 {
+                attrs = attrs.style(Style::Italic);
+            }
+            if link > 0 || code > 0 {
+                attrs = attrs.color(Color::rgb(accent[0], accent[1], accent[2]));
+            }
+            if script != 0 {
+                let px = (base_px * script_scale(script)).round().max(5.0);
+                attrs = attrs
+                    .metadata(script_tag(script))
+                    .metrics(Metrics::new(px, (base_px * 1.5).round()));
+            }
+            attrs
+        };
+
+        macro_rules! flush {
+            () => {
+                flush!(None)
+            };
+            ($align:expr) => {{
+                let base = heading.unwrap_or(self.font_px);
+                let indent = (list_stack.len() + quote_depth + dd_depth) as f32 * 1.5
+                    * self.font_px;
+                let inset_r = quote_depth as f32 * 1.5 * self.font_px;
+                let taken = std::mem::take(&mut spans);
+                self.push_inset(font_system, &taken, base, indent, inset_r, $align);
+            }};
+        }
+
+        for event in crate::html::parse(&source) {
+            match event {
+                crate::html::Event::Open { name, attrs } => {
+                    depth += 1;
+                    if skip.is_none() && SKIPPED_HTML.contains(&name.as_str()) {
+                        skip = Some(depth);
+                    }
+                    if skip.is_some() {
+                        continue;
+                    }
+                    let base = heading.unwrap_or(self.font_px);
+                    match name.as_str() {
+                        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                            flush!();
+                            let scale = match name.as_str() {
+                                "h1" => 1.7,
+                                "h2" => 1.4,
+                                "h3" => 1.2,
+                                _ => 1.05,
+                            };
+                            heading = Some((self.font_px * scale).round());
+                            bold += 1;
+                        }
+                        "p" | "div" | "section" | "article" | "header" | "footer" | "main"
+                        | "aside" | "nav" | "figure" | "figcaption" | "caption" | "address"
+                        | "form" | "fieldset" | "details" | "summary" | "dl" | "dt" => flush!(),
+                        "dd" => {
+                            flush!();
+                            dd_depth += 1;
+                        }
+                        "blockquote" => {
+                            flush!();
+                            quote_depth += 1;
+                        }
+                        "ul" => {
+                            flush!();
+                            list_stack.push(None);
+                        }
+                        "ol" => {
+                            flush!();
+                            let start = crate::html::attr(&attrs, "start")
+                                .and_then(|s| s.trim().parse().ok())
+                                .unwrap_or(1);
+                            list_stack.push(Some(start));
+                        }
+                        "li" => {
+                            let marker = match list_stack.last_mut() {
+                                Some(Some(n)) => {
+                                    let m = format!("{n}. ");
+                                    *n += 1;
+                                    m
+                                }
+                                _ => "•  ".to_string(),
+                            };
+                            spans.push((marker, attrs_for(1, 0, 0, 0, 0, base)));
+                        }
+                        "pre" => {
+                            flush!();
+                            pre = Some(String::new());
+                        }
+                        "table" => {
+                            flush!();
+                            table = Some(Vec::new());
+                        }
+                        "tr" => {
+                            table_row.clear();
+                            spans.clear();
+                        }
+                        "th" => {
+                            bold += 1;
+                            spans.clear();
+                        }
+                        "td" => spans.clear(),
+                        "strong" | "b" => bold += 1,
+                        "em" | "i" | "cite" | "var" | "dfn" => italic += 1,
+                        "a" => link += 1,
+                        "code" | "kbd" | "samp" | "tt" => code += 1,
+                        "sup" => script = 1,
+                        "sub" => script = -1,
+                        "br" => spans.push(("\n".into(), attrs_for(0, 0, 0, 0, 0, base))),
+                        "hr" => {
+                            flush!();
+                            self.blocks.push(Block::Rule);
+                        }
+                        "img" => {
+                            let src = crate::html::attr(&attrs, "src").unwrap_or_default();
+                            let src = src.trim().trim_start_matches("./");
+                            let alt = crate::html::attr(&attrs, "alt").unwrap_or_default();
+                            let fill = crate::html::attr(&attrs, "width").and_then(percent_of);
+                            // Remote and inline-data sources have no file to
+                            // read, and a figure would break a table's grid.
+                            let local = !src.is_empty()
+                                && !src.starts_with("http")
+                                && !src.starts_with("data:");
+                            let mut placed = false;
+                            if local && table.is_none() {
+                                flush!();
+                                placed = self.push_figure(&base_dir.join(src), fill);
+                            }
+                            if !placed {
+                                let label = if alt.is_empty() {
+                                    format!("[image: {src}]")
+                                } else {
+                                    format!("[{alt}]")
+                                };
+                                let remote = usize::from(!local);
+                                spans.push((label, attrs_for(0, 1, remote, 0, 0, base)));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                crate::html::Event::Close { name } => {
+                    let skipping = skip.is_some();
+                    if skip == Some(depth) {
+                        skip = None;
+                    }
+                    depth = depth.saturating_sub(1);
+                    if skipping {
+                        continue;
+                    }
+                    match name.as_str() {
+                        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                            flush!();
+                            heading = None;
+                            bold = bold.saturating_sub(1);
+                        }
+                        "p" => {
+                            // Justified running text is what makes the page
+                            // read as typeset; list and quote bodies stay
+                            // ragged, as LaTeX sets them.
+                            let plain = list_stack.is_empty()
+                                && quote_depth == 0
+                                && dd_depth == 0
+                                && table.is_none();
+                            flush!(plain.then_some(Align::Justified));
+                        }
+                        "figcaption" | "caption" => {
+                            let taken = std::mem::take(&mut spans);
+                            let px = (self.font_px * 0.92).round();
+                            self.push_aligned(font_system, &taken, px, 0.0, Some(Align::Center));
+                        }
+                        "div" | "section" | "article" | "header" | "footer" | "main" | "aside"
+                        | "nav" | "figure" | "address" | "form" | "fieldset" | "details"
+                        | "summary" | "dl" | "dt" | "li" => flush!(),
+                        "dd" => {
+                            flush!();
+                            dd_depth = dd_depth.saturating_sub(1);
+                        }
+                        "blockquote" => {
+                            flush!();
+                            quote_depth = quote_depth.saturating_sub(1);
+                        }
+                        "ul" | "ol" => {
+                            flush!();
+                            list_stack.pop();
+                        }
+                        "pre" => {
+                            let text = pre.take().unwrap_or_default();
+                            let text = text.trim_start_matches('\n').trim_end();
+                            if !text.is_empty() {
+                                let px = (self.font_px * 0.92).round();
+                                let mut buffer =
+                                    Buffer::new(font_system, Metrics::new(px, (px * 1.4).round()));
+                                buffer.set_wrap(Wrap::WordOrGlyph);
+                                buffer.set_text(
+                                    text,
+                                    &mono(family).color(fg),
+                                    Shaping::Advanced,
+                                    None,
+                                );
+                                self.blocks.push(Block::Text {
+                                    buffer,
+                                    indent: 0.0,
+                                    inset_r: 0.0,
+                                    bg: Some(code_bg),
+                                    height: 0.0,
+                                });
+                            }
+                        }
+                        "table" => {
+                            if let Some(rows) = table.take() {
+                                self.push_table(font_system, rows);
+                            }
+                            spans.clear();
+                        }
+                        "tr" => {
+                            if let Some(rows) = table.as_mut() {
+                                rows.push(std::mem::take(&mut table_row));
+                            }
+                        }
+                        "td" | "th" => {
+                            if name == "th" {
+                                bold = bold.saturating_sub(1);
+                            }
+                            table_row.push(std::mem::take(&mut spans));
+                        }
+                        "strong" | "b" => bold = bold.saturating_sub(1),
+                        "em" | "i" | "cite" | "var" | "dfn" => {
+                            italic = italic.saturating_sub(1)
+                        }
+                        "a" => link = link.saturating_sub(1),
+                        "code" | "kbd" | "samp" | "tt" => code = code.saturating_sub(1),
+                        "sup" | "sub" => script = 0,
+                        _ => {}
+                    }
+                }
+                crate::html::Event::Text(text) => {
+                    if skip.is_some() {
+                        continue;
+                    }
+                    if let Some(buffer) = pre.as_mut() {
+                        buffer.push_str(&text);
+                        continue;
+                    }
+                    // Outside <pre> every run of spacing is one space, and a
+                    // space that would open a block is dropped.
+                    let after_space = spans
+                        .last()
+                        .is_some_and(|(t, _)| !t.ends_with(' ') && !t.ends_with('\n'));
+                    let text = collapse_spaces(&text, after_space);
+                    if !text.is_empty() {
+                        let base = heading.unwrap_or(self.font_px);
+                        spans.push((text, attrs_for(bold, italic, link, code, script, base)));
+                    }
+                }
+            }
+        }
+        flush!();
         if self.blocks.is_empty() {
             let attrs = ui_attrs().color(fg);
             self.push_plain(font_system, "(empty file)", attrs, Wrap::WordOrGlyph);
@@ -3627,6 +3975,78 @@ mod tests {
 
 
 
+
+    /// The HTML view has to reach the same page the Markdown view paints:
+    /// structure from the tags, a real table, a figure block for a local
+    /// image, and text that reads back in document order.
+    #[test]
+    fn html_is_set_as_a_page() {
+        let dir = std::env::temp_dir();
+        let img = dir.join("tigriden-viewer-html-test.png");
+        RgbaImage::new(4, 4).save(&img).unwrap();
+        let path = dir.join("tigriden-viewer-html-test.html");
+        std::fs::write(
+            &path,
+            concat!(
+                "<!doctype html><html><head><title>Hidden</title>",
+                "<style>p { color: red }</style></head><body>\n",
+                "<h1>Results &amp; Notes</h1>\n",
+                "<p>The error is <strong>2&nbsp;kg</strong>, or 10<sup>-3</sup> of the\n",
+                "   total. See <a href=\"x.html\">the appendix</a>.\n",
+                "<ul><li>first<li>second</ul>\n",
+                "<pre>  keep   this\n  spacing</pre>\n",
+                "<table><tr><th>run<th>rmse<tr><td>a<td>0.12</table>\n",
+                "<figure><img src=\"tigriden-viewer-html-test.png\" width=\"50%\">",
+                "<figcaption>Figure 1</figcaption></figure>\n",
+                "<script>document.title = 'nope'</script>\n",
+                "</body></html>\n",
+            ),
+        )
+        .unwrap();
+
+        let mut font_system = FontSystem::new();
+        let theme = crate::theme::default_theme();
+        let mut viewer = ViewerState::open(
+            &mut font_system,
+            &path,
+            ViewKind::Html,
+            "Menlo",
+            13.0,
+            theme,
+            [0, 0, 0],
+            400.0,
+            std::sync::Arc::new(|| {}),
+        )
+        .expect("viewer opens the html");
+
+        assert_eq!(
+            viewer.blocks.iter().filter(|b| matches!(b, Block::Table { .. })).count(),
+            1,
+            "the table becomes a laid-out grid",
+        );
+        let pictures: Vec<&Block> =
+            viewer.blocks.iter().filter(|b| matches!(b, Block::Picture { .. })).collect();
+        assert_eq!(pictures.len(), 1, "the local <img> becomes a figure");
+        let Block::Picture { fill, .. } = pictures[0] else { unreachable!() };
+        assert_eq!(*fill, Some(0.5), "width=\"50%\" is half the column");
+
+        assert!(viewer.select_all(), "the html view has selectable text");
+        let all = viewer.selected_text().expect("select-all yields text");
+        assert!(all.contains("Results & Notes"), "entities decode: {all}");
+        assert!(all.contains("2\u{a0}kg"), "&nbsp; survives as itself: {all}");
+        assert!(all.contains("of the total."), "a source newline is one space: {all}");
+        assert!(all.contains("the appendix"), "link text is kept: {all}");
+        assert!(all.contains("  keep   this"), "<pre> keeps its spacing: {all}");
+        assert!(all.contains("Figure 1"), "the caption is set: {all}");
+        assert!(!all.contains("Hidden"), "<title> never reaches the page: {all}");
+        assert!(!all.contains("color: red"), "<style> never reaches the page: {all}");
+        assert!(!all.contains("document.title"), "<script> never reaches the page: {all}");
+        assert!(all.find("first").unwrap() < all.find("second").unwrap());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&img);
+    }
+
     #[test]
     fn markdown_selection_copies_text() {
         let path = std::env::temp_dir().join("tigriden-viewer-sel-test.md");
@@ -3832,7 +4252,9 @@ mod tests {
         let mut viewer = ViewerState::open(
             &mut font_system,
             Path::new(&src),
-            ViewKind::Tex,
+            // Whatever the file is: the hook is as useful on a Markdown or
+            // HTML page as on the .tex it was written for.
+            classify(Path::new(&src)).unwrap_or(ViewKind::Tex),
             "Menlo",
             46.0,
             theme,
@@ -3840,7 +4262,7 @@ mod tests {
             w as f32,
             std::sync::Arc::new(|| {}),
         )
-        .expect("viewer opens the tex");
+        .expect("viewer opens the file");
         if (zoom - 1.0).abs() > 0.01 {
             viewer.zoom_by(&mut font_system, zoom);
         }
@@ -3956,6 +4378,7 @@ pub fn classify(path: &Path) -> Option<ViewKind> {
         "csv" | "tsv" => Some(ViewKind::Csv),
         "pdf" => Some(ViewKind::Pdf),
         "tex" | "latex" | "ltx" => Some(ViewKind::Tex),
+        "html" | "htm" | "xhtml" => Some(ViewKind::Html),
         _ => None,
     }
 }

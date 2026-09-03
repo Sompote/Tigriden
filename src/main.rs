@@ -3,6 +3,7 @@ mod config;
 mod editor;
 mod fonts;
 mod git;
+mod html;
 mod mac;
 mod mathlayout;
 mod paint;
