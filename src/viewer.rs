@@ -285,8 +285,9 @@ pub struct ViewerState {
     sel_head: Option<(usize, Cursor)>,
     /// True while the left button is dragging out a text selection.
     selecting: bool,
-    /// Extracted text of a page-rendered PDF, filled lazily on first copy
-    /// (the page bitmaps carry no selectable glyphs).
+    /// The whole document's text for a page-rendered PDF, extracted by the
+    /// worker while the pages rasterize (the bitmaps carry no selectable
+    /// glyphs). None until it arrives.
     pdf_text: Option<String>,
     /// Set for LaTeX documents, which are painted on a white sheet with dark
     /// ink the way a PDF of the same source would look.
@@ -514,6 +515,12 @@ enum PdfReq {
 
 /// A finished piece of that work.
 enum PdfRes {
+    /// The document parsed; one entry per page, in order.
+    Opened(Vec<(f32, f32)>),
+    /// hayro could not use the file, so it was read for its text instead.
+    Unreadable(String),
+    /// The whole document's text, for a copy with nothing selected.
+    Whole(String),
     Page(usize, u32, RgbaImage),
     Text(usize, PageText),
 }
@@ -547,27 +554,63 @@ struct PdfWorker {
     wanted: Arc<Mutex<HashSet<usize>>>,
 }
 
-/// Parses the PDF on a dedicated thread and returns the page sizes plus a
-/// handle for requesting page bitmaps, or None if hayro cannot parse it.
+/// Opens the PDF on a dedicated thread and hands back a handle at once.
+///
+/// Reading the file and parsing it are the worker's job, not the caller's:
+/// this used to block on the parse before returning, on the event loop that
+/// every window shares, for as long as a large document took. The page list
+/// arrives later as [`PdfRes::Opened`], and the pane draws empty until it does.
 ///
 /// The thread keeps the parsed document and one hayro `RenderCache` alive for
 /// its whole life: fonts, images and outlines decoded once are reused for
 /// every page and re-render, and the UI thread never blocks on rasterization.
-fn spawn_pdf_worker(bytes: Vec<u8>, notify: Notify) -> Option<(PdfWorker, Vec<(f32, f32)>)> {
+fn spawn_pdf_worker(path: PathBuf, notify: Notify) -> PdfWorker {
     let (req_tx, req_rx) = mpsc::channel::<PdfReq>();
     let (res_tx, res_rx) = mpsc::channel();
-    let (init_tx, init_rx) = mpsc::channel();
     let wanted = Arc::new(Mutex::new(HashSet::new()));
     let wanted_worker = wanted.clone();
     std::thread::spawn(move || {
+        // Whatever goes wrong — unreadable file, encrypted or malformed
+        // document, no pages — the answer is the same: show the text.
+        let fallback = |res_tx: &Sender<PdfRes>, notify: &Notify, why: String| {
+            let text = pdf_extract::extract_text(&path).unwrap_or_default();
+            let text = if text.trim().is_empty() { why } else { text };
+            let _ = res_tx.send(PdfRes::Unreadable(text));
+            notify();
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            fallback(&res_tx, &notify, format!("cannot read {}", path.display()));
+            return;
+        };
         let Ok(pdf) = hayro::hayro_syntax::Pdf::new(bytes) else {
-            let _ = init_tx.send(None);
+            fallback(&res_tx, &notify, "cannot read pdf".to_string());
             return;
         };
         let sizes: Vec<(f32, f32)> = pdf.pages().iter().map(|p| p.render_dimensions()).collect();
-        if init_tx.send(Some(sizes)).is_err() {
+        if sizes.is_empty() {
+            fallback(&res_tx, &notify, "(no pages in this PDF)".to_string());
             return;
         }
+        if res_tx.send(PdfRes::Opened(sizes)).is_err() {
+            return;
+        }
+        notify();
+
+        // The whole document's text, for Cmd+C with nothing selected — the
+        // page bitmaps carry no glyphs to select. On a thread of its own for
+        // two reasons: it used to run on the event loop at the moment of the
+        // copy, and pdf_extract re-parses the file from scratch, so doing it
+        // here would stand between the reader and the first page.
+        let text_tx = res_tx.clone();
+        let text_notify = notify.clone();
+        let text_path = path.clone();
+        std::thread::spawn(move || {
+            let text = pdf_extract::extract_text(&text_path).unwrap_or_default();
+            if text_tx.send(PdfRes::Whole(text)).is_ok() {
+                text_notify();
+            }
+        });
+
         let pages = pdf.pages();
         let cache = hayro::RenderCache::new();
         let text_cache = hayro::hayro_interpret::InterpreterCache::new();
@@ -604,11 +647,7 @@ fn spawn_pdf_worker(bytes: Vec<u8>, notify: Notify) -> Option<(PdfWorker, Vec<(f
             }
         }
     });
-    init_rx
-        .recv()
-        .ok()
-        .flatten()
-        .map(|sizes| (PdfWorker { req_tx, res_rx, wanted }, sizes))
+    PdfWorker { req_tx, res_rx, wanted }
 }
 
 /// Handle to a per-viewer image thread that decodes the originals and serves
@@ -729,7 +768,7 @@ impl ViewerState {
             ViewKind::Image => viewer.build_image(path)?,
             ViewKind::Markdown => viewer.build_markdown(font_system, path)?,
             ViewKind::Csv => viewer.build_csv(font_system, path)?,
-            ViewKind::Pdf => viewer.build_pdf(font_system, path, notify.clone())?,
+            ViewKind::Pdf => viewer.build_pdf(path, notify.clone())?,
             ViewKind::Tex => viewer.build_tex(font_system, path)?,
             ViewKind::Html => viewer.build_html(font_system, path)?,
         }
@@ -841,29 +880,12 @@ impl ViewerState {
         Ok(())
     }
 
-    /// Renders the actual PDF pages (a worker thread rasterizes them as they
-    /// scroll into view). Files hayro cannot parse (e.g. encrypted) fall back
-    /// to plain text extraction so something still shows.
-    fn build_pdf(&mut self, font_system: &mut FontSystem, path: &Path, notify: Notify) -> Result<(), String> {
-        let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        match spawn_pdf_worker(bytes, notify) {
-            Some((worker, sizes)) if !sizes.is_empty() => {
-                for (index, size) in sizes.into_iter().enumerate() {
-                    self.blocks.push(Block::Page { index, size, height: 0.0 });
-                }
-                self.worker = Some(worker);
-                Ok(())
-            }
-            _ => self.build_pdf_text(font_system, path),
-        }
-    }
-
-    fn build_pdf_text(&mut self, font_system: &mut FontSystem, path: &Path) -> Result<(), String> {
-        let text = pdf_extract::extract_text(path)
-            .map_err(|e| format!("cannot read pdf: {e}"))?;
-        let text = if text.trim().is_empty() { "(no extractable text in this PDF)".into() } else { text };
-        let attrs = ui_attrs().color(self.text_color());
-        self.push_plain(font_system, &text, attrs, Wrap::WordOrGlyph);
+    /// Starts the worker that will open the document and rasterize its pages
+    /// as they scroll into view. Returns before it has parsed anything: the
+    /// pages arrive in `prepare_pages`, and a file hayro cannot use comes back
+    /// as extracted text instead.
+    fn build_pdf(&mut self, path: &Path, notify: Notify) -> Result<(), String> {
+        self.worker = Some(spawn_pdf_worker(path.to_path_buf(), notify));
         Ok(())
     }
 
@@ -2878,22 +2900,21 @@ impl ViewerState {
     }
 
     /// Whether Cmd+C / the right-click Copy would produce anything: a live
-    /// selection, or a page-rendered PDF whose text can be extracted whole.
+    /// selection, or a page-rendered PDF whose text has come back from the
+    /// worker.
     pub fn can_copy(&self) -> bool {
         self.sel_range().is_some()
             || self.page_sel_range().is_some()
-            || (self.kind == ViewKind::Pdf && self.worker.is_some())
+            || self.whole_document_text().is_some()
     }
 
     /// Clipboard text for a page-rendered PDF, whose bitmaps carry no
-    /// selectable glyphs: the whole document's extracted text, cached after
-    /// the first request. None for other views or when nothing is extractable.
-    pub fn whole_document_text(&mut self) -> Option<String> {
-        if self.kind != ViewKind::Pdf || self.worker.is_none() {
+    /// selectable glyphs: the whole document's text, extracted by the worker
+    /// when the file was opened. None for other views, until it arrives, or
+    /// when nothing is extractable.
+    pub fn whole_document_text(&self) -> Option<String> {
+        if self.kind != ViewKind::Pdf {
             return None;
-        }
-        if self.pdf_text.is_none() {
-            self.pdf_text = Some(pdf_extract::extract_text(&self.path).unwrap_or_default());
         }
         self.pdf_text.clone().filter(|t| !t.trim().is_empty())
     }
@@ -2953,10 +2974,18 @@ impl ViewerState {
     /// (and adjacent to) the viewport at the current width/zoom, and drops
     /// far-away cached pages to bound memory. Never blocks: a page draws as a
     /// placeholder until its bitmap arrives and the worker triggers a repaint.
-    fn prepare_pages(&mut self, view_h: f32) {
+    fn prepare_pages(&mut self, font_system: &mut FontSystem, view_h: f32) {
         let Some(worker) = self.worker.as_ref() else { return };
+        // The document's own arrival is a result like any other, since the
+        // worker opens it. Both cases relayout, so they are handled after the
+        // drain rather than inside it.
+        let mut opened = None;
+        let mut unreadable = None;
         for res in worker.res_rx.try_iter() {
             match res {
+                PdfRes::Opened(sizes) => opened = Some(sizes),
+                PdfRes::Unreadable(text) => unreadable = Some(text),
+                PdfRes::Whole(text) => self.pdf_text = Some(text),
                 PdfRes::Page(index, width, img) => {
                     if self.pending.get(&index) == Some(&width) {
                         self.pending.remove(&index);
@@ -2969,6 +2998,25 @@ impl ViewerState {
                 }
             }
         }
+        if let Some(sizes) = opened {
+            for (index, size) in sizes.into_iter().enumerate() {
+                self.blocks.push(Block::Page { index, size, height: 0.0 });
+            }
+            self.reflow(font_system);
+            self.clamp_scroll();
+        }
+        if let Some(text) = unreadable {
+            // No pages to rasterize, so no worker: that is how `zoomable`
+            // reads this as the text fallback it now is. Copy needs nothing
+            // special, since the text goes in as a selectable block.
+            self.worker = None;
+            let attrs = ui_attrs().color(self.text_color());
+            self.push_plain(font_system, &text, attrs, Wrap::WordOrGlyph);
+            self.reflow(font_system);
+            self.clamp_scroll();
+            return;
+        }
+        let Some(worker) = self.worker.as_ref() else { return };
         let target_w = self.column_width() * self.zoom;
         // (page index, size, intersects viewport) in document order.
         let mut pages: Vec<(usize, (f32, f32), bool)> = Vec::new();
@@ -3067,7 +3115,7 @@ impl ViewerState {
         width_px: u32,
         height_px: u32,
     ) -> SharedPixelBuffer<Rgba8Pixel> {
-        self.prepare_pages(height_px as f32);
+        self.prepare_pages(font_system, height_px as f32);
         self.prepare_images(height_px as f32);
         let mut frame = SharedPixelBuffer::<Rgba8Pixel>::new(width_px.max(1), height_px.max(1));
         let bg = colors::base_palette(self.theme)[0];
@@ -4101,6 +4149,42 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_pdf_falls_back_to_text_without_blocking_the_open() {
+        let path = std::env::temp_dir().join("tigriden-viewer-broken.pdf");
+        std::fs::write(&path, b"%PDF-1.7\nnot actually a pdf\n").unwrap();
+
+        let mut font_system = FontSystem::new();
+        let mut viewer = ViewerState::open(
+            &mut font_system,
+            &path,
+            ViewKind::Pdf,
+            "Menlo",
+            13.0,
+            crate::theme::default_theme(),
+            [0, 0, 0],
+            800.0,
+            std::sync::Arc::new(|| {}),
+        )
+        .expect("a broken pdf still opens a view");
+        // Deciding it is unreadable is the worker's job too, so open returns
+        // before anyone has looked at the file.
+        assert!(viewer.worker.is_some());
+
+        let mut swash_cache = SwashCache::new();
+        for _ in 0..200 {
+            viewer.render(&mut font_system, &mut swash_cache, 800, 600);
+            if viewer.worker.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(viewer.worker.is_none(), "the fallback drops the worker");
+        assert_eq!(viewer.blocks.len(), 1, "the extracted text is one block");
+        assert!(!viewer.zoomable(), "there are no pages to magnify");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn pdf_renders_pages_and_zooms() {
         let path = std::env::temp_dir().join("tigriden-viewer-test.pdf");
         std::fs::write(&path, hello_pdf()).unwrap();
@@ -4119,8 +4203,11 @@ mod tests {
             std::sync::Arc::new(|| {}),
         )
         .expect("viewer opens the pdf");
-        assert!(viewer.worker.is_some(), "hayro should parse the PDF, not fall back to text");
-        assert_eq!(viewer.blocks.len(), 1, "one page, one block");
+        // Opening does not parse: the worker does, and the pane is empty until
+        // it answers. That is the point — a big document must not hold the
+        // event loop, which every window shares.
+        assert!(viewer.worker.is_some(), "the worker starts with the view");
+        assert!(viewer.blocks.is_empty(), "no pages before the worker has opened the file");
 
         let mut swash_cache = SwashCache::new();
         // The page (2:1 aspect, fit to width) must show as a mostly white
@@ -4144,11 +4231,16 @@ mod tests {
                     }
                 }
             }
-            if dark > 100 {
+            // Both halves, not just the glyphs: until the worker has opened
+            // the document there is no page, and the pane's own dark ground
+            // would count as glyph pixels.
+            if white > page_w * page_h / 2 && dark > 100 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+        assert!(viewer.worker.is_some(), "hayro should parse the PDF, not fall back to text");
+        assert_eq!(viewer.blocks.len(), 1, "one page, one block");
         assert!(white > page_w * page_h / 2, "page should render as a white sheet, got {white}");
         assert!(dark > 100, "glyphs should render on the page, got {dark} dark pixels");
 
@@ -4174,10 +4266,22 @@ mod tests {
         viewer.zoom_reset(&mut font_system);
         assert_eq!(viewer.scroll_x, 0.0, "reset returns to fit-to-width");
 
-        // Copy with nothing selected falls back to the whole document.
+        // Copy with nothing selected falls back to the whole document. That
+        // text is extracted by the worker while the pages rasterize, never on
+        // the event loop at the moment of the copy, so poll for it.
         assert!(viewer.selected_text().is_none());
-        let text = viewer.whole_document_text().expect("pdf text extraction");
+        let mut whole = None;
+        for _ in 0..200 {
+            viewer.render(&mut font_system, &mut swash_cache, 800, 600);
+            whole = viewer.whole_document_text();
+            if whole.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let text = whole.expect("the worker extracts the document text");
         assert!(text.contains("Hello PDF"), "extracted text: {text:?}");
+        assert!(viewer.can_copy(), "copy is offered once there is text to copy");
 
         // The text layer arrives from the same worker as the bitmaps, so poll
         // for it, then drag across the page and copy just what was dragged.
@@ -4382,4 +4486,5 @@ pub fn classify(path: &Path) -> Option<ViewKind> {
         _ => None,
     }
 }
+
 

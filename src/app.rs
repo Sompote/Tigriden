@@ -46,12 +46,28 @@ struct WindowEntry {
 
 thread_local! {
     static WINDOWS: RefCell<Vec<WindowEntry>> = const { RefCell::new(Vec::new()) };
+    /// One font system for the process.
+    ///
+    /// `FontSystem::new` scans the system font directories, which takes long
+    /// enough to stall the event loop, and it ran again for every window —
+    /// each loading the same faces into a database of its own. Shared, so
+    /// opening a second window costs nothing and the shape caches are built
+    /// once. cosmic-text asks for exactly this.
+    static FONT_SYSTEM: Rc<RefCell<FontSystem>> = Rc::new(RefCell::new({
+        let system = FontSystem::new();
+        crate::fonts::index(system.db());
+        system
+    }));
     /// The live config, shared by every window: Settings edits go here first,
     /// then out to disk and to each window.
     static CONFIG: RefCell<Config> = RefCell::new(Config::default());
     /// Font family names handed to cosmic-text, which wants `&'static str`.
     /// Interned so repeated Settings edits do not leak a string each time.
     static FONT_NAMES: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+}
+
+fn font_system() -> Rc<RefCell<FontSystem>> {
+    FONT_SYSTEM.with(Rc::clone)
 }
 
 pub fn set_config(config: Config) {
@@ -326,7 +342,7 @@ pub struct App {
     active: usize,
     recents: Vec<PathBuf>,
     row_map: Vec<RowTarget>,
-    font_system: FontSystem,
+    font_system: Rc<RefCell<FontSystem>>,
     swash_cache: SwashCache,
     term_renderer: Option<TermRenderer>,
     renderer_scale: f32,
@@ -378,8 +394,7 @@ impl App {
         let id = NEXT_APP_ID.fetch_add(1, Ordering::Relaxed);
         // The font database first: only with it up can a family the config
         // names be told from one this machine does not have.
-        let font_system = FontSystem::new();
-        crate::fonts::index(font_system.db());
+        let font_system = font_system();
         let mut config = config;
         if config.resolve_families() {
             // Say so on disk, so the Settings picker and the next launch agree
@@ -583,7 +598,7 @@ impl App {
             let font_px = self.config.font_size * scale;
             for idx in 0..self.sessions.len() {
                 if let Some(editor) = self.sessions[idx].editor.as_mut() {
-                    editor.restyle(&mut self.font_system, font_family, font_px, theme);
+                    editor.restyle(&mut self.font_system.borrow_mut(), font_family, font_px, theme);
                 }
             }
             // Viewers bake colors and layout into their blocks, so rebuild them.
@@ -612,13 +627,15 @@ impl App {
         }
         if self.changes_enabled {
             for idx in 0..self.sessions.len() {
-                self.sessions[idx].tracking = crate::git::detect(&self.sessions[idx].root);
-                // Shadow folders get a fresh baseline: "watch from now".
+                self.start_tracking(idx);
+                // Turning the panel on is the explicit "watch from now"
+                // gesture, so a shadow folder does get a fresh baseline here.
                 self.refresh_changes(idx, true);
             }
         } else {
             for session in &mut self.sessions {
                 session.tracking = None;
+                session.git = None;
                 session.changes.clear();
             }
         }
@@ -637,8 +654,9 @@ impl App {
         let scale = self.scale();
         if self.term_renderer.is_none() || (self.renderer_scale - scale).abs() > 0.01 {
             let px = self.config.term_font_size * scale;
-            self.term_renderer =
-                Some(TermRenderer::new(self.term_font_family, px, &mut self.font_system));
+            let renderer =
+                TermRenderer::new(self.term_font_family, px, &mut self.font_system.borrow_mut());
+            self.term_renderer = Some(renderer);
             self.renderer_scale = scale;
         }
         let r = self.term_renderer.as_ref().unwrap();
@@ -704,8 +722,12 @@ impl App {
         self.sessions.push(session);
         let new_idx = self.sessions.len() - 1;
         if self.changes_enabled {
-            self.sessions[new_idx].tracking = crate::git::detect(&self.sessions[new_idx].root);
-            self.refresh_changes(new_idx, true);
+            self.start_tracking(new_idx);
+            // Not a re-baseline: the same folder may already be open in
+            // another window, and re-snapshotting would drop every change it
+            // still offers to roll back. A folder with no baseline yet gets
+            // one from the worker.
+            self.refresh_changes(new_idx, false);
         }
         self.set_active(new_idx);
         if persist {
@@ -1265,30 +1287,59 @@ impl App {
 
     // ----- git changes panel -----
 
-    /// Re-runs `git status` for one session on a background thread. Results
-    /// arrive in `changes_ready`; a generation counter drops stale ones.
-    /// `rebaseline` re-snapshots shadow-tracked folders ("watch from now").
+    /// Points a session at its repository and starts the thread that will do
+    /// every git call for it.
+    fn start_tracking(&mut self, idx: usize) {
+        let Some(session) = self.sessions.get_mut(idx) else { return };
+        let root = session.root.clone();
+        let tracking = crate::git::detect(&root);
+        session.tracking = tracking.clone();
+        let app_id = self.id;
+        session.git = tracking.map(|tracking| {
+            let root = root.clone();
+            crate::git::Worker::spawn(root.clone(), tracking, move |done| {
+                let root = root.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    with_app_id(app_id, |app| app.git_done(&root, done));
+                });
+            })
+        });
+    }
+
+    /// Queues a `git status` for one session. Results arrive in
+    /// `changes_ready`; a generation counter drops stale ones. `rebaseline`
+    /// re-snapshots shadow-tracked folders ("watch from now").
     fn refresh_changes(&mut self, idx: usize, rebaseline: bool) {
         if !self.changes_enabled {
             return;
         }
         let Some(session) = self.sessions.get_mut(idx) else { return };
-        let Some(tracking) = session.tracking.clone() else { return };
         session.changes_gen += 1;
         let generation = session.changes_gen;
-        let root = session.root.clone();
-        let app_id = self.id;
-        std::thread::spawn(move || {
-            if let crate::git::Tracking::Shadow(dir) = &tracking {
-                if rebaseline || !dir.join("HEAD").exists() {
-                    crate::git::snapshot_baseline(&root, dir);
-                }
+        if let Some(worker) = &session.git {
+            worker.send(crate::git::Job::Status { generation, rebaseline });
+        }
+    }
+
+    /// Queues a rollback, and the status refresh that reports what it left.
+    fn revert(&mut self, idx: usize, revert: crate::git::Revert) {
+        let Some(session) = self.sessions.get_mut(idx) else { return };
+        session.changes_gen += 1;
+        let generation = session.changes_gen;
+        if let Some(worker) = &session.git {
+            worker.send(crate::git::Job::Revert { revert, generation });
+        }
+    }
+
+    fn git_done(&mut self, root: &Path, done: crate::git::Done) {
+        match done {
+            crate::git::Done::Status(generation, changes) => {
+                self.changes_ready(root, generation, changes)
             }
-            let changes = crate::git::status(&root, &tracking);
-            let _ = slint::invoke_from_event_loop(move || {
-                with_app_id(app_id, |app| app.changes_ready(&root, generation, changes));
-            });
-        });
+            crate::git::Done::Diff(generation, path, text) => {
+                self.diff_ready(root, generation, path, text)
+            }
+        }
     }
 
     fn changes_ready(&mut self, root: &Path, generation: u64, changes: Vec<crate::git::Change>) {
@@ -1331,7 +1382,7 @@ impl App {
             }
             return;
         }
-        editor.reload(&mut self.font_system, font_family);
+        editor.reload(&mut self.font_system.borrow_mut(), font_family);
         if is_active {
             self.apply_editor_size();
             self.render_editor();
@@ -1372,8 +1423,10 @@ impl App {
                 with_app_id(app_id, |app| app.render_editor());
             });
         });
-        match ViewerState::open(
-            &mut self.font_system,
+        // Bound, not matched on directly: the borrow of the shared font
+        // system has to end before the arms call back into `self`.
+        let opened = ViewerState::open(
+            &mut self.font_system.borrow_mut(),
             &path,
             kind,
             self.font_family,
@@ -1382,7 +1435,8 @@ impl App {
             self.config.accent_rgb(),
             width_px,
             notify,
-        ) {
+        );
+        match opened {
             Ok(viewer_state) => {
                 let session = &mut self.sessions[idx];
                 session.viewer = Some(viewer_state);
@@ -1463,14 +1517,15 @@ impl App {
         }
 
         let scale = self.scale();
-        match EditorState::open(
-            &mut self.font_system,
+        let opened = EditorState::open(
+            &mut self.font_system.borrow_mut(),
             syntax_system(),
             &path,
             self.font_family,
             self.config.font_size * scale,
             self.theme,
-        ) {
+        );
+        match opened {
             Ok(editor) => {
                 self.sessions[idx].editor = Some(editor);
                 self.apply_editor_size();
@@ -1490,17 +1545,11 @@ impl App {
         }
         self.active = idx;
         let session = &mut self.sessions[idx];
-        let Some(tracking) = session.tracking.clone() else { return };
         session.diff_gen += 1;
         let generation = session.diff_gen;
-        let root = session.root.clone();
-        let app_id = self.id;
-        std::thread::spawn(move || {
-            let text = crate::git::diff_file(&root, &tracking, &path);
-            let _ = slint::invoke_from_event_loop(move || {
-                with_app_id(app_id, |app| app.diff_ready(&root, generation, path, text));
-            });
-        });
+        if let Some(worker) = &session.git {
+            worker.send(crate::git::Job::Diff { generation, path });
+        }
     }
 
     fn diff_ready(&mut self, root: &Path, generation: u64, path: PathBuf, text: String) {
@@ -1509,15 +1558,16 @@ impl App {
             return;
         }
         let scale = self.scale();
-        match EditorState::open_diff(
-            &mut self.font_system,
+        let opened = EditorState::open_diff(
+            &mut self.font_system.borrow_mut(),
             syntax_system(),
             &path,
             &text,
             self.font_family,
             self.config.font_size * scale,
             self.theme,
-        ) {
+        );
+        match opened {
             Ok(editor) => {
                 self.sessions[idx].viewer = None;
                 self.sessions[idx].editor = Some(editor);
@@ -1541,7 +1591,13 @@ impl App {
         }
         let Some(session) = self.sessions.get_mut(self.active) else { return false };
         let Some(editor) = session.editor.as_mut() else { return false };
-        match editor.handle_key(&mut self.font_system, &mut self.clipboard, text, &mods) {
+        let outcome = editor.handle_key(
+            &mut self.font_system.borrow_mut(),
+            &mut self.clipboard,
+            text,
+            &mods,
+        );
+        match outcome {
             KeyOutcome::Save => {
                 self.save_editor();
                 true
@@ -1565,15 +1621,15 @@ impl App {
         let Some(viewer_state) = session.viewer.as_mut() else { return false };
         let handled = match text.chars().next() {
             Some('=') | Some('+') => {
-                viewer_state.zoom_by(&mut self.font_system, 1.25);
+                viewer_state.zoom_by(&mut self.font_system.borrow_mut(), 1.25);
                 true
             }
             Some('-') => {
-                viewer_state.zoom_by(&mut self.font_system, 0.8);
+                viewer_state.zoom_by(&mut self.font_system.borrow_mut(), 0.8);
                 true
             }
             Some('0') => {
-                viewer_state.zoom_reset(&mut self.font_system);
+                viewer_state.zoom_reset(&mut self.font_system.borrow_mut());
                 true
             }
             _ => false,
@@ -1653,7 +1709,7 @@ impl App {
     fn viewer_zoom_step(&mut self, factor: f32) {
         let Some(session) = self.sessions.get_mut(self.active) else { return };
         let Some(viewer_state) = session.viewer.as_mut() else { return };
-        viewer_state.zoom_by(&mut self.font_system, factor);
+        viewer_state.zoom_by(&mut self.font_system.borrow_mut(), factor);
         self.render_editor();
     }
 
@@ -1668,7 +1724,12 @@ impl App {
             return;
         }
         let Some(editor) = session.editor.as_mut() else { return };
-        editor.handle_mouse(&mut self.font_system, kind, (x * scale) as i32, (y * scale) as i32);
+        editor.handle_mouse(
+            &mut self.font_system.borrow_mut(),
+            kind,
+            (x * scale) as i32,
+            (y * scale) as i32,
+        );
         if kind != 1 {
             self.render_editor();
         }
@@ -1701,7 +1762,7 @@ impl App {
         if let Some(viewer_state) = session.viewer.as_mut() {
             if zoom {
                 let factor = (1.0 + delta_y * 0.002 * scale).clamp(0.5, 2.0);
-                viewer_state.zoom_by(&mut self.font_system, factor);
+                viewer_state.zoom_by(&mut self.font_system.borrow_mut(), factor);
                 self.throttled_viewer_render(std::time::Duration::from_millis(33));
             } else {
                 viewer_state.scroll_by(delta_x * scale, delta_y * scale);
@@ -1710,7 +1771,7 @@ impl App {
             return;
         }
         let Some(editor) = session.editor.as_mut() else { return };
-        editor.scroll(&mut self.font_system, delta_y * scale);
+        editor.scroll(&mut self.font_system.borrow_mut(), delta_y * scale);
         self.render_editor();
     }
 
@@ -1747,10 +1808,10 @@ impl App {
         let (w, h) = self.editor_view;
         let Some(session) = self.sessions.get_mut(self.active) else { return };
         if let Some(editor) = session.editor.as_mut() {
-            editor.set_viewport(&mut self.font_system, w * scale, h * scale);
+            editor.set_viewport(&mut self.font_system.borrow_mut(), w * scale, h * scale);
         }
         if let Some(viewer_state) = session.viewer.as_mut() {
-            viewer_state.set_viewport(&mut self.font_system, w * scale, h * scale);
+            viewer_state.set_viewport(&mut self.font_system.borrow_mut(), w * scale, h * scale);
         }
     }
 
@@ -1773,7 +1834,8 @@ impl App {
             return;
         }
         if let Some(viewer_state) = session.viewer.as_mut() {
-            let buffer = viewer_state.render(&mut self.font_system, &mut self.swash_cache, w, h);
+            let buffer =
+                viewer_state.render(&mut self.font_system.borrow_mut(), &mut self.swash_cache, w, h);
             #[cfg(feature = "framedump")]
             dump_frame("editor", &buffer);
             ui.set_editor_frame(Image::from_rgba8_premultiplied(buffer));
@@ -1789,7 +1851,7 @@ impl App {
             return;
         };
         let (can_copy, can_paste) = (editor.has_selection(), !editor.read_only);
-        let buffer = editor.render(&mut self.font_system, &mut self.swash_cache, w, h);
+        let buffer = editor.render(&mut self.font_system.borrow_mut(), &mut self.swash_cache, w, h);
         #[cfg(feature = "framedump")]
         dump_frame("editor", &buffer);
         ui.set_editor_frame(Image::from_rgba8_premultiplied(buffer));
@@ -2133,7 +2195,7 @@ impl App {
         let term = handle.term.term.lock();
         let renderer = self.term_renderer.as_mut().unwrap();
         let buffer = renderer.render(
-            &mut self.font_system,
+            &mut self.font_system.borrow_mut(),
             &mut self.swash_cache,
             &term,
             self.theme,
@@ -2978,53 +3040,20 @@ impl App {
                 if let Some(editor) =
                     self.sessions.get_mut(self.active).and_then(|s| s.editor.as_mut())
                 {
-                    editor.reload(&mut self.font_system, font_family);
+                    editor.reload(&mut self.font_system.borrow_mut(), font_family);
                 }
                 self.apply_editor_size();
                 self.render_editor();
                 self.update_chrome();
             }
             Banner::ConfirmDiscard(idx, path, status) => {
-                let (root, tracking) = match self.sessions.get(idx) {
-                    Some(session) => match &session.tracking {
-                        Some(tracking) => (session.root.clone(), tracking.clone()),
-                        None => return,
-                    },
-                    None => return,
-                };
-                let app_id = self.id;
-                std::thread::spawn(move || {
-                    crate::git::discard(&root, &tracking, &path, status);
-                    let _ = slint::invoke_from_event_loop(move || {
-                        with_app_id(app_id, |app| {
-                            if let Some(i) = app.sessions.iter().position(|s| s.root == root) {
-                                app.refresh_changes(i, false);
-                            }
-                        });
-                    });
-                });
+                self.revert(idx, crate::git::Revert::One(path, status));
             }
             Banner::ConfirmDiscardAll(idx) => {
-                let (root, tracking, changes) = match self.sessions.get(idx) {
-                    Some(session) => match &session.tracking {
-                        Some(tracking) => {
-                            (session.root.clone(), tracking.clone(), session.changes.clone())
-                        }
-                        None => return,
-                    },
-                    None => return,
+                let Some(changes) = self.sessions.get(idx).map(|s| s.changes.clone()) else {
+                    return;
                 };
-                let app_id = self.id;
-                std::thread::spawn(move || {
-                    crate::git::discard_all(&root, &tracking, &changes);
-                    let _ = slint::invoke_from_event_loop(move || {
-                        with_app_id(app_id, |app| {
-                            if let Some(i) = app.sessions.iter().position(|s| s.root == root) {
-                                app.refresh_changes(i, false);
-                            }
-                        });
-                    });
-                });
+                self.revert(idx, crate::git::Revert::All(changes));
             }
             Banner::ConfirmTrash(idx, path) => self.trash_path(idx, path),
             Banner::None => {}

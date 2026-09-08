@@ -64,7 +64,8 @@ pub struct TermSession {
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     input_tx: Sender<Vec<u8>>,
     master: Option<Box<dyn MasterPty + Send>>,
-    child: Box<dyn Child + Send + Sync>,
+    /// Taken by `shutdown`, which hands it to a thread that reaps it.
+    child: Option<Box<dyn Child + Send + Sync>>,
     reader_handle: Option<JoinHandle<()>>,
     writer_handle: Option<JoinHandle<()>>,
     win_size: Arc<Mutex<WindowSize>>,
@@ -171,7 +172,7 @@ impl TermSession {
             term,
             input_tx,
             master: Some(pty.master),
-            child,
+            child: Some(child),
             reader_handle: Some(reader_handle),
             writer_handle: Some(writer_handle),
             win_size,
@@ -217,23 +218,132 @@ impl TermSession {
         self.term.lock().resize(TermSize::new(cols as usize, rows as usize));
     }
 
+    /// Hangs up the shell and everything it started. Never blocks.
+    ///
+    /// Closing a tab, a session or a window runs this, and it runs on the
+    /// event loop that every window shares. So it waits on nothing. It used
+    /// to wait on three things:
+    ///
+    /// - `Child::kill`, which signals the shell alone and then sleeps up to
+    ///   250 ms on the calling thread before escalating to SIGKILL;
+    /// - `Child::wait`, which blocks in `wait4` until the shell is reaped;
+    /// - joining the reader thread, which sits in `read()` on the pty master.
+    ///
+    /// On macOS the kernel revokes the terminal when the session leader dies,
+    /// so the read does end quickly. The two process waits are the ones with
+    /// no bound: a shell that traps SIGHUP, or one wedged in the kernel on its
+    /// way out, holds the event loop for as long as it takes, and both windows
+    /// stop drawing. All three now happen on a thread of their own.
     pub fn shutdown(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        // Dropping the master closes the PTY, which EOFs the reader thread.
+        // Read the foreground group before the master goes. Job control gives
+        // the command the user was looking at a process group of its own, and
+        // the shell's group does not cover it.
+        #[cfg(unix)]
+        let foreground = self.master.as_ref().and_then(|m| m.process_group_leader());
+        let Some(mut child) = self.child.take() else { return };
+
+        #[cfg(unix)]
+        let groups: Vec<i32> = {
+            let shell = child.process_id().map(|pid| pid as i32);
+            let mut groups: Vec<i32> = [foreground, shell].into_iter().flatten().collect();
+            groups.dedup();
+            // SIGHUP first, and right now: a shell that gets it hangs up its
+            // own jobs on the way out, which reaches further than we can.
+            for pgid in &groups {
+                signal_group(*pgid, SIGHUP);
+            }
+            groups
+        };
+
+        // Closing our end of the pty makes the kernel hang up the foreground
+        // group as well, and EOFs the reader thread once the slave is free.
         self.master.take();
-        if let Some(handle) = self.reader_handle.take() {
-            let _ = handle.join();
-        }
-        // Writer thread exits once every sender is gone; ours is dropped with
-        // self, so don't join it here.
+        self.reader_handle.take();
+        // The writer thread ends when the last sender drops, which happens
+        // with `self`.
         self.writer_handle.take();
+
+        // Escalate and reap off the event loop: a process that ignores SIGHUP
+        // must not cost the UI a frame.
+        std::thread::spawn(move || {
+            // Give SIGHUP its chance first. A shell that takes it hangs up its
+            // own jobs on the way out, which is both gentler and further
+            // reaching than anything we can send.
+            for _ in 0..5 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+            }
+            // Still up, so the shell's pid is still its own and the group is
+            // safe to signal.
+            #[cfg(unix)]
+            for pgid in groups {
+                signal_group(pgid, SIGKILL);
+            }
+            #[cfg(not(unix))]
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+    }
+}
+
+#[cfg(unix)]
+const SIGHUP: i32 = 1;
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+
+#[cfg(unix)]
+extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+/// Signals every process in the group led by `pgid`.
+///
+/// `Child::kill` is no use here: it signals the shell alone, and sleeps up to
+/// 250 ms on the calling thread between its own SIGHUP and SIGKILL. The
+/// negative pid is what makes this reach the whole group instead.
+#[cfg(unix)]
+fn signal_group(pgid: i32, sig: i32) {
+    if pgid > 1 {
+        // Safety: a plain libc call; an unknown or dead group is an error
+        // return, not undefined behaviour.
+        unsafe { kill(-pgid, sig) };
     }
 }
 
 impl Drop for TermSession {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.shutdown();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A shell that ignores SIGHUP with a job in the foreground: the case the
+    /// old teardown paid for, since it signalled, slept, and waited for the
+    /// shell to die before returning to the event loop.
+    #[test]
+    fn shutdown_does_not_wait_for_a_shell_that_ignores_sighup() {
+        let hooks = TermHooks { repaint: Arc::new(|| {}), exited: Arc::new(|| {}) };
+        let theme = Arc::new(AtomicU8::new(0));
+        let Ok(mut session) =
+            TermSession::spawn(Path::new("/"), 80, 24, (8, 16), 1000, theme, hooks)
+        else {
+            return; // no pty available here; nothing to assert about
+        };
+
+        // An agent CLI the user left running, in miniature.
+        session.write(b"trap '' HUP\rsleep 30\r".to_vec());
+        std::thread::sleep(Duration::from_millis(2500));
+
+        let start = Instant::now();
+        session.shutdown();
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_millis(50), "shutdown blocked for {elapsed:?}");
+    }
+}
+

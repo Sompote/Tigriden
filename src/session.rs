@@ -36,6 +36,9 @@ pub struct Session {
     /// Set while the changes panel is enabled: real git or shadow snapshot.
     /// Assigned by App after construction so the toggle check stays there.
     pub tracking: Option<crate::git::Tracking>,
+    /// The thread every git call for this folder goes through, alive as long
+    /// as `tracking` is. Dropping it ends the thread without blocking.
+    pub git: Option<crate::git::Worker>,
     pub changes: Vec<crate::git::Change>,
     /// Generation counters so stale background git results are dropped.
     pub changes_gen: u64,
@@ -77,6 +80,7 @@ impl Session {
             tree_visible: true,
             pending_fs: Vec::new(),
             tracking: None,
+            git: None,
             changes: Vec::new(),
             changes_gen: 0,
             diff_gen: 0,
