@@ -1,6 +1,6 @@
 [package]
 name = "tigriden"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2021"
 description = "Fast, tiny end-to-end research workbench: per-folder terminals for AI coding agents, change tracking with one-click rollback, and LaTeX/PDF/Markdown/HTML read as typeset pages."
 license = "MIT"
