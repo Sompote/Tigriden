@@ -193,7 +193,7 @@ When a release adds an agent button, a config still holding an older build's sto
 
 Runtime state (restored folders, split position) lives next to it in `state.toml`; shadow snapshots for the Changes panel live in `snapshots/`.
 
-### Snapshot size limits
+### Snapshot size limits *(0.2.1)*
 
 A folder without its own git repository is tracked by a hidden snapshot repo
 under `~/Library/Application Support/tigriden/snapshots/`. Two limits keep that
@@ -239,6 +239,16 @@ Only the PTY reader threads and the viewer's rasterizer/decoder workers run in t
 `cargo build --features framedump`, then run with `TIGRIDEN_DUMP=/tmp/frames` to dump both panes as PNGs. `TIGRIDEN_TEST_INPUT='claude\r'`, `TIGRIDEN_TEST_OPEN=path`, `TIGRIDEN_TEST_SETTINGS='style=vivid,font-size-step=2'`, `TIGRIDEN_TEST_CHANGES=1` (reports the Changes panel's tracking mode and contents around a write), `TIGRIDEN_TEST_CTXMENU=1` (runs the right-click menu's Copy and Select All against the terminal and reports what reached the clipboard), `TIGRIDEN_TEST_SCROLLBACK=up|down` (wheels the terminal and reports the mode, history size and resulting screen — the way to tell scrollback from alternate-screen scrolling) and `TIGRIDEN_TEST_WHEEL_UI=1` (dispatches a real scroll event through Slint's hit-testing, to prove wheel input still reaches the terminal) script the first session for headless testing. For the typeset LaTeX page there is a faster loop that needs no window: `TEX_DUMP=paper.tex TEX_DUMP_OUT=/tmp/tex TEX_DUMP_PAGES=3 TEX_DUMP_FROM=0 cargo test tex_sheet_dump -- --nocapture` writes one PNG per page.
 
 ## Changelog
+
+- **0.2.1** *(unreleased — on `main`, not in the 0.2.0 downloads)* — **A snapshot no longer copies the data it sits next to.** The store had reached 17 GB across 40 folders. Two folders held 13 of it. Nothing capped, packed or deleted anything, ever.
+
+  A per-file cap does not fix that on its own. The mass is never in the giants. One folder carried 4602 harvested PDFs averaging 1.7 MB, a literature corpus. Another held 7638 JPGs averaging 0.65 MB, a training set. Both sit under any per-file cap worth setting. A 5 MB cap caught 3.0 GB of the first folder and 1.6 GB of the second, and left the rest.
+
+  What marks those files is the directory they sit in. A manuscript folder does not hold 4600 PDFs. A subtree of 200 MB or more is now excluded whole, at the shallowest point over the line, and a single file of 5 MB or more is excluded wherever it sits. The root is never excluded, so a big folder still tracks its own small files. Measured against the real folders: 8.1 GB becomes 100 MB, 6.5 GB becomes 39 MB, and a 415 MB book folder keeps 128 MB with every source file in it.
+
+  **Both sizes are settings.** Settings ▸ Changes panel takes folders at 100 MB, 200 MB, 500 MB, 2 GB or no limit, and files at 1, 5, 20, 100 MB or no limit. `config.toml` calls them `snapshot_file_mb` and `snapshot_dir_mb`. The git workers run on their own threads, so the values cross as two atomics rather than through the thread-local config.
+
+  An exclude only holds back a file git is not already tracking. A file that grew past the cap since the last baseline is dropped from the index too, which the next commit records as a deletion. The file itself is untouched. Baselines also run `git gc` now: one repo held 5499 loose objects and 6.91 GiB with nothing in a pack, because git's default threshold is 6700 and no baseline ever asked. And a folder whose every file is excluded commits an empty baseline. Without a commit there was no baseline, so every refresh walked the whole tree again trying to take one.
 
 - **0.2.0** — **HTML in the viewer, and a window that stays responsive.**
 
