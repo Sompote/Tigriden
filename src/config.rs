@@ -14,6 +14,18 @@ fn default_true() -> bool {
     true
 }
 
+/// Snapshot defaults, in MB. Measured against real folders: a 8.1 GB
+/// literature corpus snapshots to 100 MB at these values and a 6.5 GB training
+/// set to 39 MB, while a 415 MB book folder keeps 128 MB and every source file
+/// in it. See [`Config::snapshot_file_mb`].
+fn default_snapshot_file_mb() -> u32 {
+    5
+}
+
+fn default_snapshot_dir_mb() -> u32 {
+    200
+}
+
 /// A named group of presets shown in its own window ("agent team").
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Team {
@@ -50,6 +62,14 @@ pub struct Config {
     pub scrollback: usize,
     /// Whether new windows start with the git Changes panel on.
     pub show_changes: bool,
+    /// A file this many MB or larger stays out of a folder's snapshot. `0`
+    /// means no limit. Only read when a baseline is taken.
+    #[serde(default = "default_snapshot_file_mb")]
+    pub snapshot_file_mb: u32,
+    /// A directory subtree this many MB or larger is excluded from a snapshot
+    /// whole, at the shallowest point over the line. `0` means no limit.
+    #[serde(default = "default_snapshot_dir_mb")]
+    pub snapshot_dir_mb: u32,
     pub presets: Vec<Preset>,
     #[serde(default)]
     pub teams: Vec<Team>,
@@ -103,6 +123,14 @@ impl Config {
         self.term_font_size = self.term_font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
         self.ui_font_size = self.ui_font_size.clamp(MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE);
         self.scrollback = self.scrollback.clamp(200, 500_000);
+        // Zero is the "no limit" setting and stays as it is; anything else is
+        // pulled into a range that still leaves the store bounded.
+        if self.snapshot_file_mb != 0 {
+            self.snapshot_file_mb = self.snapshot_file_mb.clamp(1, 4096);
+        }
+        if self.snapshot_dir_mb != 0 {
+            self.snapshot_dir_mb = self.snapshot_dir_mb.clamp(10, 102_400);
+        }
     }
 
     /// Points both families at something the machine actually has. Called
@@ -155,6 +183,8 @@ impl Default for Config {
             ui_font_size: 13.0,
             scrollback: 10_000,
             show_changes: false,
+            snapshot_file_mb: default_snapshot_file_mb(),
+            snapshot_dir_mb: default_snapshot_dir_mb(),
             presets: vec![
                 Preset { label: "claude".into(), command: "claude".into(), send_enter: true },
                 Preset { label: "codex".into(), command: "codex".into(), send_enter: true },

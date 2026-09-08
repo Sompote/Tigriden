@@ -71,6 +71,10 @@ fn font_system() -> Rc<RefCell<FontSystem>> {
 }
 
 pub fn set_config(config: Config) {
+    // The git workers are on their own threads and cannot read CONFIG, which
+    // is thread-local. Hand them the snapshot limits here, where every path
+    // that changes the config passes.
+    crate::git::set_snapshot_limits(config.snapshot_file_mb, config.snapshot_dir_mb);
     CONFIG.with(|slot| *slot.borrow_mut() = config);
 }
 
@@ -203,6 +207,14 @@ pub fn settings_changed(key: &str, value: &str) {
             Err(_) => return,
         },
         "show-changes" => config.show_changes = value == "true",
+        "snapshot-file-mb" => match value.parse::<u32>() {
+            Ok(mb) => config.snapshot_file_mb = mb,
+            Err(_) => return,
+        },
+        "snapshot-dir-mb" => match value.parse::<u32>() {
+            Ok(mb) => config.snapshot_dir_mb = mb,
+            Err(_) => return,
+        },
         _ => return,
     }
     config.sanitize();
@@ -530,6 +542,8 @@ impl App {
         ui.set_settings_term_font_size(self.config.term_font_size);
         ui.set_settings_ui_font_size(self.config.ui_font_size);
         ui.set_settings_scrollback(self.config.scrollback as i32);
+        ui.set_settings_snapshot_file_mb(self.config.snapshot_file_mb as i32);
+        ui.set_settings_snapshot_dir_mb(self.config.snapshot_dir_mb as i32);
         ui.set_settings_show_changes(self.config.show_changes);
         ui.set_settings_config_path(SharedString::from(
             config::config_path().map(|p| p.display().to_string()).unwrap_or_default(),

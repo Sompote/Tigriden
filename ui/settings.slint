@@ -150,6 +150,8 @@ export component SettingsDialog inherits Rectangle {
     in property <float> term-font-size;
     in property <float> ui-font-size;
     in property <int> scrollback;
+    in property <int> snapshot-file-mb;
+    in property <int> snapshot-dir-mb;
     in property <bool> show-changes;
     in property <string> config-path;
 
@@ -486,6 +488,75 @@ export component SettingsDialog inherits Rectangle {
 
                         Text {
                             text: "Applies to windows opened from now on; File ▸ Show Changes Panel toggles this window.";
+                            color: Theme.text-dim;
+                            font-size: Theme.font-size-tiny;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            FieldLabel { text: "Skip folders"; }
+                            Chip {
+                                label: "100 MB";
+                                selected: root.snapshot-dir-mb == 100;
+                                clicked => { root.changed("snapshot-dir-mb", "100"); }
+                            }
+                            Chip {
+                                label: "200 MB";
+                                selected: root.snapshot-dir-mb == 200;
+                                clicked => { root.changed("snapshot-dir-mb", "200"); }
+                            }
+                            Chip {
+                                label: "500 MB";
+                                selected: root.snapshot-dir-mb == 500;
+                                clicked => { root.changed("snapshot-dir-mb", "500"); }
+                            }
+                            Chip {
+                                label: "2 GB";
+                                selected: root.snapshot-dir-mb == 2048;
+                                clicked => { root.changed("snapshot-dir-mb", "2048"); }
+                            }
+                            Chip {
+                                label: "No limit";
+                                selected: root.snapshot-dir-mb == 0;
+                                clicked => { root.changed("snapshot-dir-mb", "0"); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            FieldLabel { text: "Skip files"; }
+                            Chip {
+                                label: "1 MB";
+                                selected: root.snapshot-file-mb == 1;
+                                clicked => { root.changed("snapshot-file-mb", "1"); }
+                            }
+                            Chip {
+                                label: "5 MB";
+                                selected: root.snapshot-file-mb == 5;
+                                clicked => { root.changed("snapshot-file-mb", "5"); }
+                            }
+                            Chip {
+                                label: "20 MB";
+                                selected: root.snapshot-file-mb == 20;
+                                clicked => { root.changed("snapshot-file-mb", "20"); }
+                            }
+                            Chip {
+                                label: "100 MB";
+                                selected: root.snapshot-file-mb == 100;
+                                clicked => { root.changed("snapshot-file-mb", "100"); }
+                            }
+                            Chip {
+                                label: "No limit";
+                                selected: root.snapshot-file-mb == 0;
+                                clicked => { root.changed("snapshot-file-mb", "0"); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+
+                        Text {
+                            text: "Snapshot size limits, for folders without their own git repository. A data directory or a single file at or over these sizes is left out of the snapshot, which keeps the store small — those files are then not listed in the panel and cannot be rolled back. Applies when a baseline is taken: turn the Changes panel off and on again to re-take one.";
                             color: Theme.text-dim;
                             font-size: Theme.font-size-tiny;
                             wrap: word-wrap;

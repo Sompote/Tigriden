@@ -38,11 +38,11 @@ Nothing in steps 2–5 costs a LaTeX run or a second application.
 - **One-click agents** — preset buttons type the agent command into the terminal for you (`claude`, `codex`, `gemini`, `opencode`, or your own, fully configurable).
 - **A real terminal** — VTE-compliant ([alacritty_terminal](https://crates.io/crates/alacritty_terminal) + a real PTY), so `vim`, `top` and the Claude Code TUI just work: bracketed paste, truecolor, mouse selection, right-click Copy / Paste / Select All, and a wheel that scrolls inside full-screen apps as well as through history (Shift+PgUp/PgDn/Home/End/↑/↓ page the scrollback). Drop a file from Finder on the terminal and its shell-quoted path is typed in, ready to attach to a prompt. **Marks stay on the letters they belong to** *(0.1.9)* — a cell's zero-width vowels, tones and accents are drawn as the one stack they are, so `สวัสดีครับ` keeps its Thai vowels and tone marks instead of thinning to bare consonants. **Ctrl and ⌘ work on a non-Latin layout** *(0.2.0)* — on a Thai keyboard Ctrl+O typed Ctrl+ญ, which matches no shortcut and encodes no control byte, so `^O` never reached `nano` and the app's own ⌘ keys went dead. A combo is now resolved through the key's position on a Latin layout, the way macOS resolves its own shortcuts; plain typing, Dvorak, AZERTY, arrows and F-keys are untouched.
 - **Multiple terminals per folder** — `+` spawns extra shells in the same workspace, so an agent can run while you use a second tab for git, tests, or another agent.
-- **Every file the agent touched, and an undo** *(0.1.1)* — **File ▸ Show Changes Panel** lists modified/added/deleted files within ~1 s of a write, with a syntax-highlighted diff per file. **Discard Changes…** reverts one file, **↺** reverts the whole run, both behind a confirmation. Git folders compare against the last commit; folders without git get invisible shadow snapshots, so a scratch project or a manuscript folder is just as safe.
+- **Every file the agent touched, and an undo** *(0.1.1)* — **File ▸ Show Changes Panel** lists modified/added/deleted files within ~1 s of a write, with a syntax-highlighted diff per file. **Discard Changes…** reverts one file, **↺** reverts the whole run, both behind a confirmation. Git folders compare against the last commit; folders without git get invisible shadow snapshots, so a scratch project or a manuscript folder is just as safe. **Snapshots skip bulk data** *(0.2.1)* — a directory over 200 MB or a single file over 5 MB stays out, both sizes settable in Settings, so a training set or a PDF corpus does not end up copied into the snapshot store.
 - **Several projects at once** — one session per folder with its own shell, tree and open file; switching is instant. **File ▸ New Window** runs independent windows in parallel, and named `[[teams]]` give each window its own agent buttons. **Windows no longer stall each other** *(0.2.0)* — they share one event loop, so closing a terminal, opening a PDF, scanning fonts or watching a folder with git now happens off it.
 - **A file panel that manages files** *(0.1.6)* — gitignore-aware and live as the agent works. Drag files in from Finder, Cut/Copy/Paste through the system pasteboard in both directions, Delete to the Trash behind a confirmation, rename/duplicate/reveal from the keyboard or the context menu.
 - **Built-in editor** — syntax highlighting for 40+ languages ([cosmic-text](https://crates.io/crates/cosmic-text) + syntect), Cmd+S to save. When the agent rewrites the file you have open, it reloads automatically (or asks, if you have unsaved edits).
-- **Settings, themes, persistence** *(0.1.2)* — **File ▸ Settings… (⌘,)**: six themes, accent color, **a font and a text size for the editor and for the terminal, each picked on its own** *(0.1.8)*, scrollback, applied live to every window. The pickers list the monospaced families your machine really has, and a configured family it does not have is swapped for one it does — never for the platform's proportional interface font. A native menu bar (Add Folder ⌘O, New Terminal ⌘T, Open Recent, New Window ▸ team, Save ⌘S, Close ⌘W) routes to whichever pane has focus, and folders, layout and the recent list come back on relaunch.
+- **Settings, themes, persistence** *(0.1.2)* — **File ▸ Settings… (⌘,)**: six themes, accent color, **a font and a text size for the editor and for the terminal, each picked on its own** *(0.1.8)*, scrollback, **the snapshot size limits** *(0.2.1)*, applied live to every window. The pickers list the monospaced families your machine really has, and a configured family it does not have is swapped for one it does — never for the platform's proportional interface font. A native menu bar (Add Folder ⌘O, New Terminal ⌘T, Open Recent, New Window ▸ team, Save ⌘S, Close ⌘W) routes to whichever pane has focus, and folders, layout and the recent list come back on relaunch.
 - **Small on purpose** — no Electron, no webview under the UI, no C regex libraries; a Slint shell with both panes rasterized straight to pixel buffers, which is where the ~10 MB binary and the instant startup come from.
 
 ## For writing and revising
@@ -192,6 +192,28 @@ Presets and teams are file-only — the Settings dialog links to config.toml for
 When a release adds an agent button, a config still holding an older build's stock list picks it up once, recorded as `presets_version`. Add or remove a single preset and the list becomes yours: later releases leave it alone.
 
 Runtime state (restored folders, split position) lives next to it in `state.toml`; shadow snapshots for the Changes panel live in `snapshots/`.
+
+### Snapshot size limits
+
+A folder without its own git repository is tracked by a hidden snapshot repo
+under `~/Library/Application Support/tigriden/snapshots/`. Two limits keep that
+store from growing past the projects it tracks, both in **Settings ▸ Changes
+panel** and in `config.toml`:
+
+```toml
+snapshot_file_mb = 5     # a file this big or bigger is not snapshotted
+snapshot_dir_mb  = 200   # a directory subtree this big is excluded whole
+```
+
+`0` on either means no limit. The directory rule is the one that matters: the
+mass in a research folder is rarely one huge file, it is thousands of medium
+ones. A folder of 4602 harvested PDFs averaging 1.7 MB snapshots to 100 MB at
+these values, and a 7638-image training set to 39 MB, while a 415 MB book
+folder keeps 128 MB and every source file in it. Excluded files are not listed
+in the Changes panel and cannot be rolled back from it.
+
+Limits apply when a baseline is taken. Turn the Changes panel off and on again
+to re-take one for the folders already open.
 
 ## Architecture
 

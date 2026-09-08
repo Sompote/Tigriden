@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Serializes work on one folder's repository.
@@ -99,9 +100,30 @@ fn has_baseline(dir: &Path) -> bool {
 const SKIP_DIRS: [&str; 6] =
     ["node_modules", "target", "dist", "build", ".venv", "__pycache__"];
 
+/// The snapshot size limits in bytes, as Settings last set them. `0` is the
+/// "no limit" setting.
+///
+/// Baselines run on the git worker threads and the settings dialog runs on the
+/// event loop, so these cross a thread boundary. Two atomics are enough: a
+/// baseline that reads them mid-change gets one value or the other, and both
+/// are answers the user asked for.
+static MAX_FILE_BYTES: AtomicU64 = AtomicU64::new(5 * 1024 * 1024);
+static MAX_DIR_BYTES: AtomicU64 = AtomicU64::new(200 * 1024 * 1024);
+
+/// Points the limits at what the config says. Called whenever it changes.
+pub fn set_snapshot_limits(file_mb: u32, dir_mb: u32) {
+    MAX_FILE_BYTES.store(u64::from(file_mb) * 1024 * 1024, Ordering::Relaxed);
+    MAX_DIR_BYTES.store(u64::from(dir_mb) * 1024 * 1024, Ordering::Relaxed);
+}
+
 /// A file this size or larger stays out of the snapshot. Catches the one-off
 /// giant: a 309 MB `weight.zip`, a 156 MB `.engine`, a 323 MB database.
-const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+fn max_file_bytes() -> u64 {
+    match MAX_FILE_BYTES.load(Ordering::Relaxed) {
+        0 => u64::MAX,
+        bytes => bytes,
+    }
+}
 
 /// A directory subtree this big is excluded whole, at the shallowest point
 /// that crosses the line.
@@ -110,11 +132,14 @@ const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 /// never in the giants. One tracked folder carried 4602 PDFs averaging 1.7 MB
 /// — a scraped literature corpus — and another 7638 JPGs averaging 0.65 MB, a
 /// training set. Both sit under any per-file cap worth setting, and together
-/// they were 13 of the 17 GB. What marks them is the directory: a manuscript
-/// folder does not hold 4600 PDFs. Excluding the subtree takes those two
-/// folders to 152 MB and 65 MB, while a paper's `figures/` is nowhere near
-/// the line.
-const MAX_DIR_BYTES: u64 = 200 * 1024 * 1024;
+/// they were 13 of the 17 GB the store had reached. What marks them is the
+/// directory: a manuscript folder does not hold 4600 PDFs.
+fn max_dir_bytes() -> u64 {
+    match MAX_DIR_BYTES.load(Ordering::Relaxed) {
+        0 => u64::MAX,
+        bytes => bytes,
+    }
+}
 
 /// What a walk of the work tree found: a subtree's size, the oversized files
 /// directly relevant to it, and the same for each child directory.
@@ -148,7 +173,7 @@ fn scan(dir: &Path, rel: &str) -> Scan {
         } else if kind.is_file() {
             let Ok(size) = entry.metadata().map(|m| m.len()) else { continue };
             node.bytes += size;
-            if size >= MAX_FILE_BYTES {
+            if size >= max_file_bytes() {
                 node.files.push(child);
             }
         }
@@ -165,7 +190,7 @@ fn scan(dir: &Path, rel: &str) -> Scan {
 /// gets its own small files tracked.
 fn to_exclude(root: &Path) -> (Vec<String>, Vec<String>) {
     fn collect(node: Scan, dirs: &mut Vec<String>, files: &mut Vec<String>) {
-        if !node.rel.is_empty() && node.bytes >= MAX_DIR_BYTES {
+        if !node.rel.is_empty() && node.bytes >= max_dir_bytes() {
             dirs.push(node.rel);
             return;
         }
@@ -261,6 +286,10 @@ pub fn snapshot_baseline(root: &Path, dir: &Path, force: bool) {
             "user.email=snapshot@tigriden.local",
             "commit",
             "-q",
+            // A folder whose every file is excluded still needs a commit.
+            // Without one there is no baseline, so the next refresh re-walks
+            // the whole tree and tries again, forever.
+            "--allow-empty",
             "-m",
             "snapshot baseline",
         ])
@@ -508,6 +537,15 @@ fn queue(
 mod tests {
     use super::*;
 
+    /// The snapshot limits are process-wide, so any test that depends on them
+    /// holds this for its duration and states the values it wants.
+    fn limits(file_mb: u32, dir_mb: u32) -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_snapshot_limits(file_mb, dir_mb);
+        guard
+    }
+
     /// A work tree and, beside it, the snapshot repo. Real snapshot repos sit
     /// under the config dir, never inside the folder they track — one inside
     /// would show up in its own `git status`.
@@ -521,6 +559,7 @@ mod tests {
 
     #[test]
     fn an_existing_baseline_survives_a_second_window_opening_the_folder() {
+        let _limits = limits(5, 200);
         let (root, git_dir) = scratch("baseline");
         std::fs::write(root.join("a.txt"), "one").unwrap();
 
@@ -546,6 +585,7 @@ mod tests {
 
     #[test]
     fn an_init_with_no_commit_is_not_a_baseline() {
+        let _limits = limits(5, 200);
         let (root, git_dir) = scratch("unborn");
         std::fs::create_dir_all(&git_dir).unwrap();
         // What an interrupted first snapshot leaves behind: HEAD on disk, no
@@ -561,10 +601,11 @@ mod tests {
 
     #[test]
     fn a_file_over_the_cap_stays_out_of_the_snapshot() {
+        let _limits = limits(5, 200);
         let (root, git_dir) = scratch("oversize");
         std::fs::create_dir_all(root.join("weight")).unwrap();
         std::fs::write(root.join("paper.tex"), "\\documentclass{article}").unwrap();
-        std::fs::write(root.join("weight/model.pt"), vec![0u8; MAX_FILE_BYTES as usize]).unwrap();
+        std::fs::write(root.join("weight/model.pt"), vec![0u8; max_file_bytes() as usize]).unwrap();
 
         snapshot_baseline(&root, &git_dir, false);
         let tracking = Tracking::Shadow(git_dir.clone());
@@ -579,19 +620,20 @@ mod tests {
         assert!(!tracked.contains("model.pt"), "the oversized weight was snapshotted");
 
         // And it stays out of the panel rather than showing as an eternal add.
-        std::fs::write(root.join("weight/model.pt"), vec![1u8; MAX_FILE_BYTES as usize]).unwrap();
+        std::fs::write(root.join("weight/model.pt"), vec![1u8; max_file_bytes() as usize]).unwrap();
         assert!(status(&root, &tracking).is_empty(), "the excluded file reached the panel");
     }
 
     #[test]
     fn a_file_that_grew_past_the_cap_leaves_the_index() {
+        let _limits = limits(5, 200);
         let (root, git_dir) = scratch("grew");
         std::fs::write(root.join("run.csv"), "a,b\n1,2\n").unwrap();
         snapshot_baseline(&root, &git_dir, false);
 
         // The run appends until the file is over the cap; "watch from now"
         // must drop it rather than carry a 5 MB blob into every later commit.
-        std::fs::write(root.join("run.csv"), vec![b'x'; MAX_FILE_BYTES as usize]).unwrap();
+        std::fs::write(root.join("run.csv"), vec![b'x'; max_file_bytes() as usize]).unwrap();
         snapshot_baseline(&root, &git_dir, true);
 
         let tracked = Command::new("git")
@@ -609,6 +651,7 @@ mod tests {
 
     #[test]
     fn a_data_directory_over_budget_is_excluded_whole() {
+        let _limits = limits(5, 200);
         let (root, git_dir) = scratch("corpus");
         std::fs::write(root.join("paper.tex"), "\\documentclass{article}").unwrap();
         std::fs::create_dir_all(root.join("figures")).unwrap();
@@ -635,6 +678,56 @@ mod tests {
 
         // Adding to the corpus does not fill the panel either.
         std::fs::write(root.join("harvest/pdfs/new.pdf"), vec![7u8; 1024]).unwrap();
+        assert!(status(&root, &Tracking::Shadow(git_dir)).is_empty());
+    }
+
+    #[test]
+    fn settings_move_the_limits() {
+        let _limits = limits(5, 200);
+        let (root, git_dir) = scratch("limits");
+        std::fs::write(root.join("paper.tex"), "\\documentclass{article}").unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::write(root.join("data/a.bin"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+        std::fs::write(root.join("data/b.bin"), vec![1u8; 2 * 1024 * 1024]).unwrap();
+
+        // Tight enough that the 4 MB directory is over budget.
+        set_snapshot_limits(5, 3);
+        snapshot_baseline(&root, &git_dir, true);
+        let tracked = tracked_paths(&git_dir);
+        assert!(tracked.contains("paper.tex"), "the baseline was taken");
+        assert!(!tracked.contains("data/"), "the directory was over budget");
+
+        // Loosened, the same folder comes back.
+        set_snapshot_limits(5, 200);
+        snapshot_baseline(&root, &git_dir, true);
+        assert!(tracked_paths(&git_dir).contains("data/a.bin"), "the directory is under budget now");
+
+        // Off means no limit at all.
+        set_snapshot_limits(0, 0);
+        assert_eq!(max_file_bytes(), u64::MAX);
+        assert_eq!(max_dir_bytes(), u64::MAX);
+    }
+
+    fn tracked_paths(git_dir: &Path) -> String {
+        let out = Command::new("git")
+            .arg("--git-dir")
+            .arg(git_dir)
+            .args(["ls-tree", "-r", "--name-only", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn a_folder_with_nothing_left_to_track_still_gets_a_baseline() {
+        let _limits = limits(1, 200);
+        let (root, git_dir) = scratch("allexcluded");
+        std::fs::write(root.join("report.pdf"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+
+        snapshot_baseline(&root, &git_dir, false);
+        // Without a commit there is no baseline, and every later refresh would
+        // walk the whole folder again trying to take one.
+        assert!(has_baseline(&git_dir), "an all-excluded folder took no baseline");
         assert!(status(&root, &Tracking::Shadow(git_dir)).is_empty());
     }
 

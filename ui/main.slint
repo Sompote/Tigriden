@@ -213,6 +213,8 @@ export component MainWindow inherits Window {
     in property <float> settings-ui-font-size: 13;
     in property <int> settings-scrollback: 10000;
     in property <bool> settings-show-changes: false;
+    in property <int> settings-snapshot-file-mb: 5;
+    in property <int> settings-snapshot-dir-mb: 200;
     in property <string> settings-config-path: "";
 
     callback row-clicked(int);
@@ -671,6 +673,8 @@ export component MainWindow inherits Window {
         ui-font-size: root.settings-ui-font-size;
         scrollback: root.settings-scrollback;
         show-changes: root.settings-show-changes;
+        snapshot-file-mb: root.settings-snapshot-file-mb;
+        snapshot-dir-mb: root.settings-snapshot-dir-mb;
         config-path: root.settings-config-path;
         changed(key, value) => { root.settings-changed(key, value); }
         close => { root.settings-close(); }
