@@ -571,11 +571,9 @@ fn spawn_pdf_worker(path: PathBuf, notify: Notify) -> PdfWorker {
     let wanted_worker = wanted.clone();
     std::thread::spawn(move || {
         // Whatever goes wrong — unreadable file, encrypted or malformed
-        // document, no pages — the answer is the same: show the text.
+        // document, no pages — the answer is the same: say so in the pane.
         let fallback = |res_tx: &Sender<PdfRes>, notify: &Notify, why: String| {
-            let text = pdf_extract::extract_text(&path).unwrap_or_default();
-            let text = if text.trim().is_empty() { why } else { text };
-            let _ = res_tx.send(PdfRes::Unreadable(text));
+            let _ = res_tx.send(PdfRes::Unreadable(why));
             notify();
         };
         let Ok(bytes) = std::fs::read(&path) else {
@@ -597,15 +595,14 @@ fn spawn_pdf_worker(path: PathBuf, notify: Notify) -> PdfWorker {
         notify();
 
         // The whole document's text, for Cmd+C with nothing selected — the
-        // page bitmaps carry no glyphs to select. On a thread of its own for
-        // two reasons: it used to run on the event loop at the moment of the
-        // copy, and pdf_extract re-parses the file from scratch, so doing it
-        // here would stand between the reader and the first page.
+        // page bitmaps carry no glyphs to select. On a thread of its own, with
+        // its own copy of the document: walking every page takes long enough
+        // that doing it here would stand between the reader and the first page.
         let text_tx = res_tx.clone();
         let text_notify = notify.clone();
         let text_path = path.clone();
         std::thread::spawn(move || {
-            let text = pdf_extract::extract_text(&text_path).unwrap_or_default();
+            let text = extract_document_text(&text_path).unwrap_or_default();
             if text_tx.send(PdfRes::Whole(text)).is_ok() {
                 text_notify();
             }
@@ -2754,18 +2751,7 @@ impl ViewerState {
             if !out.is_empty() && !chars.is_empty() {
                 out.push('\n');
             }
-            let mut prev: Option<&PageChar> = None;
-            for c in chars {
-                match prev {
-                    Some(p) if p.line != c.line => out.push('\n'),
-                    // PDFs routinely draw words with no space glyph between
-                    // them; a wide enough gap stands in for one.
-                    Some(p) if c.x - (p.x + p.w) > c.h * 0.25 => out.push(' '),
-                    _ => {}
-                }
-                out.push_str(&c.text);
-                prev = Some(c);
-            }
+            out.push_str(&chars_to_text(chars));
         }
         (!out.trim().is_empty()).then_some(out)
     }
@@ -3489,6 +3475,47 @@ impl hayro::hayro_interpret::Device<'_> for TextExtractor {
     fn pop_transparency_group(&mut self) {}
 }
 
+/// Renders extracted characters as text: a line break where the reading order
+/// moves to a new row, and a space wherever the gap is wide enough to stand in
+/// for one. PDFs routinely draw words with no space glyph between them.
+fn chars_to_text(chars: &[PageChar]) -> String {
+    let mut out = String::new();
+    let mut prev: Option<&PageChar> = None;
+    for c in chars {
+        match prev {
+            Some(p) if p.line != c.line => out.push('\n'),
+            Some(p) if c.x - (p.x + p.w) > c.h * 0.25 => out.push(' '),
+            _ => {}
+        }
+        out.push_str(&c.text);
+        prev = Some(c);
+    }
+    out
+}
+
+/// The whole document's text, page by page in reading order.
+///
+/// This opens its own copy of the file: the caller runs it on a thread of its
+/// own, while the worker thread keeps the document it rasterizes from.
+fn extract_document_text(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let pdf = hayro::hayro_syntax::Pdf::new(bytes).ok()?;
+    let cache = hayro::hayro_interpret::InterpreterCache::new();
+    let mut out = String::new();
+    for index in 0..pdf.pages().len() {
+        let Some(page) = extract_page_text(&pdf, index, &cache) else { continue };
+        let text = chars_to_text(&page.chars);
+        if text.trim().is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&text);
+    }
+    Some(out)
+}
+
 /// Extracts one page's selectable text by interpreting its content stream
 /// with a glyph-only device.
 fn extract_page_text<'a>(
@@ -3697,6 +3724,66 @@ mod tests {
             objects.len() + 1
         ));
         out.into_bytes()
+    }
+
+    /// A Type 3 font whose /Widths the page never supplies. matplotlib figures
+    /// embedded in LaTeX papers produce fonts of this shape, and they used to
+    /// abort the whole app: the text extractor panicked on the missing width,
+    /// and release builds abort on panic.
+    fn type3_pdf() -> Vec<u8> {
+        let objects = [
+            "<</Type/Catalog/Pages 2 0 R>>".to_string(),
+            "<</Type/Pages/Kids[3 0 R]/Count 1>>".to_string(),
+            "<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>".to_string(),
+            {
+                let stream = "BT /F1 24 Tf 20 40 Td (A) Tj ET";
+                format!("<</Length {}>>stream\n{stream}\nendstream", stream.len() + 1)
+            },
+            [
+                "<</Type/Font/Subtype/Type3/FontBBox[0 0 750 750]",
+                "/FontMatrix[0.001 0 0 0.001 0 0]/CharProcs<</square 6 0 R>>",
+                "/Encoding<</Type/Encoding/Differences[65/square]>>/FirstChar 65/LastChar 65>>",
+            ]
+            .concat(),
+            {
+                let stream = "750 0 0 0 750 750 d1 0 0 750 750 re f";
+                format!("<</Length {}>>stream\n{stream}\nendstream", stream.len() + 1)
+            },
+        ];
+        let mut out = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.push_str(&format!("{} 0 obj\n{body}\nendobj\n", i + 1));
+        }
+        let xref = out.len();
+        out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
+        for off in &offsets {
+            out.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        out.push_str(&format!(
+            "trailer\n<</Size {}/Root 1 0 R>>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        ));
+        out.into_bytes()
+    }
+
+    #[test]
+    fn whole_document_text_walks_the_pages() {
+        let path = std::env::temp_dir().join("tigriden-viewer-wholetext.pdf");
+        std::fs::write(&path, hello_pdf()).unwrap();
+        let text = extract_document_text(&path).expect("the document opens");
+        assert!(text.contains("Hello PDF"), "got {text:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_type3_font_without_widths_extracts_instead_of_aborting() {
+        let path = std::env::temp_dir().join("tigriden-viewer-type3.pdf");
+        std::fs::write(&path, type3_pdf()).unwrap();
+        // Text or no text, what matters is that the walk returns at all.
+        assert!(extract_document_text(&path).is_some(), "the document opens");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -4179,7 +4266,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         assert!(viewer.worker.is_none(), "the fallback drops the worker");
-        assert_eq!(viewer.blocks.len(), 1, "the extracted text is one block");
+        assert_eq!(viewer.blocks.len(), 1, "the reason shows as one block");
         assert!(!viewer.zoomable(), "there are no pages to magnify");
         let _ = std::fs::remove_file(&path);
     }
