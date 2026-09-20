@@ -256,8 +256,11 @@ pub struct ViewerState {
     /// Background rasterizer that owns the parsed PDF; None for non-PDF
     /// views and for the text-extraction fallback.
     worker: Option<PdfWorker>,
-    /// Rasterized pages by index; the bitmap width encodes the render width.
-    page_cache: HashMap<usize, RgbaImage>,
+    /// Rasterized pages by index, each with the width it was requested at.
+    /// The request width, not the bitmap's own, is what a later request is
+    /// checked against: the rasterizer may come back a pixel short, and a
+    /// bitmap that never matches would be asked for again on every frame.
+    page_cache: HashMap<usize, (u32, RgbaImage)>,
     /// Widths requested from the worker but not yet delivered, by page index.
     pending: HashMap<usize, u32>,
     /// Selectable text by page index. Kept for every page that has scrolled
@@ -2976,7 +2979,7 @@ impl ViewerState {
                     if self.pending.get(&index) == Some(&width) {
                         self.pending.remove(&index);
                     }
-                    self.page_cache.insert(index, img);
+                    self.page_cache.insert(index, (width, img));
                 }
                 PdfRes::Text(index, text) => {
                     self.pending_text.remove(&index);
@@ -3031,7 +3034,7 @@ impl ViewerState {
         for slot in order {
             let (index, size, _) = pages[slot];
             let want = fit_draw(size.0, size.1, target_w).0 as u32;
-            if self.page_cache.get(&index).is_some_and(|img| img.width() == want)
+            if self.page_cache.get(&index).is_some_and(|(w, _)| *w == want)
                 || self.pending.get(&index) == Some(&want)
             {
                 continue;
@@ -3208,12 +3211,12 @@ impl ViewerState {
                         let dim = colors::base_palette(self.theme)[8];
                         let draw_w = fit_draw(size.0, size.1, text_w * self.zoom).0 as i32;
                         match page_cache.get(index) {
-                            Some(img) if img.width() == draw_w as u32 => {
+                            Some((w, img)) if *w == draw_w as u32 => {
                                 blit_opaque(&mut canvas, img, x0, y as i32)
                             }
                             // A re-render at the new width is still in
                             // flight: show the old bitmap rescaled meanwhile.
-                            Some(img) => {
+                            Some((_, img)) => {
                                 blit_scaled(&mut canvas, img, x0, y as i32, draw_w, *height as i32)
                             }
                             // Not rasterized yet: draw a blank sheet so the
@@ -3566,10 +3569,16 @@ fn rasterize_page<'a>(
     let page = pages.get(index)?;
     let (page_w, _) = page.render_dimensions();
     let scale = draw_w as f32 / page_w.max(1.0);
+    // The width is stated outright rather than left to the scale: hayro sizes
+    // its pixmap as `floor(page_w * scale)`, and in f32 that comes out one
+    // pixel short of `draw_w` for about one width in sixteen on a Letter page.
+    // The viewer used to compare the bitmap against the width it asked for,
+    // and at such a width it asked again on every frame, forever: one core
+    // rasterizing, one core repainting.
     let settings = hayro::RenderSettings {
         x_scale: scale,
         y_scale: scale,
-        width: None,
+        width: Some(draw_w.min(u16::MAX as u32) as u16),
         height: None,
         bg_color: hayro::vello_cpu::color::palette::css::WHITE,
     };
@@ -3766,6 +3775,21 @@ mod tests {
             objects.len() + 1
         ));
         out.into_bytes()
+    }
+
+    /// hayro sizes its pixmap as `floor(page_w * (draw_w / page_w))`, and in
+    /// f32 that lands one pixel short of `draw_w` for about one width in
+    /// sixteen on a Letter page. The viewer compared the bitmap's width with
+    /// the width it asked for, so at such a pane width it asked again on every
+    /// frame, forever: one core rasterizing, one core repainting.
+    #[test]
+    fn a_page_rasterizes_at_exactly_the_requested_width() {
+        let pdf = hayro::hayro_syntax::Pdf::new(two_column_pdf()).unwrap();
+        let cache = hayro::RenderCache::new();
+        for draw_w in [413u32, 417, 421, 425, 1000, 1225] {
+            let img = rasterize_page(pdf.pages(), 0, draw_w, &cache).unwrap();
+            assert_eq!(img.width(), draw_w, "requested {draw_w}");
+        }
     }
 
     #[test]
