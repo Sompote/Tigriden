@@ -1,6 +1,6 @@
 # Tigriden — A Fast, Tiny End-to-End Research Workbench
 
-![Version](https://img.shields.io/badge/version-0.2.0-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
+![Version](https://img.shields.io/badge/version-0.2.1-e8912d) ![License](https://img.shields.io/badge/license-MIT-blue) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 
 **From the coding agent that runs your experiments to the scientific paper you submit — one window for the whole thing.** An agentic coding workbench (per-folder terminals, a live file panel, change tracking with one-click rollback, a lightweight editor) with a document viewer bolted to the same window: your `.tex` shown as the page it compiles to, your PDFs as real pages, and the figures and data your code just produced next to both.
 
@@ -36,13 +36,13 @@ Nothing in steps 2–5 costs a LaTeX run or a second application.
 ## For agentic coding
 
 - **One-click agents** — preset buttons type the agent command into the terminal for you (`claude`, `codex`, `gemini`, `opencode`, or your own, fully configurable).
-- **A real terminal** — VTE-compliant ([alacritty_terminal](https://crates.io/crates/alacritty_terminal) + a real PTY), so `vim`, `top` and the Claude Code TUI just work: bracketed paste, truecolor, mouse selection, right-click Copy / Paste / Select All, and a wheel that scrolls inside full-screen apps as well as through history (Shift+PgUp/PgDn/Home/End/↑/↓ page the scrollback). Drop a file from Finder on the terminal and its shell-quoted path is typed in, ready to attach to a prompt. **Marks stay on the letters they belong to** *(0.1.9)* — a cell's zero-width vowels, tones and accents are drawn as the one stack they are, so `สวัสดีครับ` keeps its Thai vowels and tone marks instead of thinning to bare consonants. **Ctrl and ⌘ work on a non-Latin layout** *(0.2.0)* — on a Thai keyboard Ctrl+O typed Ctrl+ญ, which matches no shortcut and encodes no control byte, so `^O` never reached `nano` and the app's own ⌘ keys went dead. A combo is now resolved through the key's position on a Latin layout, the way macOS resolves its own shortcuts; plain typing, Dvorak, AZERTY, arrows and F-keys are untouched.
+- **A real terminal** — VTE-compliant ([alacritty_terminal](https://crates.io/crates/alacritty_terminal) + a real PTY), so `vim`, `top` and the Claude Code TUI just work: bracketed paste, truecolor, mouse selection, right-click Copy / Paste / Select All, and a wheel that scrolls inside full-screen apps as well as through history (Shift+PgUp/PgDn/Home/End/↑/↓ page the scrollback). Drop a file from Finder on the terminal and its shell-quoted path is typed in, ready to attach to a prompt. **Marks stay on the letters they belong to** *(0.1.9)* — a cell's zero-width vowels, tones and accents are drawn as the one stack they are, so `สวัสดีครับ` keeps its Thai vowels and tone marks instead of thinning to bare consonants. **Ctrl and ⌘ work on a non-Latin layout** *(0.2.0)* — on a Thai keyboard Ctrl+O typed Ctrl+ญ, which matches no shortcut and encodes no control byte, so `^O` never reached `nano` and the app's own ⌘ keys went dead. A combo is now resolved through the key's position on a Latin layout, the way macOS resolves its own shortcuts; plain typing, Dvorak, AZERTY, arrows and F-keys are untouched. **Typing keeps up with a streaming agent** *(0.2.1)* — a program writes its output in as many chunks as it likes, and the reader armed a repaint as soon as the last one had been drawn. Each repaint redraws the whole pane, so a fast writer outran the frame budget and left the main thread no room for keys: the terminal stopped echoing what was typed. Paints are now capped to one per frame interval, 60 per second by default and 15 or 30 in Settings.
 - **Multiple terminals per folder** — `+` spawns extra shells in the same workspace, so an agent can run while you use a second tab for git, tests, or another agent.
 - **Every file the agent touched, and an undo** *(0.1.1)* — **File ▸ Show Changes Panel** lists modified/added/deleted files within ~1 s of a write, with a syntax-highlighted diff per file. **Discard Changes…** reverts one file, **↺** reverts the whole run, both behind a confirmation. Git folders compare against the last commit; folders without git get invisible shadow snapshots, so a scratch project or a manuscript folder is just as safe. **Snapshots skip bulk data** *(0.2.0)* — a directory over 200 MB or a single file over 5 MB stays out, both sizes settable in Settings, so a training set or a PDF corpus does not end up copied into the snapshot store.
-- **Several projects at once** — one session per folder with its own shell, tree and open file; switching is instant. **File ▸ New Window** runs independent windows in parallel, and named `[[teams]]` give each window its own agent buttons. **Windows no longer stall each other** *(0.2.0)* — they share one event loop, so closing a terminal, opening a PDF, scanning fonts or watching a folder with git now happens off it.
-- **A file panel that manages files** *(0.1.6)* — gitignore-aware and live as the agent works. Drag files in from Finder, Cut/Copy/Paste through the system pasteboard in both directions, Delete to the Trash behind a confirmation, rename/duplicate/reveal from the keyboard or the context menu.
+- **Several projects at once** — one session per folder with its own shell, tree and open file; switching is instant. **File ▸ New Window** runs independent windows in parallel, and named `[[teams]]` give each window its own agent buttons. **Windows no longer stall each other** *(0.2.0)* — they share one event loop, so closing a terminal, opening a PDF, scanning fonts or watching a folder with git now happens off it. **Lean mode** *(0.2.1)* is one switch for the case where several of those windows stream at once: it sets 15 fps, 2k scrollback, no Changes panel and no file watching. The frame cap alone accounts for most of that: over 12 s of streaming output it measured 1.83 s of CPU against 3.48 s at 60 fps. Each of the four stays adjustable on its own.
+- **A file panel that manages files** *(0.1.6)* — gitignore-aware and live as the agent works. Drag files in from Finder, Cut/Copy/Paste through the system pasteboard in both directions, Delete to the Trash behind a confirmation, rename/duplicate/reveal from the keyboard or the context menu. **The watch is optional** *(0.2.1)* — turn it off and the tree refreshes when you act on it instead, which costs nothing while a build or a training run churns thousands of files through the folder.
 - **Built-in editor** — syntax highlighting for 40+ languages ([cosmic-text](https://crates.io/crates/cosmic-text) + syntect), Cmd+S to save. When the agent rewrites the file you have open, it reloads automatically (or asks, if you have unsaved edits).
-- **Settings, themes, persistence** *(0.1.2)* — **File ▸ Settings… (⌘,)**: six themes, accent color, **a font and a text size for the editor and for the terminal, each picked on its own** *(0.1.8)*, scrollback, **the snapshot size limits** *(0.2.0)*, applied live to every window. The pickers list the monospaced families your machine really has, and a configured family it does not have is swapped for one it does — never for the platform's proportional interface font. A native menu bar (Add Folder ⌘O, New Terminal ⌘T, Open Recent, New Window ▸ team, Save ⌘S, Close ⌘W) routes to whichever pane has focus, and folders, layout and the recent list come back on relaunch.
+- **Settings, themes, persistence** *(0.1.2)* — **File ▸ Settings… (⌘,)**: six themes, accent color, **a font and a text size for the editor and for the terminal, each picked on its own** *(0.1.8)*, scrollback, **the terminal's refresh rate, file watching and the Lean switch** *(0.2.1)*, **the snapshot size limits** *(0.2.0)*, applied live to every window. The pickers list the monospaced families your machine really has, and a configured family it does not have is swapped for one it does — never for the platform's proportional interface font. A native menu bar (Add Folder ⌘O, New Terminal ⌘T, Open Recent, New Window ▸ team, Save ⌘S, Close ⌘W) routes to whichever pane has focus, and folders, layout and the recent list come back on relaunch.
 - **Small on purpose** — no Electron, no webview under the UI, no C regex libraries; a Slint shell with both panes rasterized straight to pixel buffers, which is where the ~10 MB binary and the instant startup come from.
 
 ## For writing and revising
@@ -68,7 +68,7 @@ Paper and margins from `\documentclass` options and `geometry`; one or two colum
 
 No Rust needed — grab the prebuilt app from the [latest release](https://github.com/Sompote/Tigriden/releases/latest):
 
-1. Download **`Tigriden-0.2.0-macos-universal.app.zip`** (one download for both Apple Silicon and Intel).
+1. Download **`Tigriden-0.2.1-macos-universal.app.zip`** (one download for both Apple Silicon and Intel).
 2. Unzip and drag **Tigriden.app** into **/Applications**.
 3. First launch only: the app isn't notarized, so **right-click → Open → Open**, or run:
 
@@ -76,9 +76,9 @@ No Rust needed — grab the prebuilt app from the [latest release](https://githu
    xattr -d com.apple.quarantine /Applications/Tigriden.app
    ```
 
-Prefer a bare binary? The release also ships `tigriden-0.2.0-macos-arm64.tar.gz` (Apple Silicon) and `tigriden-0.2.0-macos-x86_64.tar.gz` (Intel) — untar and run `./tigriden`.
+Prefer a bare binary? The release also ships `tigriden-0.2.1-macos-arm64.tar.gz` (Apple Silicon) and `tigriden-0.2.1-macos-x86_64.tar.gz` (Intel) — untar and run `./tigriden`.
 
-**Windows** builds on the same release: unzip `tigriden-0.2.0-windows-x86_64.zip` and run `tigriden.exe`. It is built by CI on every tag rather than tested by hand — macOS is still the primary target — but the last three releases fixed what made it look broken on sight. 0.1.8: a config naming a font Windows does not have (Menlo, say) rendered the terminal in Segoe UI, the platform's *proportional* interface font. 0.1.9's mark stacking is platform-neutral code, and Windows falls back to Leelawadee UI for Thai — an OpenType face with real mark attachment, so tone marks sit slightly better there than under the Ayuthaya macOS reaches for. 0.2.0's Latin-layout fallback for Ctrl and ⌘ combos reads the physical key through winit, so it applies there as well. One thing in 0.2.0 is macOS only: *Rendered* HTML needs WKWebView, so on Windows an HTML file opens in *Reader*. Terminal teardown still runs off the event loop there, with `Child::kill` in place of the process-group signals Unix gets.
+**Windows** builds on the same release: unzip `tigriden-0.2.1-windows-x86_64.zip` and run `tigriden.exe`. It is built by CI on every tag rather than tested by hand — macOS is still the primary target — but the last three releases fixed what made it look broken on sight. 0.1.8: a config naming a font Windows does not have (Menlo, say) rendered the terminal in Segoe UI, the platform's *proportional* interface font. 0.1.9's mark stacking is platform-neutral code, and Windows falls back to Leelawadee UI for Thai — an OpenType face with real mark attachment, so tone marks sit slightly better there than under the Ayuthaya macOS reaches for. 0.2.0's Latin-layout fallback for Ctrl and ⌘ combos reads the physical key through winit, so it applies there as well. The frame cap, the reused frames and the file-watch switch added in 0.2.1 are platform-neutral code as well. One thing in 0.2.0 is macOS only: *Rendered* HTML needs WKWebView, so on Windows an HTML file opens in *Reader*. Terminal teardown still runs off the event loop there, with `Child::kill` in place of the process-group signals Unix gets.
 
 <details>
 <summary><b>Build from source</b> (stable Rust required)</summary>
@@ -152,6 +152,8 @@ font_size = 13.0            # editor + viewer (8-28)
 term_font_size = 13.0       # terminal, sized on its own (8-28)
 ui_font_size = 13.0         # sidebar, tabs, dialogs (10-18)
 scrollback = 10000
+term_fps = 60               # ceiling on terminal paints per second (10-120)
+watch_files = true          # recursive watch on each open folder
 show_changes = false        # start new windows with the Changes panel on
 
 [[presets]]
@@ -215,6 +217,35 @@ in the Changes panel and cannot be rolled back from it.
 Limits apply when a baseline is taken. Turn the Changes panel off and on again
 to re-take one for the folders already open.
 
+### Lean mode *(0.2.1)*
+
+Four settings decide what a window costs while an agent streams output into it,
+and the **Lean mode** switch in Settings ▸ Terminal moves all four at once:
+
+```toml
+term_fps     = 15     # terminal paints per second (default 60, range 10-120)
+scrollback   = 2000   # lines of history per terminal (default 10000)
+show_changes = false  # no Changes panel, so no git work per write
+watch_files  = false  # no recursive watch on open folders
+```
+
+The frame cap is the largest of the four while output is streaming. The terminal
+pane is redrawn whole on
+every paint, so the cap, not the program's output rate, decides how much drawing
+a chatty agent buys. Measured over 12 s of streaming output, 60 fps cost 3.48 s
+of CPU, 30 fps cost 3.30 s and 15 fps cost 1.83 s. The gap between 60 and 30 is
+small because the cost of a paint is not proportional to what changed: redrawing
+the pane costs the same after 13 changed lines as after 53. Halving the rate only
+pays once each paint is already redrawing everything, which is why the lean value
+is 15 and not 30. Settings offers 15, 30 and 60; `config.toml` takes anything from
+10 to 120.
+
+The switch is derived from the four values rather than stored, so it reads On only
+while all four are lean and goes out as soon as one is moved back. Turning it off
+restores the defaults, not whatever the values were before. Every one of the four
+stays adjustable on its own, and a change to file watching applies to folders
+already open without reopening them.
+
 ## Architecture
 
 Slint provides only the chrome (sidebar, layout, splitter). The two hard parts are custom-rendered pixel panes on the CPU:
@@ -228,7 +259,7 @@ The file viewer paints into the same kind of pixel buffer: Markdown/CSV/LaTeX la
 
 Because the panes paint themselves, a theme is one definition in `src/theme.rs` feeding three consumers: the Slint `Theme` global (chrome), the ANSI 0-15 palette (terminal, shared with the PTY threads for OSC color queries), and a syntect theme name (editor).
 
-Only the PTY reader threads and the viewer's rasterizer/decoder workers run in the background; rendering and editing happen on the UI thread with coalesced, throttled repaints.
+Only the PTY reader threads and the viewer's rasterizer/decoder workers run in the background; rendering and editing happen on the UI thread with coalesced, throttled repaints. Two things keep that affordable while a terminal streams. Terminal paints are capped to one per frame interval, so a program that writes in a hundred chunks pays for one frame rather than a hundred, and a pane that is not on screen is not painted at all. And each pane reuses its own frames: `SharedPixelBuffer::new` writes every pixel, and the `fill` that follows overwrites all of it, so a fresh buffer per paint costs a full pane of stores for nothing. `src/paint.rs` keeps the last two handles a pane handed out, which leaves the older frame unshared and free to draw into again; without it, `make_mut_slice` copies the whole pane on every paint. The terminal, the editor and the viewer all draw through it.
 
 `src/mac.rs` holds the AppKit calls neither Slint nor winit exposes: the pasteboard's *file list* (so the panel's ⌘C/⌘V interoperate with Finder) and the pointer location during an external drag, since winit's drop events carry a path but no coordinates.
 
@@ -239,6 +270,14 @@ Only the PTY reader threads and the viewer's rasterizer/decoder workers run in t
 `cargo build --features framedump`, then run with `TIGRIDEN_DUMP=/tmp/frames` to dump both panes as PNGs. `TIGRIDEN_TEST_INPUT='claude\r'`, `TIGRIDEN_TEST_OPEN=path`, `TIGRIDEN_TEST_SETTINGS='style=vivid,font-size-step=2'`, `TIGRIDEN_TEST_CHANGES=1` (reports the Changes panel's tracking mode and contents around a write), `TIGRIDEN_TEST_CTXMENU=1` (runs the right-click menu's Copy and Select All against the terminal and reports what reached the clipboard), `TIGRIDEN_TEST_SCROLLBACK=up|down` (wheels the terminal and reports the mode, history size and resulting screen — the way to tell scrollback from alternate-screen scrolling) and `TIGRIDEN_TEST_WHEEL_UI=1` (dispatches a real scroll event through Slint's hit-testing, to prove wheel input still reaches the terminal) script the first session for headless testing. For the typeset LaTeX page there is a faster loop that needs no window: `TEX_DUMP=paper.tex TEX_DUMP_OUT=/tmp/tex TEX_DUMP_PAGES=3 TEX_DUMP_FROM=0 cargo test tex_sheet_dump -- --nocapture` writes one PNG per page.
 
 ## Changelog
+
+- **0.2.1** — **What a window costs while an agent streams into it.**
+
+  **The terminal stopped echoing what was typed.** A program writes its output in as many chunks as it cares to write, and the PTY reader arms a repaint as soon as the last one has been drawn. Every repaint redraws the whole pane, and the paint used to run the moment it was queued, so a program writing in a hundred chunks bought close to a hundred full-pane frames. That outran the frame budget and left the main thread no room to handle key events. Paints are now capped to one per frame interval. The pending flag stays set while the wait runs, so the reader queues nothing further, and the timer paints whatever the terminal holds when it fires. The flag is cleared before the paint rather than after, so output arriving during a paint arms the next frame instead of being dropped. A terminal that is not the visible one drops its pending frame as soon as the flag is read, rather than waiting out a frame interval to find it has nothing to draw.
+
+  **A paint no longer allocates a pane.** `SharedPixelBuffer::new` writes every pixel one at a time, and the `Canvas::fill` that opens each paint overwrites all of it, so a fresh buffer per frame cost a full pane of stores for nothing. Reusing the newest frame does not work either, because the pane still holds it and `make_mut_slice` then copies the whole pane to make it unique. `src/paint.rs` now keeps the last two handles a pane handed out, which leaves the frame from two paints ago unshared and free to draw into again. The terminal renderer, the editor and the viewer all take their frames from it.
+
+  **Four settings, one switch.** The frame cap is a setting, because the right value depends on how many windows are streaming at once. Settings ▸ Terminal offers 15, 30 and 60 fps, and `config.toml` takes 10 to 120 as `term_fps`. Measured over 12 s of streaming output, 60 fps cost 3.48 s of CPU, 30 fps cost 3.30 s and 15 fps cost 1.83 s. Dropping to 30 buys almost nothing, because the cost of a paint is not proportional to what changed: redrawing the pane costs the same after 13 changed lines as after 53. Halving the rate only pays once each paint is already redrawing everything. **Watch files** is the second new setting. Off stops the recursive watch on open folders, so a build or a training run that churns thousands of files no longer wakes the window, and the tree refreshes when you act on it instead. The setting applies to folders already open, without reopening them. **Lean mode** sets the frame cap to 15, the scrollback to 2000, the Changes panel off and file watching off, for the case of several windows running agents side by side. It is derived from those four values rather than stored, so it cannot disagree with them: it reads On only while all four are lean, and goes out as soon as one is moved back on its own. Turning it off restores the defaults rather than the values it replaced.
 
 - **0.2.0** — **HTML in the viewer, a window that stays responsive, and a snapshot store that stays small.**
 
