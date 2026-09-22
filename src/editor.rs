@@ -7,7 +7,7 @@ use cosmic_text::{
 };
 use slint::{Rgba8Pixel, SharedPixelBuffer};
 
-use crate::paint::Canvas;
+use crate::paint::{Canvas, Frames};
 use crate::term::keys::Mods;
 use crate::theme::ThemeDef;
 
@@ -48,6 +48,8 @@ pub struct EditorState {
     /// at the underlying file, not at what the buffer holds.
     pub read_only: bool,
     mouse_down: bool,
+    /// Frames retained for reuse across paints.
+    frames: Frames,
 }
 
 fn mono_attrs(font_family: &'static str) -> Attrs<'static> {
@@ -78,6 +80,7 @@ impl EditorState {
             disk_mtime,
             read_only: false,
             mouse_down: false,
+            frames: Frames::default(),
         })
     }
 
@@ -108,6 +111,7 @@ impl EditorState {
             disk_mtime: None,
             read_only: true,
             mouse_down: false,
+            frames: Frames::default(),
         })
     }
 
@@ -317,7 +321,7 @@ impl EditorState {
         width_px: u32,
         height_px: u32,
     ) -> SharedPixelBuffer<Rgba8Pixel> {
-        let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width_px.max(1), height_px.max(1));
+        let mut buffer = self.frames.take(width_px.max(1), height_px.max(1));
         let bg = self.editor.background_color();
         let (w, h) = (buffer.width() as i32, buffer.height() as i32);
         let mut canvas = Canvas { pixels: buffer.make_mut_slice(), width: w, height: h };
@@ -326,6 +330,7 @@ impl EditorState {
         self.editor.draw(font_system, swash_cache, |x, y, rw, rh, color| {
             canvas.blend_rect(x, y, rw as i32, rh as i32, color);
         });
+        self.frames.keep(&buffer);
         buffer
     }
 }

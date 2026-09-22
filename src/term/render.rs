@@ -6,7 +6,7 @@ use alacritty_terminal::vte::ansi::CursorShape;
 use cosmic_text::{Attrs, Buffer, CacheKey, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 use slint::{Rgba8Pixel, SharedPixelBuffer};
 
-use crate::paint::Canvas;
+use crate::paint::{Canvas, Frames};
 use crate::term::colors;
 use crate::term::EventProxy;
 use crate::theme::ThemeDef;
@@ -29,6 +29,8 @@ pub struct TermRenderer {
     /// can be keyed by `&str` without building an owned key per cell.
     clusters: [HashMap<String, Vec<GlyphPos>>; 2],
     shape_buffer: Buffer,
+    /// Frames retained for reuse across paints.
+    frames: Frames,
 }
 
 impl TermRenderer {
@@ -45,6 +47,7 @@ impl TermRenderer {
             cell_h: cell_h as u32,
             clusters: [HashMap::new(), HashMap::new()],
             shape_buffer,
+            frames: Frames::default(),
         };
         renderer.cell_w = renderer.measure_advance(font_system).max(1.0).round() as u32;
         renderer
@@ -112,7 +115,7 @@ impl TermRenderer {
         width_px: u32,
         height_px: u32,
     ) -> SharedPixelBuffer<Rgba8Pixel> {
-        let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width_px.max(1), height_px.max(1));
+        let mut buffer = self.frames.take(width_px.max(1), height_px.max(1));
         let bg = colors::base_palette(theme)[0];
         let default_fg = colors::base_palette(theme)[7];
         let (buf_w, buf_h) = (buffer.width() as i32, buffer.height() as i32);
@@ -210,6 +213,7 @@ impl TermRenderer {
 
         // Cursor (hidden while the grid is scrolled away or by the app).
         if !content.mode.contains(TermMode::SHOW_CURSOR) || content.cursor.shape == CursorShape::Hidden {
+            self.frames.keep(&buffer);
             return buffer;
         }
         if let Some(view) = point_to_viewport(display_offset, content.cursor.point) {
@@ -250,6 +254,7 @@ impl TermRenderer {
             }
         }
 
+        self.frames.keep(&buffer);
         buffer
     }
 }

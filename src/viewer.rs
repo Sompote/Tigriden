@@ -11,7 +11,7 @@ use slint::{Rgba8Pixel, SharedPixelBuffer};
 use hayro::vello_cpu::kurbo;
 
 use crate::mathlayout::{self, MathBox, MathItem};
-use crate::paint::Canvas;
+use crate::paint::{Canvas, Frames};
 use crate::term::colors;
 use crate::theme::ThemeDef;
 
@@ -328,6 +328,8 @@ pub struct ViewerState {
     /// Effective accent (theme default or the user's override).
     accent: [u8; 3],
     font_family: &'static str,
+    /// Frames retained for reuse across paints.
+    frames: Frames,
 }
 
 /// Called from worker threads whenever a bitmap is ready; the app uses it to
@@ -763,6 +765,7 @@ impl ViewerState {
             theme,
             accent,
             font_family,
+            frames: Frames::default(),
         };
         match kind {
             ViewKind::Image => viewer.build_image(path)?,
@@ -3106,7 +3109,7 @@ impl ViewerState {
     ) -> SharedPixelBuffer<Rgba8Pixel> {
         self.prepare_pages(font_system, height_px as f32);
         self.prepare_images(height_px as f32);
-        let mut frame = SharedPixelBuffer::<Rgba8Pixel>::new(width_px.max(1), height_px.max(1));
+        let mut frame = self.frames.take(width_px.max(1), height_px.max(1));
         let bg = colors::base_palette(self.theme)[0];
         let (w, h) = (frame.width() as i32, frame.height() as i32);
         let mut canvas = Canvas { pixels: frame.make_mut_slice(), width: w, height: h };
@@ -3390,6 +3393,7 @@ impl ViewerState {
                 thumb,
             );
         }
+        self.frames.keep(&frame);
         frame
     }
 }
