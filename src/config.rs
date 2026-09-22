@@ -26,9 +26,10 @@ fn default_snapshot_dir_mb() -> u32 {
     200
 }
 
-/// Terminal paints per second on a machine with room to spare. A streaming
-/// agent damages the grid far faster than this, so the cap is what decides
-/// the cost, not the program's output rate.
+/// Terminal paints per second on a machine with room to spare. This is a
+/// ceiling, not a target. The terminal paints when a program writes to it,
+/// and the ceiling only decides how many of those writes get a paint of
+/// their own. It costs nothing while a program writes more slowly than this.
 fn default_term_fps() -> u32 {
     60
 }
@@ -36,11 +37,12 @@ fn default_term_fps() -> u32 {
 /// Lean values for the four settings the Lean switch moves. Kept together so
 /// the switch and the check that lights it cannot drift apart.
 ///
-/// 15 rather than 30 because the cost per paint is not flat: a paint that
-/// redraws the whole pane costs the same whether it follows 13 changed lines
-/// or 53. Measured over 12 s of streaming output, 60 fps cost 3.48 s of CPU,
-/// 30 fps cost 3.30 s, and 15 fps cost 1.83 s. Halving the rate only pays
-/// once each paint is already redrawing everything.
+/// 15 rather than 30 because 30 was measured to buy almost nothing. Over 12 s
+/// of streaming output, 60 fps cost 3.48 s of CPU, 30 fps cost 3.30 s, and
+/// 15 fps cost 1.83 s. A cap only saves work once it sits below the rate the
+/// program damages the grid at. That rate was near 30/s here, so the 60 fps
+/// cap never bound and the 30 fps cap barely did. One run per setting, no
+/// repeats: the ordering is reliable, the individual figures are not.
 pub const LEAN_TERM_FPS: u32 = 15;
 pub const LEAN_SCROLLBACK: usize = 2_000;
 

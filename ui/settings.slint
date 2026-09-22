@@ -457,7 +457,7 @@ export component SettingsDialog inherits Rectangle {
                         }
 
                         Text {
-                            text: "Sets the four below for running several windows at once: 15 fps, 2k scrollback, no changes panel, no file watching. Each stays adjustable on its own.";
+                            text: "Sets the four below for running several windows at once: 15 fps, 2k scrollback, no changes panel, no file watching. Each stays adjustable on its own. With watching off, an open document no longer re-renders when the agent saves it.";
                             color: Theme.text-dim;
                             font-size: Theme.font-size-tiny;
                             wrap: word-wrap;
@@ -569,7 +569,7 @@ export component SettingsDialog inherits Rectangle {
                         }
 
                         Text {
-                            text: "Off stops watching open folders for changes on disk. The file tree then refreshes when you act on it, which costs nothing while a build or a training run churns the folder.";
+                            text: "Off stops watching open folders for changes on disk, so a build or a training run churning the folder costs nothing. Nothing then refreshes by itself: the file tree and the Changes panel update when you next act on them, and an open document stops re-rendering when it changes on disk.";
                             color: Theme.text-dim;
                             font-size: Theme.font-size-tiny;
                             wrap: word-wrap;
