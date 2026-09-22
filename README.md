@@ -42,7 +42,7 @@ Nothing in steps 2–5 costs a LaTeX run or a second application.
 - **Several projects at once** — one session per folder with its own shell, tree and open file; switching is instant. **File ▸ New Window** runs independent windows in parallel, and named `[[teams]]` give each window its own agent buttons. **Windows no longer stall each other** *(0.2.0)* — they share one event loop, so closing a terminal, opening a PDF, scanning fonts or watching a folder with git now happens off it.
 - **A file panel that manages files** *(0.1.6)* — gitignore-aware and live as the agent works. Drag files in from Finder, Cut/Copy/Paste through the system pasteboard in both directions, Delete to the Trash behind a confirmation, rename/duplicate/reveal from the keyboard or the context menu.
 - **Built-in editor** — syntax highlighting for 40+ languages ([cosmic-text](https://crates.io/crates/cosmic-text) + syntect), Cmd+S to save. When the agent rewrites the file you have open, it reloads automatically (or asks, if you have unsaved edits).
-- **Settings, themes, persistence** *(0.1.2)* — **File ▸ Settings… (⌘,)**: six themes, accent color, **a font and a text size for the editor and for the terminal, each picked on its own** *(0.1.8)*, scrollback, **the snapshot size limits** *(0.2.0)*, applied live to every window. The pickers list the monospaced families your machine really has, and a configured family it does not have is swapped for one it does — never for the platform's proportional interface font. A native menu bar (Add Folder ⌘O, New Terminal ⌘T, Open Recent, New Window ▸ team, Save ⌘S, Close ⌘W) routes to whichever pane has focus, and folders, layout and the recent list come back on relaunch.
+- **Settings, themes, persistence** *(0.1.2)* — **File ▸ Settings… (⌘,)**: six themes, accent color, **a font and a text size for the editor and for the terminal, each picked on its own** *(0.1.8)*, scrollback, **the snapshot size limits** *(0.2.0)*, and **Lean mode** *(0.2.0)* — one switch that caps the terminal at 15 fps, shortens scrollback, and turns the Changes panel and file watching off, for when several windows are streaming at once — applied live to every window. The pickers list the monospaced families your machine really has, and a configured family it does not have is swapped for one it does — never for the platform's proportional interface font. A native menu bar (Add Folder ⌘O, New Terminal ⌘T, Open Recent, New Window ▸ team, Save ⌘S, Close ⌘W) routes to whichever pane has focus, and folders, layout and the recent list come back on relaunch.
 - **Small on purpose** — no Electron, no webview under the UI, no C regex libraries; a Slint shell with both panes rasterized straight to pixel buffers, which is where the ~10 MB binary and the instant startup come from.
 
 ## For writing and revising
@@ -152,6 +152,8 @@ font_size = 13.0            # editor + viewer (8-28)
 term_font_size = 13.0       # terminal, sized on its own (8-28)
 ui_font_size = 13.0         # sidebar, tabs, dialogs (10-18)
 scrollback = 10000
+term_fps = 60               # cap on terminal repaints per second (10-120)
+watch_files = true          # watch open folders for changes on disk
 show_changes = false        # start new windows with the Changes panel on
 
 [[presets]]
@@ -241,6 +243,10 @@ Only the PTY reader threads and the viewer's rasterizer/decoder workers run in t
 ## Changelog
 
 - **0.2.0** — **HTML in the viewer, a window that stays responsive, and a snapshot store that stays small.**
+
+  **Lean mode, for several windows at once.** The terminal pane is redrawn whole on every paint, and the reader armed a repaint for each chunk a program wrote. A streaming agent writes far more often than the screen refreshes, so the paints outran the frame budget and left the main thread no room for keys — the terminal stopped echoing what was typed. Paints are now capped, 60 per second by default and settable at 15, 30 or 60 in **Settings ▸ Terminal**. Output that arrives inside a frame waits for the next one instead of queuing a paint of its own. **Lean mode** moves four settings together: 15 fps, 2k scrollback, the Changes panel off and file watching off. The switch is derived from those four rather than stored, so it goes out the moment you move any one of them back, and turning it off restores the defaults. 15 rather than 30 because 30 was measured to buy almost nothing. Over 12 s of streaming output, 60 fps cost 3.48 s of CPU, 30 fps cost 3.30 s, and 15 fps cost 1.83 s. A cap only saves work once it sits below the rate the program damages the grid at, which was near 30/s in that run.
+
+  **File watching is now optional.** Every open folder gets a recursive watch, and an agent or a build churning the folder turns that into steady work. Turn it off and nothing refreshes by itself: the file tree and the Changes panel update when you next act on them, and an open document stops re-rendering when it changes on disk. That last one is the cost to weigh, since it is what makes the typeset page follow the agent's saves. The setting applies to folders already open, without reopening them. **Every pane also reuses its frames.** `SharedPixelBuffer::new` writes every pixel one at a time and the fill that follows overwrites all of it, so a fresh buffer per paint cost a full pane of stores for nothing. Each pane now keeps the last two frames it handed out. It shows only the newest, which leaves the one before it unshared and free to draw into again. `config.toml` calls the two new settings `term_fps` and `watch_files`.
 
   **A snapshot no longer copies the data it sits next to.** The store had reached 17 GB across 40 folders. Two folders held 13 of it. Nothing capped, packed or deleted anything, ever.
 

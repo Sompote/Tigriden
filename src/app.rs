@@ -207,6 +207,12 @@ pub fn settings_changed(key: &str, value: &str) {
             Err(_) => return,
         },
         "show-changes" => config.show_changes = value == "true",
+        "term-fps" => match value.parse::<u32>() {
+            Ok(fps) => config.term_fps = fps,
+            Err(_) => return,
+        },
+        "watch-files" => config.watch_files = value == "true",
+        "lean" => config.set_lean(value == "true"),
         "snapshot-file-mb" => match value.parse::<u32>() {
             Ok(mb) => config.snapshot_file_mb = mb,
             Err(_) => return,
@@ -365,6 +371,9 @@ pub struct App {
     /// Trailing repaint armed while zoom wheel events are throttled.
     zoom_render_armed: bool,
     last_zoom_render: std::time::Instant,
+    /// When the visible terminal was last painted, so a chatty program pays
+    /// one frame per interval rather than one per read.
+    last_term_render: std::time::Instant,
     term_mouse_down: bool,
     /// Cell the pointer was last over, reported with wheel events to
     /// applications that read the mouse.
@@ -464,6 +473,7 @@ impl App {
             wheel_accum: 0.0,
             zoom_render_armed: false,
             last_zoom_render: std::time::Instant::now(),
+            last_term_render: std::time::Instant::now(),
             term_mouse_down: false,
             term_mouse_cell: (0, 0),
             banner: Banner::None,
@@ -545,6 +555,9 @@ impl App {
         ui.set_settings_snapshot_file_mb(self.config.snapshot_file_mb as i32);
         ui.set_settings_snapshot_dir_mb(self.config.snapshot_dir_mb as i32);
         ui.set_settings_show_changes(self.config.show_changes);
+        ui.set_settings_term_fps(self.config.term_fps as i32);
+        ui.set_settings_watch_files(self.config.watch_files);
+        ui.set_settings_lean(self.config.is_lean());
         ui.set_settings_config_path(SharedString::from(
             config::config_path().map(|p| p.display().to_string()).unwrap_or_default(),
         ));
@@ -569,6 +582,7 @@ impl App {
         let view_px_changed = (config.font_size - self.config.font_size).abs() > f32::EPSILON;
         let theme_changed = !std::ptr::eq(theme, self.theme);
         let scrollback_changed = config.scrollback != self.config.scrollback;
+        let watch_changed = config.watch_files != self.config.watch_files;
 
         self.config = config;
         self.theme = theme;
@@ -589,6 +603,17 @@ impl App {
                 for handle in &session.terms {
                     handle.term.set_scrollback(self.config.scrollback);
                 }
+            }
+        }
+
+        // Folders already open pick the watch up or drop it straight away, so
+        // the setting is worth something without reopening anything.
+        if watch_changed {
+            let watch = self.config.watch_files;
+            let app_id = self.id;
+            for session in &mut self.sessions {
+                let root = session.root.clone();
+                session.set_watch(watch, Self::fs_hook(app_id, root));
             }
         }
 
@@ -725,14 +750,9 @@ impl App {
 
         let Some(first_term) = self.spawn_term(&root) else { return };
 
-        let fs_root = root.clone();
-        let app_id = self.id;
-        let session = Session::new(root, first_term, move |paths| {
-            let fs_root = fs_root.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                with_app_id(app_id, |app| app.fs_changed(&fs_root, paths));
-            });
-        });
+        let watch = self.config.watch_files;
+        let session =
+            Session::new(root.clone(), first_term, watch, Self::fs_hook(self.id, root));
         self.sessions.push(session);
         let new_idx = self.sessions.len() - 1;
         if self.changes_enabled {
@@ -1238,6 +1258,18 @@ impl App {
     }
 
     // ----- file watching -----
+
+    /// The watcher callback for one folder: hands the changed paths back to
+    /// this window on the event loop. Built here rather than inline so the
+    /// watch can be started again later with the same wiring.
+    fn fs_hook(app_id: u64, root: PathBuf) -> impl Fn(Vec<PathBuf>) + Send + 'static {
+        move |paths| {
+            let root = root.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                with_app_id(app_id, |app| app.fs_changed(&root, paths));
+            });
+        }
+    }
 
     fn fs_changed(&mut self, root: &Path, paths: Vec<PathBuf>) {
         let Some(session) = self.sessions.iter_mut().find(|s| s.root == root) else { return };
@@ -1888,8 +1920,36 @@ impl App {
 
     // ----- terminal -----
 
+    /// A program's output arrives in as many chunks as it cares to write, and
+    /// the reader arms a repaint for each one. Painting them all costs a full
+    /// pane buffer per chunk, which outruns the frame budget and leaves the
+    /// main thread no room to handle keys: the terminal stops echoing what is
+    /// typed. Paint at most once per frame interval, and leave `frame_pending`
+    /// set while the wait runs so the reader queues nothing more; the timer
+    /// below paints whatever the terminal holds when it fires.
     pub fn term_repaint(&mut self, id: u64) {
         let Some((si, ti)) = self.find_term(id) else { return };
+        if si != self.active || ti != self.sessions[si].active_term {
+            self.sessions[si].terms[ti].frame_pending.store(false, Ordering::Release);
+            return;
+        }
+        let frame = self.config.term_frame();
+        let since = self.last_term_render.elapsed();
+        if since >= frame {
+            self.term_repaint_now(id);
+            return;
+        }
+        let app_id = self.id;
+        slint::Timer::single_shot(frame - since, move || {
+            with_app_id(app_id, |app| app.term_repaint_now(id));
+        });
+    }
+
+    /// Clears the pending flag before painting, not after, so output arriving
+    /// during the paint arms the next frame instead of being dropped.
+    fn term_repaint_now(&mut self, id: u64) {
+        let Some((si, ti)) = self.find_term(id) else { return };
+        self.last_term_render = std::time::Instant::now();
         self.sessions[si].terms[ti].frame_pending.store(false, Ordering::Release);
         if si == self.active && ti == self.sessions[si].active_term {
             self.render_term();

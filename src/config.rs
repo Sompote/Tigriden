@@ -26,6 +26,26 @@ fn default_snapshot_dir_mb() -> u32 {
     200
 }
 
+/// Terminal paints per second on a machine with room to spare. This is a
+/// ceiling, not a target. The terminal paints when a program writes to it,
+/// and the ceiling only decides how many of those writes get a paint of
+/// their own. It costs nothing while a program writes more slowly than this.
+fn default_term_fps() -> u32 {
+    60
+}
+
+/// Lean values for the four settings the Lean switch moves. Kept together so
+/// the switch and the check that lights it cannot drift apart.
+///
+/// 15 rather than 30 because 30 was measured to buy almost nothing. Over 12 s
+/// of streaming output, 60 fps cost 3.48 s of CPU, 30 fps cost 3.30 s, and
+/// 15 fps cost 1.83 s. A cap only saves work once it sits below the rate the
+/// program damages the grid at. That rate was near 30/s here, so the 60 fps
+/// cap never bound and the 30 fps cap barely did. One run per setting, no
+/// repeats: the ordering is reliable, the individual figures are not.
+pub const LEAN_TERM_FPS: u32 = 15;
+pub const LEAN_SCROLLBACK: usize = 2_000;
+
 /// A named group of presets shown in its own window ("agent team").
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Team {
@@ -60,6 +80,16 @@ pub struct Config {
     /// Chrome text size (sidebar, tabs, dialogs), in logical pixels.
     pub ui_font_size: f32,
     pub scrollback: usize,
+    /// Ceiling on terminal paints per second. The terminal pane is redrawn
+    /// whole on every paint, so this is the single biggest lever on what the
+    /// app costs while an agent is streaming output.
+    #[serde(default = "default_term_fps")]
+    pub term_fps: u32,
+    /// Whether each open folder gets a recursive watch for changes on disk.
+    /// Off means the file tree refreshes when you act on it instead, which
+    /// costs nothing while a build or a training run churns the folder.
+    #[serde(default = "default_true")]
+    pub watch_files: bool,
     /// Whether new windows start with the git Changes panel on.
     pub show_changes: bool,
     /// A file this many MB or larger stays out of a folder's snapshot. `0`
@@ -123,6 +153,7 @@ impl Config {
         self.term_font_size = self.term_font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
         self.ui_font_size = self.ui_font_size.clamp(MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE);
         self.scrollback = self.scrollback.clamp(200, 500_000);
+        self.term_fps = self.term_fps.clamp(10, 120);
         // Zero is the "no limit" setting and stays as it is; anything else is
         // pulled into a range that still leaves the store bounded.
         if self.snapshot_file_mb != 0 {
@@ -164,6 +195,31 @@ impl Config {
         true
     }
 
+    /// Shortest gap between two terminal paints.
+    pub fn term_frame(&self) -> std::time::Duration {
+        std::time::Duration::from_micros(1_000_000 / self.term_fps.clamp(10, 120) as u64)
+    }
+
+    /// Whether every setting the Lean switch moves is already at its lean
+    /// value. Derived rather than stored, so the switch cannot disagree with
+    /// the settings it stands for.
+    pub fn is_lean(&self) -> bool {
+        self.term_fps <= LEAN_TERM_FPS
+            && self.scrollback <= LEAN_SCROLLBACK
+            && !self.show_changes
+            && !self.watch_files
+    }
+
+    /// Moves all four at once. Turning it off restores the defaults rather
+    /// than whatever they were before, so the switch is its own answer.
+    pub fn set_lean(&mut self, on: bool) {
+        let defaults = Self::default();
+        self.term_fps = if on { LEAN_TERM_FPS } else { defaults.term_fps };
+        self.scrollback = if on { LEAN_SCROLLBACK } else { defaults.scrollback };
+        self.show_changes = if on { false } else { defaults.show_changes };
+        self.watch_files = !on;
+    }
+
     /// Accent actually in use: the user's override, else the theme's own.
     pub fn accent_rgb(&self) -> [u8; 3] {
         crate::theme::parse_hex(&self.accent)
@@ -182,6 +238,8 @@ impl Default for Config {
             term_font_size: 13.0,
             ui_font_size: 13.0,
             scrollback: 10_000,
+            term_fps: default_term_fps(),
+            watch_files: true,
             show_changes: false,
             snapshot_file_mb: default_snapshot_file_mb(),
             snapshot_dir_mb: default_snapshot_dir_mb(),
@@ -223,6 +281,48 @@ fn state_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The switch is derived from the four settings it stands for, so it has
+    /// to light up after it is turned on and go out again when it is turned
+    /// off or when any one of the four is moved back on its own.
+    #[test]
+    fn the_lean_switch_reads_back_the_settings_it_wrote() {
+        let mut config = Config::default();
+        assert!(!config.is_lean(), "the defaults are not lean");
+
+        config.set_lean(true);
+        config.sanitize();
+        assert!(config.is_lean());
+        assert_eq!(config.term_fps, LEAN_TERM_FPS);
+        assert_eq!(config.scrollback, LEAN_SCROLLBACK);
+        assert!(!config.show_changes);
+        assert!(!config.watch_files);
+
+        // Moving one of the four back on its own leaves lean mode.
+        config.term_fps = 60;
+        assert!(!config.is_lean(), "a raised frame cap is no longer lean");
+
+        config.set_lean(false);
+        config.sanitize();
+        assert!(!config.is_lean());
+        assert_eq!(config.term_fps, Config::default().term_fps);
+        assert_eq!(config.scrollback, Config::default().scrollback);
+        assert!(config.watch_files);
+    }
+
+    /// A frame cap of zero or a wild one would divide the paint interval into
+    /// nothing or into a stall, so `sanitize` has to pull it into range.
+    #[test]
+    fn a_frame_cap_out_of_range_is_pulled_back() {
+        let mut config = Config { term_fps: 0, ..Config::default() };
+        config.sanitize();
+        assert_eq!(config.term_fps, 10);
+        assert_eq!(config.term_frame(), std::time::Duration::from_millis(100));
+
+        let mut config = Config { term_fps: 1_000, ..Config::default() };
+        config.sanitize();
+        assert_eq!(config.term_fps, 120);
+    }
 
     fn with_presets(labels: &[&str], version: u32) -> Config {
         Config {

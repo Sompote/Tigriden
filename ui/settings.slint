@@ -153,6 +153,9 @@ export component SettingsDialog inherits Rectangle {
     in property <int> snapshot-file-mb;
     in property <int> snapshot-dir-mb;
     in property <bool> show-changes;
+    in property <int> term-fps;
+    in property <bool> watch-files;
+    in property <bool> lean;
     in property <string> config-path;
 
     // key/value pairs consumed by App::settings_changed.
@@ -439,11 +442,67 @@ export component SettingsDialog inherits Rectangle {
 
                         HorizontalLayout {
                             spacing: 8px;
+                            FieldLabel { text: "Lean mode"; }
+                            Chip {
+                                label: "Off";
+                                selected: !root.lean;
+                                clicked => { root.changed("lean", "false"); }
+                            }
+                            Chip {
+                                label: "On";
+                                selected: root.lean;
+                                clicked => { root.changed("lean", "true"); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+
+                        Text {
+                            text: "Sets the four below for running several windows at once: 15 fps, 2k scrollback, no changes panel, no file watching. Each stays adjustable on its own. With watching off, an open document no longer re-renders when the agent saves it.";
+                            color: Theme.text-dim;
+                            font-size: Theme.font-size-tiny;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            FieldLabel { text: "Refresh"; }
+                            Chip {
+                                label: "15 fps";
+                                selected: root.term-fps == 15;
+                                clicked => { root.changed("term-fps", "15"); }
+                            }
+                            Chip {
+                                label: "30 fps";
+                                selected: root.term-fps == 30;
+                                clicked => { root.changed("term-fps", "30"); }
+                            }
+                            Chip {
+                                label: "60 fps";
+                                selected: root.term-fps == 60;
+                                clicked => { root.changed("term-fps", "60"); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+
+                        Text {
+                            text: "How often the terminal repaints while a program writes to it. The pane is redrawn whole each time, so this is the largest single cost while an agent streams.";
+                            color: Theme.text-dim;
+                            font-size: Theme.font-size-tiny;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
                             FieldLabel { text: "Scrollback"; }
                             Chip {
                                 label: "1k";
                                 selected: root.scrollback == 1000;
                                 clicked => { root.changed("scrollback", "1000"); }
+                            }
+                            Chip {
+                                label: "2k";
+                                selected: root.scrollback == 2000;
+                                clicked => { root.changed("scrollback", "2000"); }
                             }
                             Chip {
                                 label: "10k";
@@ -488,6 +547,29 @@ export component SettingsDialog inherits Rectangle {
 
                         Text {
                             text: "Applies to windows opened from now on; File ▸ Show Changes Panel toggles this window.";
+                            color: Theme.text-dim;
+                            font-size: Theme.font-size-tiny;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            FieldLabel { text: "Watch files"; }
+                            Chip {
+                                label: "Off";
+                                selected: !root.watch-files;
+                                clicked => { root.changed("watch-files", "false"); }
+                            }
+                            Chip {
+                                label: "On";
+                                selected: root.watch-files;
+                                clicked => { root.changed("watch-files", "true"); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+
+                        Text {
+                            text: "Off stops watching open folders for changes on disk, so a build or a training run churning the folder costs nothing. Nothing then refreshes by itself: the file tree and the Changes panel update when you next act on them, and an open document stops re-rendering when it changes on disk.";
                             color: Theme.text-dim;
                             font-size: Theme.font-size-tiny;
                             wrap: word-wrap;

@@ -213,6 +213,9 @@ export component MainWindow inherits Window {
     in property <float> settings-ui-font-size: 13;
     in property <int> settings-scrollback: 10000;
     in property <bool> settings-show-changes: false;
+    in property <int> settings-term-fps: 60;
+    in property <bool> settings-watch-files: true;
+    in property <bool> settings-lean: false;
     in property <int> settings-snapshot-file-mb: 5;
     in property <int> settings-snapshot-dir-mb: 200;
     in property <string> settings-config-path: "";
@@ -673,6 +676,9 @@ export component MainWindow inherits Window {
         ui-font-size: root.settings-ui-font-size;
         scrollback: root.settings-scrollback;
         show-changes: root.settings-show-changes;
+        term-fps: root.settings-term-fps;
+        watch-files: root.settings-watch-files;
+        lean: root.settings-lean;
         snapshot-file-mb: root.settings-snapshot-file-mb;
         snapshot-dir-mb: root.settings-snapshot-dir-mb;
         config-path: root.settings-config-path;

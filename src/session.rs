@@ -51,6 +51,7 @@ impl Session {
     pub fn new(
         root: PathBuf,
         first_term: TermHandle,
+        watch: bool,
         on_fs_event: impl Fn(Vec<PathBuf>) + Send + 'static,
     ) -> Self {
         let name = root
@@ -58,15 +59,7 @@ impl Session {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| root.display().to_string());
 
-        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(event) = res {
-                if !event.paths.is_empty() {
-                    on_fs_event(event.paths);
-                }
-            }
-        })
-        .ok()
-        .and_then(|mut w| w.watch(&root, RecursiveMode::Recursive).ok().map(|_| w));
+        let watcher = watch.then(|| Self::spawn_watcher(&root, on_fs_event)).flatten();
 
         Self {
             root: root.clone(),
@@ -86,6 +79,36 @@ impl Session {
             diff_gen: 0,
             changes_visible: true,
             _watcher: watcher,
+        }
+    }
+
+    /// A recursive watch on `root`, or None if the platform refused one.
+    fn spawn_watcher(
+        root: &Path,
+        on_fs_event: impl Fn(Vec<PathBuf>) + Send + 'static,
+    ) -> Option<RecommendedWatcher> {
+        notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res {
+                if !event.paths.is_empty() {
+                    on_fs_event(event.paths);
+                }
+            }
+        })
+        .ok()
+        .and_then(|mut w| w.watch(root, RecursiveMode::Recursive).ok().map(|_| w))
+    }
+
+    /// Starts or stops the watch without disturbing the rest of the session,
+    /// so the setting takes effect on folders already open.
+    pub fn set_watch(
+        &mut self,
+        on: bool,
+        on_fs_event: impl Fn(Vec<PathBuf>) + Send + 'static,
+    ) {
+        match (on, self._watcher.is_some()) {
+            (false, _) => self._watcher = None,
+            (true, true) => {}
+            (true, false) => self._watcher = Self::spawn_watcher(&self.root, on_fs_event),
         }
     }
 
