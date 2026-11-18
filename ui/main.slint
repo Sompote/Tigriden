@@ -549,34 +549,19 @@ export component MainWindow inherits Window {
                                 alignment: start;
 
                                 for label[i] in root.term-tabs: tab-touch := TouchArea {
-                                    width: root.term-tabs.length > 1 && self.has-hover ? 46px : 30px;
+                                    width: 30px;
                                     Rectangle {
                                         y: 4px;
                                         height: Theme.chip-height;
                                         border-radius: 4px;
                                         background: i == root.active-term ? Theme.selection
                                             : (tab-touch.has-hover ? Theme.panel-hover : transparent);
-                                        HorizontalLayout {
-                                            padding-left: 8px;
-                                            padding-right: 4px;
-                                            spacing: 2px;
-                                            Text {
-                                                text: label;
-                                                color: i == root.active-term ? Theme.text : Theme.text-dim;
-                                                font-size: Theme.font-size-tiny;
-                                                vertical-alignment: center;
-                                            }
-                                            if root.term-tabs.length > 1 && tab-touch.has-hover: TouchArea {
-                                                width: 14px;
-                                                Text {
-                                                    text: "✕";
-                                                    color: Theme.text-dim;
-                                                    font-size: Theme.font-size-tiny - 2px;
-                                                    vertical-alignment: center;
-                                                    horizontal-alignment: center;
-                                                }
-                                                clicked => { root.close-terminal(i); }
-                                            }
+                                        Text {
+                                            text: label;
+                                            color: i == root.active-term ? Theme.text : Theme.text-dim;
+                                            font-size: Theme.font-size-tiny;
+                                            vertical-alignment: center;
+                                            horizontal-alignment: center;
                                         }
                                     }
                                     clicked => { root.term-tab-clicked(i); }
@@ -598,6 +583,28 @@ export component MainWindow inherits Window {
                                         }
                                     }
                                     clicked => { root.new-terminal(); }
+                                }
+
+                                // Closes the active terminal. It sits apart from the tab
+                                // chips so a click meant for a tab cannot close one.
+                                if root.term-tabs.length > 1: close-term-touch := TouchArea {
+                                    width: 24px;
+                                    Rectangle {
+                                        y: 4px;
+                                        height: Theme.chip-height;
+                                        border-radius: 4px;
+                                        background: close-term-touch.has-hover ? Theme.panel-hover : transparent;
+                                        Path {
+                                            width: 8px;
+                                            height: 8px;
+                                            viewbox-width: 8;
+                                            viewbox-height: 8;
+                                            stroke: close-term-touch.has-hover ? Theme.text : Theme.text-dim;
+                                            stroke-width: 1.4px;
+                                            commands: "M 0 0 L 8 8 M 8 0 L 0 8";
+                                        }
+                                    }
+                                    clicked => { root.close-terminal(root.active-term); }
                                 }
 
                                 Rectangle {
