@@ -64,8 +64,11 @@ pub struct TermSession {
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     input_tx: Sender<Vec<u8>>,
     master: Option<Box<dyn MasterPty + Send>>,
-    /// Taken by `shutdown`, which hands it to a thread that reaps it.
-    child: Option<Box<dyn Child + Send + Sync>>,
+    /// Taken by whichever comes first: the reader thread, which reaps a
+    /// shell that exited on its own, or `shutdown`, which hangs it up and
+    /// reaps it on a thread. Either way the shell never lingers as a zombie
+    /// while its tab stays open.
+    child: Arc<Mutex<Option<Box<dyn Child + Send + Sync>>>>,
     reader_handle: Option<JoinHandle<()>>,
     writer_handle: Option<JoinHandle<()>>,
     win_size: Arc<Mutex<WindowSize>>,
@@ -107,6 +110,7 @@ impl TermSession {
         cmd.env("COLORTERM", "truecolor");
 
         let child = pty.slave.spawn_command(cmd).map_err(|e| format!("spawn shell: {e}"))?;
+        let child = Arc::new(Mutex::new(Some(child)));
         // The slave must be dropped or the reader never sees EOF.
         drop(pty.slave);
 
@@ -149,6 +153,7 @@ impl TermSession {
         let reader_term = term.clone();
         let reader_exited = exited.clone();
         let reader_hooks = hooks.clone();
+        let reader_child = child.clone();
         let reader_handle = std::thread::spawn(move || {
             let mut processor: Processor = Processor::new();
             let mut buf = [0u8; 65536];
@@ -165,6 +170,14 @@ impl TermSession {
                 }
             }
             reader_exited.store(true, Ordering::Release);
+            // EOF means every holder of the slave is gone, the shell
+            // included, so this wait is short. Taking the child out first
+            // keeps the lock free for `shutdown`, which then finds nothing to
+            // signal, and a pid already reaped is never signalled after reuse.
+            let child = reader_child.lock().ok().and_then(|mut c| c.take());
+            if let Some(mut child) = child {
+                let _ = child.wait();
+            }
             (reader_hooks.exited)();
         });
 
@@ -172,7 +185,7 @@ impl TermSession {
             term,
             input_tx,
             master: Some(pty.master),
-            child: Some(child),
+            child,
             reader_handle: Some(reader_handle),
             writer_handle: Some(writer_handle),
             win_size,
@@ -240,7 +253,7 @@ impl TermSession {
         // the shell's group does not cover it.
         #[cfg(unix)]
         let foreground = self.master.as_ref().and_then(|m| m.process_group_leader());
-        let Some(mut child) = self.child.take() else { return };
+        let Some(mut child) = self.child.lock().ok().and_then(|mut c| c.take()) else { return };
 
         #[cfg(unix)]
         let groups: Vec<i32> = {

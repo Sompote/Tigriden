@@ -84,6 +84,11 @@ impl TreeState {
         }
     }
 
+    /// Drops every cached listing, for when too much changed to say what.
+    pub fn invalidate_all(&mut self) {
+        self.children.clear();
+    }
+
     /// Flattens the expanded tree into rows, root itself excluded (the session
     /// header row is added by the caller).
     pub fn flatten(&mut self) -> Vec<FlatRow> {

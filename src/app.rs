@@ -242,13 +242,22 @@ pub fn reveal_config() {
         config::save_config(&config());
     }
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+    spawn_reaped(std::process::Command::new("open").arg("-R").arg(&path));
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("explorer").arg("/select,").arg(&path).spawn();
+    spawn_reaped(std::process::Command::new("explorer").arg("/select,").arg(&path));
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let _ = std::process::Command::new("xdg-open")
-        .arg(path.parent().unwrap_or(&path))
-        .spawn();
+    spawn_reaped(std::process::Command::new("xdg-open").arg(path.parent().unwrap_or(&path)));
+}
+
+/// Runs a short helper such as `open` without waiting for it, and reaps it on
+/// a thread of its own. A child that is spawned and dropped is never waited
+/// for, so each one stays a zombie until Tigriden quits.
+fn spawn_reaped(cmd: &mut std::process::Command) {
+    if let Ok(mut child) = cmd.spawn() {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 /// Whether the wheel-zoom modifier (⌘ or Ctrl) is held right now, asked
@@ -1259,32 +1268,33 @@ impl App {
 
     // ----- file watching -----
 
-    /// The watcher callback for one folder: hands the changed paths back to
-    /// this window on the event loop. Built here rather than inline so the
-    /// watch can be started again later with the same wiring.
+    /// The watcher callback for one folder: gathers changed paths on the
+    /// watcher thread and hands them back to this window on the event loop,
+    /// at most one queued delivery at a time. Built here rather than inline so
+    /// the watch can be started again later with the same wiring.
     fn fs_hook(app_id: u64, root: PathBuf) -> impl Fn(Vec<PathBuf>) + Send + 'static {
+        let batch = Arc::new(std::sync::Mutex::new(crate::session::FsBatch::default()));
         move |paths| {
-            let root = root.clone();
+            let Ok(mut pending) = batch.lock() else { return };
+            pending.add(paths);
+            if pending.posted {
+                return;
+            }
+            pending.posted = true;
+            drop(pending);
+            let (batch, root) = (batch.clone(), root.clone());
             let _ = slint::invoke_from_event_loop(move || {
-                with_app_id(app_id, |app| app.fs_changed(&root, paths));
+                let Ok(mut pending) = batch.lock() else { return };
+                let taken = std::mem::take(&mut *pending);
+                drop(pending);
+                with_app_id(app_id, |app| app.fs_changed(&root, taken));
             });
         }
     }
 
-    fn fs_changed(&mut self, root: &Path, paths: Vec<PathBuf>) {
+    fn fs_changed(&mut self, root: &Path, batch: crate::session::FsBatch) {
         let Some(session) = self.sessions.iter_mut().find(|s| s.root == root) else { return };
-        for path in &paths {
-            if let Some(parent) = path.parent() {
-                if !session.pending_fs.contains(&PathBuf::from(parent)) {
-                    session.pending_fs.push(parent.to_path_buf());
-                }
-            }
-            // Directory events (create/delete inside) also arrive as the dir
-            // itself.
-            if !session.pending_fs.contains(path) {
-                session.pending_fs.push(path.clone());
-            }
-        }
+        session.pending_fs.merge(batch);
         if !self.fs_timer_armed {
             self.fs_timer_armed = true;
             let app_id = self.id;
@@ -1306,18 +1316,35 @@ impl App {
             if session.tracking.is_some() {
                 git_refresh.push(i);
             }
-            let dirs = std::mem::take(&mut session.pending_fs);
-            if let Some(editor) = &session.editor {
-                if dirs.iter().any(|p| *p == editor.path) {
+            let batch = std::mem::take(&mut session.pending_fs);
+            if batch.overflow {
+                // Too much changed to know whether the open file did: the
+                // editor checks its own mtime, the viewer is checked here so
+                // a long storm does not reopen the page every drain.
+                if let Some(viewer_state) = &session.viewer {
+                    let mtime =
+                        std::fs::metadata(&viewer_state.path).and_then(|m| m.modified()).ok();
+                    if mtime != session.viewer_seen_mtime {
+                        session.viewer_seen_mtime = mtime;
+                        reload_check.push(i);
+                    }
+                } else if session.editor.is_some() {
                     reload_check.push(i);
                 }
-            }
-            if let Some(viewer_state) = &session.viewer {
-                if dirs.iter().any(|p| *p == viewer_state.path) {
-                    reload_check.push(i);
+                session.tree.invalidate_all();
+            } else {
+                if let Some(editor) = &session.editor {
+                    if batch.paths.contains(&editor.path) {
+                        reload_check.push(i);
+                    }
                 }
+                if let Some(viewer_state) = &session.viewer {
+                    if batch.paths.contains(&viewer_state.path) {
+                        reload_check.push(i);
+                    }
+                }
+                session.tree.invalidate(batch.paths);
             }
-            session.tree.invalidate(dirs);
             needs_tree = true;
         }
         if needs_tree {
@@ -2583,10 +2610,10 @@ impl App {
                 NameAction::NewFolder(idx, create_dir),
             ),
             2 => {
-                let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+                spawn_reaped(std::process::Command::new("open").arg("-R").arg(&path));
             }
             3 => {
-                let _ = std::process::Command::new("open").arg(&path).spawn();
+                spawn_reaped(std::process::Command::new("open").arg(&path));
             }
             4 => {
                 if let Some(cb) = self.clipboard.as_mut() {

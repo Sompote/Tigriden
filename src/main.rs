@@ -6,6 +6,7 @@ mod git;
 mod html;
 mod mac;
 mod mathlayout;
+mod memtrim;
 mod paint;
 mod session;
 mod term;
@@ -311,6 +312,7 @@ fn main() {
         eprintln!("tigriden: config.toml is malformed; using defaults (file left untouched)");
     }
     app::set_config(config.clone());
+    memtrim::start();
 
     open_window(
         config,

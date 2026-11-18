@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -19,6 +20,61 @@ pub struct TermHandle {
     pub frame_pending: Arc<AtomicBool>,
 }
 
+/// Changed paths gathered on the watcher thread and handed to the event loop
+/// as one batch.
+///
+/// A dataset write can raise hundreds of thousands of events in a few
+/// minutes. One event-loop closure per event, each deduplicating against a
+/// list, froze every window for tens of minutes; a set with a cap keeps both
+/// the queue and the work bounded.
+#[derive(Default)]
+pub struct FsBatch {
+    pub paths: HashSet<PathBuf>,
+    /// More changed than is worth tracking one by one: treat every cached
+    /// listing as stale.
+    pub overflow: bool,
+    /// A closure to deliver this batch is already queued on the event loop.
+    pub posted: bool,
+}
+
+/// Paths a batch tracks before it gives up and rescans everything.
+const FS_BATCH_MAX: usize = 4096;
+
+impl FsBatch {
+    pub fn add(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        if self.overflow {
+            return;
+        }
+        for path in paths {
+            // Directory events (create/delete inside) arrive as the dir itself;
+            // a file event stands for a change to its parent's listing.
+            if let Some(parent) = path.parent() {
+                if !self.paths.contains(parent) {
+                    self.paths.insert(parent.to_path_buf());
+                }
+            }
+            self.paths.insert(path);
+        }
+        if self.paths.len() > FS_BATCH_MAX {
+            self.overflow = true;
+            self.paths = HashSet::new();
+        }
+    }
+
+    pub fn merge(&mut self, other: FsBatch) {
+        if other.overflow {
+            self.overflow = true;
+            self.paths = HashSet::new();
+        } else {
+            self.add(other.paths);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.overflow && self.paths.is_empty()
+    }
+}
+
 pub struct Session {
     pub root: PathBuf,
     pub name: String,
@@ -31,8 +87,11 @@ pub struct Session {
     pub html_web: bool,
     pub tree: TreeState,
     pub tree_visible: bool,
-    /// Directories whose listings changed on disk since the last model rebuild.
-    pub pending_fs: Vec<PathBuf>,
+    /// Paths that changed on disk since the last model rebuild.
+    pub pending_fs: FsBatch,
+    /// The viewer file's mtime when a change storm last checked it, so an
+    /// overflowed batch reloads the page only if the file really changed.
+    pub viewer_seen_mtime: Option<std::time::SystemTime>,
     /// Set while the changes panel is enabled: real git or shadow snapshot.
     /// Assigned by App after construction so the toggle check stays there.
     pub tracking: Option<crate::git::Tracking>,
@@ -71,7 +130,8 @@ impl Session {
             html_web: true,
             tree: TreeState::new(root),
             tree_visible: true,
-            pending_fs: Vec::new(),
+            pending_fs: FsBatch::default(),
+            viewer_seen_mtime: None,
             tracking: None,
             git: None,
             changes: Vec::new(),
@@ -124,5 +184,37 @@ impl Session {
         path.strip_prefix(&self.root)
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| path.display().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FsBatch, FS_BATCH_MAX};
+    use std::path::PathBuf;
+
+    #[test]
+    fn batch_dedupes_and_records_parents() {
+        let mut batch = FsBatch::default();
+        batch.add([PathBuf::from("/r/a/x.txt"), PathBuf::from("/r/a/y.txt")]);
+        batch.add([PathBuf::from("/r/a/x.txt")]);
+        assert!(batch.paths.contains(&PathBuf::from("/r/a")));
+        assert_eq!(batch.paths.len(), 3);
+        assert!(!batch.overflow);
+    }
+
+    #[test]
+    fn a_change_storm_collapses_to_overflow() {
+        let mut batch = FsBatch::default();
+        batch.add((0..FS_BATCH_MAX + 10).map(|i| PathBuf::from(format!("/r/data/{i}.png"))));
+        assert!(batch.overflow);
+        assert!(batch.paths.is_empty());
+        assert!(!batch.is_empty());
+        // Once overflowed, more events cost nothing.
+        batch.add([PathBuf::from("/r/data/more.png")]);
+        assert!(batch.paths.is_empty());
+        let mut main = FsBatch::default();
+        main.add([PathBuf::from("/r/a.txt")]);
+        main.merge(batch);
+        assert!(main.overflow && main.paths.is_empty());
     }
 }
